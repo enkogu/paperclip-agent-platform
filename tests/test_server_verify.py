@@ -2243,9 +2243,29 @@ class FailClosedVerifierTests(unittest.TestCase):
                             "profileRef": profile,
                             "adapterType": adapter,
                             "status": "passed",
+                            "upstreamStatus": "pass",
+                            "acceptedWarningCodes": [],
+                            "optionalUserSecretBindingCount": 2,
+                            "attemptCount": 1,
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "status": "pass",
+                                    "accepted": True,
+                                    "warningCodes": [],
+                                    "requestError": None,
+                                    "checks": [
+                                        {
+                                            "code": f"{harness}_hello_probe_passed",
+                                            "level": "info",
+                                        }
+                                    ],
+                                    "probeSandboxesDeleted": 1,
+                                }
+                            ],
                             "probeSandboxesDeleted": 1,
                         }
-                        for profile, adapter, _version, _harness in contracts
+                        for profile, adapter, _version, harness in contracts
                     ],
                     "probeCleanup": {
                         "createdSandboxCount": 3,

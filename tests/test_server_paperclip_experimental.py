@@ -185,6 +185,49 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
             (True, []),
         )
 
+    def test_environment_probe_observation_keeps_only_safe_check_fields(self):
+        observation = module.environment_probe_observation(
+            {
+                "status": "fail",
+                "checks": [
+                    {
+                        "code": "codex_hello_probe_failed",
+                        "level": "error",
+                        "message": "must never enter evidence",
+                        "stdout": "sensitive provider output",
+                    }
+                ],
+                "connection": {"token": "not-for-evidence"},
+            },
+            attempt=1,
+            accepted=False,
+            warning_codes=[],
+            request_error=None,
+            deleted_sandbox_count=1,
+        )
+
+        self.assertEqual(
+            observation,
+            {
+                "attempt": 1,
+                "status": "fail",
+                "accepted": False,
+                "warningCodes": [],
+                "requestError": None,
+                "checks": [
+                    {"code": "codex_hello_probe_failed", "level": "error"}
+                ],
+                "probeSandboxesDeleted": 1,
+            },
+        )
+        self.assertNotIn("message", json.dumps(observation))
+        self.assertNotIn("sensitive provider output", json.dumps(observation))
+
+    def test_environment_probe_retry_policy_is_small_and_bounded(self):
+        self.assertEqual(module.ENVIRONMENT_PROBE_ATTEMPTS, 3)
+        self.assertGreaterEqual(module.ENVIRONMENT_PROBE_RETRY_SECONDS, 1)
+        self.assertLessEqual(module.ENVIRONMENT_PROBE_RETRY_SECONDS, 5)
+
     def test_codex_env_contract_accepts_only_paperclip_managed_home(self):
         required = {"OPENAI_API_KEY", "GITHUB_TOKEN"}
         managed_home = (

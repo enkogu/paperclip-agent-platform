@@ -90,6 +90,8 @@ ENVIRONMENT_PROBE_HELLO_CODES = {
     ref: str(profile["runtimeContract"]["probe"]["helloCode"])
     for ref, profile in DEFAULT_PROFILE_CATALOG.by_ref.items()
 }
+ENVIRONMENT_PROBE_ATTEMPTS = 3
+ENVIRONMENT_PROBE_RETRY_SECONDS = 2
 FULL_SHA256 = re.compile(r"[a-f0-9]{64}")
 FULL_IMAGE_DIGEST = re.compile(r"sha256:[a-f0-9]{64}")
 EXACT_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]*):\?required\}")
@@ -268,6 +270,40 @@ def accepted_environment_probe(
     return set(warning_codes) == set(allowed) and bool(
         allowed
     ) and hello_passed, warning_codes
+
+
+def environment_probe_observation(
+    payload: Any,
+    *,
+    attempt: int,
+    accepted: bool,
+    warning_codes: list[str],
+    request_error: str | None,
+    deleted_sandbox_count: int,
+) -> dict[str, Any]:
+    """Return a secret-free, deterministic adapter-probe observation."""
+    checks = payload.get("checks") if isinstance(payload, dict) else None
+    safe_checks = []
+    if isinstance(checks, list):
+        safe_checks = [
+            {
+                "code": str(row.get("code", "")),
+                "level": str(row.get("level", "")),
+            }
+            for row in checks
+            if isinstance(row, dict)
+        ]
+    return {
+        "attempt": attempt,
+        "status": str(payload.get("status", ""))
+        if isinstance(payload, dict)
+        else "",
+        "accepted": accepted,
+        "warningCodes": warning_codes,
+        "requestError": request_error,
+        "checks": safe_checks,
+        "probeSandboxesDeleted": deleted_sandbox_count,
+    }
 
 
 def validate_profile_env_contract(
@@ -1874,42 +1910,95 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
                     "coding_profile_drift",
                     f"{agent['profileRef']} has no adapter type",
                 )
-            before_sandbox_ids = daytona_environment_sandbox_ids(values, environment_id)
             probe_config, optional_user_secret_count = adapter_environment_probe_config(
                 agents_by_profile[str(agent["profileRef"])].get("adapterConfig", {})
             )
-            probe_response = json_request(
-                base,
-                "POST",
-                "/api/companies/"
-                + urllib.parse.quote(company_id)
-                + "/adapters/"
-                + urllib.parse.quote(adapter_type)
-                + "/test-environment",
-                {
-                    "adapterConfig": probe_config,
-                    "environmentId": environment_id,
-                },
-                timeout=max(360, timeout_ms // 1000 + 60),
-            )
-            probe_accepted, accepted_warning_codes = accepted_environment_probe(
-                str(agent["profileRef"]), probe_response
-            )
+            probe_response: Any = None
+            probe_accepted = False
+            accepted_warning_codes: list[str] = []
+            probe_attempts: list[dict[str, Any]] = []
+            profile_created_sandbox_ids: set[str] = set()
+            for attempt in range(1, ENVIRONMENT_PROBE_ATTEMPTS + 1):
+                before_sandbox_ids = daytona_environment_sandbox_ids(
+                    values, environment_id
+                )
+                probe_response = None
+                request_error: str | None = None
+                try:
+                    probe_response = json_request(
+                        base,
+                        "POST",
+                        "/api/companies/"
+                        + urllib.parse.quote(company_id)
+                        + "/adapters/"
+                        + urllib.parse.quote(adapter_type)
+                        + "/test-environment",
+                        {
+                            "adapterConfig": probe_config,
+                            "environmentId": environment_id,
+                        },
+                        timeout=max(360, timeout_ms // 1000 + 60),
+                    )
+                    (
+                        probe_accepted,
+                        accepted_warning_codes,
+                    ) = accepted_environment_probe(
+                        str(agent["profileRef"]), probe_response
+                    )
+                except ControlError as exc:
+                    request_error = exc.code
+                    probe_accepted = False
+                    accepted_warning_codes = []
+
+                after_sandbox_ids = daytona_environment_sandbox_ids(
+                    values, environment_id
+                )
+                created_sandbox_ids = sorted(
+                    after_sandbox_ids - before_sandbox_ids
+                )
+                profile_created_sandbox_ids.update(created_sandbox_ids)
+                # Paperclip marks ad-hoc test leases ephemeral, but a provider
+                # with reuseLease=true stops rather than destroys them. Delete
+                # only IDs created by this exact attempt, including failed
+                # attempts, so retries cannot leak stopped or archived leases.
+                for sandbox_id in created_sandbox_ids:
+                    destroy_daytona_probe_sandbox(values, sandbox_id)
+                probe_attempts.append(
+                    environment_probe_observation(
+                        probe_response,
+                        attempt=attempt,
+                        accepted=probe_accepted,
+                        warning_codes=accepted_warning_codes,
+                        request_error=request_error,
+                        deleted_sandbox_count=len(created_sandbox_ids),
+                    )
+                )
+                if probe_accepted:
+                    break
+                if attempt < ENVIRONMENT_PROBE_ATTEMPTS:
+                    time.sleep(ENVIRONMENT_PROBE_RETRY_SECONDS)
+
             if not probe_accepted:
+                observed_codes = sorted(
+                    {
+                        str(check.get("code", ""))
+                        for row in probe_attempts
+                        for check in row["checks"]
+                        if check.get("code")
+                    }
+                )
                 raise ControlError(
                     "environment_probe_failed",
-                    f"{agent['profileRef']} environment probe did not pass",
+                    f"{agent['profileRef']} environment probe did not pass; "
+                    + "observed codes: "
+                    + (",".join(observed_codes) or "none"),
                 )
-            after_sandbox_ids = daytona_environment_sandbox_ids(values, environment_id)
-            created_sandbox_ids = sorted(after_sandbox_ids - before_sandbox_ids)
-            # Paperclip marks ad-hoc test leases ephemeral, but a provider with
-            # reuseLease=true stops rather than destroys them. They can never be
-            # resumed because ad-hoc leases have no heartbeat/workspace scope, so
-            # delete only the IDs created by this exact probe to prevent leaks.
-            for sandbox_id in created_sandbox_ids:
-                destroy_daytona_probe_sandbox(values, sandbox_id)
-            probe_cleanup["createdSandboxCount"] += len(created_sandbox_ids)
-            probe_cleanup["deletedSandboxCount"] += len(created_sandbox_ids)
+            probe_cleanup["createdSandboxCount"] += len(
+                profile_created_sandbox_ids
+            )
+            probe_cleanup["deletedSandboxCount"] += len(
+                profile_created_sandbox_ids
+            )
             probe_results.append(
                 {
                     "profileRef": str(agent["profileRef"]),
@@ -1917,7 +2006,9 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
                     "status": "passed",
                     "upstreamStatus": str(probe_response.get("status", "")),
                     "acceptedWarningCodes": accepted_warning_codes,
-                    "probeSandboxesDeleted": len(created_sandbox_ids),
+                    "attemptCount": len(probe_attempts),
+                    "attempts": probe_attempts,
+                    "probeSandboxesDeleted": len(profile_created_sandbox_ids),
                     "optionalUserSecretBindingCount": optional_user_secret_count,
                 }
             )

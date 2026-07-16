@@ -8460,6 +8460,87 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 }
                 for profile in NATIVE_HARNESS_PROFILES
             ]
+
+            def valid_probe(row: dict, expected: dict[str, str]) -> bool:
+                attempts = row.get("attempts")
+                if (
+                    not all(row.get(key) == value for key, value in expected.items())
+                    or not isinstance(row.get("probeSandboxesDeleted"), int)
+                    or row.get("probeSandboxesDeleted") < 0
+                    or not isinstance(row.get("attemptCount"), int)
+                    or not isinstance(attempts, list)
+                    or not 1 <= row.get("attemptCount") <= 3
+                    or len(attempts) != row.get("attemptCount")
+                    or row.get("upstreamStatus") not in {"pass", "warn"}
+                    or not isinstance(row.get("acceptedWarningCodes"), list)
+                    or not all(
+                        isinstance(code, str)
+                        for code in row.get("acceptedWarningCodes", [])
+                    )
+                    or not isinstance(
+                        row.get("optionalUserSecretBindingCount"), int
+                    )
+                    or row.get("optionalUserSecretBindingCount") < 0
+                ):
+                    return False
+                for index, attempt in enumerate(attempts, 1):
+                    if (
+                        not isinstance(attempt, dict)
+                        or set(attempt)
+                        != {
+                            "attempt",
+                            "status",
+                            "accepted",
+                            "warningCodes",
+                            "requestError",
+                            "checks",
+                            "probeSandboxesDeleted",
+                        }
+                        or attempt.get("attempt") != index
+                        or not isinstance(attempt.get("status"), str)
+                        or not isinstance(attempt.get("accepted"), bool)
+                        or not isinstance(attempt.get("warningCodes"), list)
+                        or not all(
+                            isinstance(code, str)
+                            for code in attempt.get("warningCodes", [])
+                        )
+                        or (
+                            attempt.get("requestError") is not None
+                            and not re.fullmatch(
+                                r"[a-z][a-z0-9_]*",
+                                str(attempt.get("requestError")),
+                            )
+                        )
+                        or not isinstance(attempt.get("checks"), list)
+                        or not all(
+                            isinstance(check, dict)
+                            and set(check) == {"code", "level"}
+                            and isinstance(check.get("code"), str)
+                            and isinstance(check.get("level"), str)
+                            for check in attempt.get("checks", [])
+                        )
+                        or not isinstance(
+                            attempt.get("probeSandboxesDeleted"), int
+                        )
+                        or attempt.get("probeSandboxesDeleted") < 0
+                    ):
+                        return False
+                return (
+                    attempts[-1].get("accepted") is True
+                    and attempts[-1].get("status") == row.get("upstreamStatus")
+                    and attempts[-1].get("warningCodes")
+                    == row.get("acceptedWarningCodes")
+                    and all(
+                        attempt.get("accepted") is False
+                        for attempt in attempts[:-1]
+                    )
+                    and sum(
+                        attempt.get("probeSandboxesDeleted", 0)
+                        for attempt in attempts
+                    )
+                    == row.get("probeSandboxesDeleted")
+                )
+
             _expect(
                 findings,
                 plugin.get("status") == "ready"
@@ -8503,9 +8584,7 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 and len(probes) == 3
                 and all(isinstance(row, dict) for row in probes)
                 and all(
-                    all(row.get(key) == expected[key] for key in expected)
-                    and isinstance(row.get("probeSandboxesDeleted"), int)
-                    and row.get("probeSandboxesDeleted") >= 0
+                    valid_probe(row, expected)
                     for row, expected in zip(probes, expected_probe_rows)
                 )
                 and _nested(details, "probeCleanup", "leakedSandboxCount") == 0
