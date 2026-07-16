@@ -567,7 +567,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                     },
                 )
 
-    def test_existing_install_imports_only_fill_only_notion_aliases(self):
+    def test_existing_install_imports_reviewed_operator_and_notion_values(self):
         token = "unit-prin7r-notion-token-must-not-appear-in-commands"
         generic_token = "unit-generic-notion-token-must-not-cross-ssh"
         api_key_fallback = "unit-prin7r-api-key-must-not-cross-ssh"
@@ -605,6 +605,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
             "NOTION_WORKSPACE_ID": "managed-workspace",
             "NOTION_BOT_ID": "managed-bot",
             "PRIN7R_NOTION_PAGE_ID": "broad-parent-must-not-be-upgrade-imported",
+            "MTE_OPERATOR_SSH_CIDRS": "203.0.113.9/32",
+            "PLATFORM_BASE_DOMAIN": "example.test",
+            "CLOUDFLARE_GLOBAL_API_KEY": "local-only-must-not-cross-ssh",
             "UNRELATED_SECRET": "must-not-cross-ssh",
         }
         with (
@@ -624,12 +627,15 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "NOTION_TABLE_DATA_SOURCE_ID": "managed-data-source",
                 "NOTION_WORKSPACE_ID": "managed-workspace",
                 "NOTION_BOT_ID": "managed-bot",
+                "MTE_OPERATOR_SSH_CIDRS": "203.0.113.9/32",
+                "PLATFORM_BASE_DOMAIN": "example.test",
             },
         )
         self.assertNotIn(token, "\n".join(command for command, _ in commands))
         self.assertNotIn(generic_token, json.dumps(commands))
         self.assertNotIn(api_key_fallback, json.dumps(commands))
         self.assertNotIn("UNRELATED_SECRET", json.dumps(commands))
+        self.assertNotIn("CLOUDFLARE_GLOBAL_API_KEY", json.dumps(commands))
 
     def test_empty_profile_migrates_to_postgres_notion_and_imports_dedicated_root(self):
         token = "unit-notion-token-never-returned"

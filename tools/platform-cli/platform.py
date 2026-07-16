@@ -1897,22 +1897,27 @@ def ensure_config_initialized(cfg: dict[str, Any]) -> None:
     if result.returncode != 0:
         run_config(cfg, "init")
         return
-    # Schema upgrades migrate newly declared defaults from the still-raw
-    # structural sources.  The Notion pivot is the one reviewed exception:
-    # fill-only aliases may be imported without exposing their values or
-    # overwriting an already canonical credential.
+    # Schema upgrades may add a new operator-owned key after the canonical
+    # source was first created. Re-import the reviewed operator contract plus
+    # managed Notion identifiers; server-config filters them again and applies
+    # them fill-only, so existing credentials and generated values always win.
+    contract = server_config_contract()
     local_values = normalize_notion_token_import(operator_values())
-    notion_imports = {
+    allowed_upgrade_imports = (
+        set(contract.REQUIRED_OPERATOR_ENV_KEYS)
+        - set(contract.LOCAL_ONLY_OPERATOR_INPUT_KEYS)
+    ) | NOTION_UPGRADE_IMPORT_KEYS
+    upgrade_imports = {
         key: value
         for key, value in local_values.items()
-        if key in NOTION_UPGRADE_IMPORT_KEYS and value
+        if key in allowed_upgrade_imports and value
     }
     sync(cfg, render_projections=False)
     script = remote_script(cfg, "server-config.py")
     ssh(
         cfg,
         f"umask 077; python3 {shlex.quote(script)} init",
-        input_text=json.dumps(notion_imports),
+        input_text=json.dumps(upgrade_imports),
     )
     ssh(cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-secrets.py'))} init")
     ssh(cfg, f"python3 {shlex.quote(script)} render")
