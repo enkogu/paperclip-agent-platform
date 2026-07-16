@@ -302,11 +302,15 @@ def commit_transaction(
     proof = verify_tree(root, manifest)
     state_path = root / ".deploy" / STATE_NAME
     current = load_optional_object(state_path)
-    if current is not None and current.get("activationId") not in {
-        activation_id,
-        (journal.get("previousState") or {}).get("activationId"),
-    }:
-        raise TransactionError("a newer source activation is already current")
+    if current is not None:
+        current_status = current.get("status")
+        if current_status not in {"active", "rolledBack"}:
+            raise TransactionError("current source activation state is invalid")
+        if current_status == "active" and current.get("activationId") not in {
+            activation_id,
+            (journal.get("previousState") or {}).get("activationId"),
+        }:
+            raise TransactionError("a newer source activation is already current")
     state = activation_state(root, journal, proof)
     # The current pointer is durable before the journal advertises active.
     # Thus an active journal always has a reconstructable current pointer, and

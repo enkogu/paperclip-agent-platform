@@ -391,6 +391,39 @@ class DeployTransactionTests(unittest.TestCase):
                 ]
             )
 
+    def test_promotion_replaces_an_inactive_rolled_back_pointer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "platform"
+            root.mkdir()
+            self.seal_release(root, "release-12345678", "new")
+            self.module.atomic_json(
+                root / ".deploy/current-release.json",
+                {
+                    "apiVersion": self.module.API_VERSION,
+                    "kind": "GovernedSourceActivation",
+                    "status": "rolledBack",
+                    "runId": "run-00000000",
+                    "releaseId": "release-00000000",
+                    "activationId": "run-00000000-a1",
+                    "sourceSha256": "0" * 64,
+                },
+            )
+
+            active = self.module.promote(
+                root,
+                "release-12345678",
+                "run-12345678",
+                "run-12345678-a1",
+            )
+
+            self.assertEqual(active["status"], "active")
+            self.assertEqual(active["activationId"], "run-12345678-a1")
+            self.assertTrue(
+                self.module.verify_current(root, "release-12345678", "run-12345678-a1")[
+                    "ok"
+                ]
+            )
+
     def test_recovery_closes_state_written_before_active_journal_window(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "platform"
