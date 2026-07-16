@@ -87,6 +87,12 @@ class ServerE2ECanaryTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "remote_http_error")
         self.assertNotIn("github_pat_", str(raised.exception))
 
+    def test_preflight_reads_the_deployed_flow_instead_of_removed_configs_api(self):
+        source = SCRIPT.read_text()
+        self.assertNotIn('"GET", "/api/v1/main/configs"', source)
+        self.assertIn('"/api/v1/main/flows/"', source)
+        self.assertIn('"kestra_flow_not_ready"', source)
+
     def test_harness_evidence_v3_requires_exactly_one_document(self):
         valid = {
             "name": "harness-evidence",

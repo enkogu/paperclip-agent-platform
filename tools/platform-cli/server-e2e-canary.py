@@ -4229,7 +4229,26 @@ def preflight(
 
     kestra = str(e2e["kestraBaseUrl"]).rstrip("/")
     auth = basic_auth(values)
-    kestra_request(kestra, auth, "GET", "/api/v1/main/configs")
+    flow_namespace = "micro_task_engine.e2e"
+    flow_id = "paperclip-github-e2e"
+    existing_flow = kestra_request(
+        kestra,
+        auth,
+        "GET",
+        "/api/v1/main/flows/"
+        + urllib.parse.quote(flow_namespace, safe="")
+        + "/"
+        + urllib.parse.quote(flow_id, safe=""),
+    )
+    if (
+        not isinstance(existing_flow, dict)
+        or existing_flow.get("namespace") != flow_namespace
+        or existing_flow.get("id") != flow_id
+    ):
+        raise CanaryError(
+            "kestra_flow_not_ready",
+            "Kestra did not return the exact deployed E2E flow identity",
+        )
 
     paperclip = str(e2e["paperclipBaseUrl"]).rstrip("/")
     _, health = paperclip_request(paperclip, values, "GET", "/api/health")
