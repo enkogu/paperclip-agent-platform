@@ -1,0 +1,213 @@
+name: mte-firecrawl
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+    compress: 'true'
+x-firecrawl-env:
+  REDIS_URL: ${FIRECRAWL_REDIS_URL:?required}
+  REDIS_RATE_LIMIT_URL: ${FIRECRAWL_REDIS_URL:?required}
+  PLAYWRIGHT_MICROSERVICE_URL: http://playwright-service:3000/scrape
+  POSTGRES_USER: ${FIRECRAWL_DB_USER:?required}
+  POSTGRES_PASSWORD: ${FIRECRAWL_DB_PASSWORD:?required}
+  POSTGRES_DB: ${FIRECRAWL_DB_NAME:?required}
+  POSTGRES_HOST: nuq-postgres
+  POSTGRES_PORT: '5432'
+  USE_DB_AUTHENTICATION: 'false'
+  NUM_WORKERS_PER_QUEUE: ${FIRECRAWL_WORKERS_PER_QUEUE:?required}
+  CRAWL_CONCURRENT_REQUESTS: ${FIRECRAWL_CRAWL_CONCURRENCY:?required}
+  MAX_CONCURRENT_JOBS: ${FIRECRAWL_MAX_JOBS:?required}
+  BROWSER_POOL_SIZE: ${FIRECRAWL_BROWSER_POOL_SIZE:?required}
+  SEARXNG_ENDPOINT: http://searxng:8080
+  LOGGING_LEVEL: ${FIRECRAWL_LOG_LEVEL:?required}
+services:
+  api:
+    image: ${MTE_FIRECRAWL_API_IMAGE:?required}
+    environment:
+      REDIS_URL: ${FIRECRAWL_REDIS_URL:?required}
+      REDIS_RATE_LIMIT_URL: ${FIRECRAWL_REDIS_URL:?required}
+      PLAYWRIGHT_MICROSERVICE_URL: ${MTE_FIRECRAWL_API_ENV_PLAYWRIGHT_MICROSERVICE_URL:?required}
+      POSTGRES_USER: ${FIRECRAWL_DB_USER:?required}
+      POSTGRES_PASSWORD: ${FIRECRAWL_DB_PASSWORD:?required}
+      POSTGRES_DB: ${FIRECRAWL_DB_NAME:?required}
+      POSTGRES_HOST: ${MTE_FIRECRAWL_API_ENV_POSTGRES_HOST:?required}
+      POSTGRES_PORT: ${MTE_FIRECRAWL_API_ENV_POSTGRES_PORT:?required}
+      USE_DB_AUTHENTICATION: 'false'
+      NUM_WORKERS_PER_QUEUE: ${FIRECRAWL_WORKERS_PER_QUEUE:?required}
+      CRAWL_CONCURRENT_REQUESTS: ${FIRECRAWL_CRAWL_CONCURRENCY:?required}
+      MAX_CONCURRENT_JOBS: ${FIRECRAWL_MAX_JOBS:?required}
+      BROWSER_POOL_SIZE: ${FIRECRAWL_BROWSER_POOL_SIZE:?required}
+      SEARXNG_ENDPOINT: ${MTE_FIRECRAWL_API_ENV_SEARXNG_ENDPOINT:?required}
+      LOGGING_LEVEL: ${FIRECRAWL_LOG_LEVEL:?required}
+      HOST: ${MTE_FIRECRAWL_API_ENV_HOST:?required}
+      PORT: ${MTE_FIRECRAWL_API_ENV_PORT:?required}
+      EXTRACT_WORKER_PORT: ${MTE_FIRECRAWL_API_ENV_EXTRACT_WORKER_PORT:?required}
+      WORKER_PORT: ${MTE_FIRECRAWL_API_ENV_WORKER_PORT:?required}
+      NUQ_RABBITMQ_URL: ${MTE_FIRECRAWL_API_ENV_NUQ_RABBITMQ_URL:?required}
+      HARNESS_STARTUP_TIMEOUT_MS: '300000'
+      ENV: local
+    command:
+    - node
+    - dist/src/harness.js
+    - --start-docker
+    ports:
+    - ${MTE_FIRECRAWL_API_PORT_1_MAPPING:?required}
+    networks:
+    - firecrawl
+    - search
+    depends_on:
+      redis:
+        condition: service_healthy
+      playwright-service:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      nuq-postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - node -e "fetch('http://127.0.0.1:3002/').then(r=>{if(r.status>=500)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+    restart: unless-stopped
+    stop_grace_period: 90s
+    cpus: ${FIRECRAWL_API_CPU_LIMIT:?required}
+    mem_limit: ${FIRECRAWL_API_MEMORY_LIMIT:?required}
+    pids_limit: 768
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    logging: *id001
+  playwright-service:
+    image: ${MTE_FIRECRAWL_PLAYWRIGHT_SERVICE_IMAGE:?required}
+    environment:
+      PORT: ${MTE_FIRECRAWL_PLAYWRIGHT_SERVICE_ENV_PORT:?required}
+      MAX_CONCURRENT_PAGES: ${FIRECRAWL_CRAWL_CONCURRENCY:?required}
+      BLOCK_MEDIA: 'true'
+    networks:
+    - firecrawl
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - node -e "fetch('http://127.0.0.1:3000/').then(()=>{}).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    tmpfs:
+    - /tmp/.cache:noexec,nosuid,size=512m
+    restart: unless-stopped
+    cpus: ${FIRECRAWL_BROWSER_CPU_LIMIT:?required}
+    mem_limit: ${FIRECRAWL_BROWSER_MEMORY_LIMIT:?required}
+    pids_limit: 768
+    logging: *id001
+    ports: []
+  redis:
+    image: ${MTE_FIRECRAWL_REDIS_IMAGE:?required}
+    environment:
+      FIRECRAWL_REDIS_PASSWORD: ${FIRECRAWL_REDIS_PASSWORD:?required}
+    user: redis
+    command:
+    - /bin/sh
+    - -euc
+    - 'umask 077
+
+      test -n "$(printenv FIRECRAWL_REDIS_PASSWORD)"
+
+      printf ''appendonly yes\nsave 60 1\nrequirepass %s\n'' "$(printenv FIRECRAWL_REDIS_PASSWORD)"
+      > /tmp/mte-firecrawl-redis.conf
+
+      unset FIRECRAWL_REDIS_PASSWORD
+
+      exec redis-server /tmp/mte-firecrawl-redis.conf
+
+      '
+    tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,mode=1777
+    volumes:
+    - firecrawl-redis:/data
+    networks:
+    - firecrawl
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - REDISCLI_AUTH="$${FIRECRAWL_REDIS_PASSWORD:?required}" redis-cli ping | grep
+        -q PONG
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    cpus: ${FIRECRAWL_REDIS_CPU_LIMIT:?required}
+    mem_limit: ${FIRECRAWL_REDIS_MEMORY_LIMIT:?required}
+    pids_limit: 128
+    logging: *id001
+    ports: []
+  rabbitmq:
+    image: ${MTE_FIRECRAWL_RABBITMQ_IMAGE:?required}
+    volumes:
+    - firecrawl-rabbitmq:/var/lib/rabbitmq
+    networks:
+    - firecrawl
+    healthcheck:
+      test:
+      - CMD
+      - nc
+      - -z
+      - 127.0.0.1
+      - '5672'
+      interval: 10s
+      timeout: 15s
+      retries: 20
+      start_period: 120s
+    restart: unless-stopped
+    cpus: ${FIRECRAWL_RABBIT_CPU_LIMIT:?required}
+    mem_limit: ${FIRECRAWL_RABBIT_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+    ports: []
+  nuq-postgres:
+    image: ${MTE_FIRECRAWL_NUQ_POSTGRES_IMAGE:?required}
+    environment:
+      POSTGRES_USER: ${FIRECRAWL_DB_USER:?required}
+      POSTGRES_PASSWORD: ${FIRECRAWL_DB_PASSWORD:?required}
+      POSTGRES_DB: ${FIRECRAWL_DB_NAME:?required}
+    command:
+    - postgres
+    - -c
+    - cron.database_name=${FIRECRAWL_DB_NAME:?required}
+    volumes:
+    - firecrawl-postgres:/var/lib/postgresql/data
+    networks:
+    - firecrawl
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U ${FIRECRAWL_DB_USER:?required} -d ${FIRECRAWL_DB_NAME:?required}
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+    cpus: ${FIRECRAWL_DB_CPU_LIMIT:?required}
+    mem_limit: ${FIRECRAWL_DB_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+    ports: []
+volumes:
+  firecrawl-redis:
+    name: mte-firecrawl-redis
+  firecrawl-rabbitmq:
+    name: mte-firecrawl-rabbitmq
+  firecrawl-postgres:
+    name: mte-firecrawl-postgres
+networks:
+  firecrawl:
+    name: mte-firecrawl
+  search:
+    name: mte-search
+    external: true

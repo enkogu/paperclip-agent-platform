@@ -1,0 +1,105 @@
+name: mte-toolhive
+services:
+  tool-runtime:
+    image: ${MTE_TOOLHIVE_TOOL_RUNTIME_IMAGE:?required}
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ''
+    command:
+    - --host=tcp://0.0.0.0:2375
+    - --host=unix:///var/run/docker.sock
+    volumes:
+    - toolhive-docker:/var/lib/docker
+    - toolhive-docker-run:/var/run
+    - /opt/mte-platform/toolhive/tmp:/opt/mte-platform/toolhive/tmp
+    networks:
+      tool-runtime:
+        aliases:
+        - tool-runtime
+    healthcheck:
+      test:
+      - CMD
+      - docker
+      - -H
+      - tcp://127.0.0.1:2375
+      - info
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    cpus: ${TOOLHIVE_DOCKER_CPU_LIMIT:?required}
+    mem_limit: ${TOOLHIVE_DOCKER_MEMORY_LIMIT:?required}
+    pids_limit: 512
+    ports: []
+  toolhive:
+    image: ${MTE_TOOLHIVE_TOOLHIVE_IMAGE:?required}
+    command:
+    - /usr/local/bin/thv
+    - serve
+    - --host
+    - 0.0.0.0
+    - --port
+    - '8080'
+    - --openapi
+    environment:
+      HOME: /root
+      XDG_CONFIG_HOME: /root/.config
+      TMPDIR: /opt/mte-platform/toolhive/tmp
+      TOOLHIVE_DOCKER_SOCKET: ${MTE_TOOLHIVE_TOOLHIVE_ENV_DOCKER_SOCKET:?required}
+    ports:
+    - ${MTE_TOOLHIVE_TOOLHIVE_PORT_1_MAPPING:?required}
+    - ${MTE_TOOLHIVE_TOOLHIVE_PORT_2_MAPPING:?required}
+    volumes:
+    - /opt/mte-platform/toolhive/bin/thv:/usr/local/bin/thv:ro
+    - /etc/ssl/certs:/etc/ssl/certs:ro
+    - /opt/mte-platform/toolhive/tmp:/opt/mte-platform/toolhive/tmp
+    - toolhive-config:/root/.config/toolhive
+    - toolhive-data:/root/.local/share/toolhive
+    - toolhive-docker-run:/var/run:ro
+    networks:
+      tool-runtime: {}
+      tool-plane:
+        aliases:
+        - toolhive
+      agent-plane:
+        aliases:
+        - toolhive
+    depends_on:
+      tool-runtime:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 60s
+    cpus: ${TOOLHIVE_CPU_LIMIT:?required}
+    mem_limit: ${TOOLHIVE_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+volumes:
+  toolhive-docker:
+    name: mte-toolhive-docker
+  toolhive-docker-run:
+    name: mte-toolhive-docker-run
+  toolhive-config:
+    name: mte-toolhive-config
+  toolhive-data:
+    name: mte-toolhive-data
+networks:
+  tool-runtime:
+    name: mte-tool-runtime
+  tool-plane:
+    name: mte-tool-plane
+  agent-plane:
+    name: ${MTE_AGENT_PLANE_NETWORK:?required}
+    external: true

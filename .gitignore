@@ -1,0 +1,57 @@
+# Operating systems and editors
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+*.orig
+*.rej
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+
+# Node.js
+node_modules/
+.npm-cache/
+npm-debug.log*
+
+# Local configuration and credentials. The one reviewed public template is
+# the only environment-shaped file allowed in the repository.
+.env
+.env.*
+*.env
+*.env.*
+!config/platform.env.example
+*.key
+*.pem
+*.p12
+*.token
+
+# Runtime state and generated evidence
+.runtime/
+state/
+evidence/
+
+# Terraform/OpenTofu state
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl.backup
+crash.log
+
+# Local deployment projections
+config/platform.env

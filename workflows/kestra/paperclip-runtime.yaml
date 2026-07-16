@@ -1,0 +1,41 @@
+id: paperclip-native-runtime
+namespace: paperclip_agent_platform.examples
+description: Minimal native Paperclip issue submission; no sidecar adapter or shadow run store.
+
+inputs:
+  - id: paperclip_base_url
+    type: STRING
+    required: true
+  - id: company_id
+    type: STRING
+    required: true
+  - id: project_id
+    type: STRING
+    required: true
+  - id: agent_id
+    type: STRING
+    required: true
+  - id: task
+    type: STRING
+    required: true
+
+tasks:
+  - id: create_issue
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.paperclip_base_url }}/api/companies/{{ inputs.company_id }}/issues"
+    method: POST
+    contentType: application/json
+    body: |
+      {
+        "title": "[kestra:{{ execution.id }}] Native Paperclip task",
+        "description": {{ inputs.task | json }},
+        "status": "todo",
+        "priority": "medium",
+        "projectId": {{ inputs.project_id | json }},
+        "assigneeAgentId": {{ inputs.agent_id | json }}
+      }
+
+outputs:
+  - id: paperclip_issue_id
+    type: STRING
+    value: "{{ outputs.create_issue.body | jq('.id') | first }}"

@@ -1,0 +1,331 @@
+apiVersion: micro-task-engine/v1alpha1
+kind: PlatformLock
+metadata:
+  generatedAt: "2026-07-15"
+
+spec:
+  dokploy: 0.29.12
+  paperclip: 2026.707.0
+  kestra: 1.3.27
+  9router: 0.5.30
+  hermesAgent: 0.18.2
+  toolHive: 0.36.0
+  openTofu: 1.12.1
+  harnesses:
+    pi: 0.80.7
+    codex: 0.144.4
+    claudeCode: 2.1.209
+  dataContentProfiles:
+    postgres-notion:
+      contractVersion: 2
+      selectable: true
+      contractComplete: true
+      componentIds: [postgrest]
+      canonicalKeyPrefixes: [POSTGREST_, MTE_POSTGREST_, NOTION_]
+      systemOfRecord:
+        providerId: postgres
+        componentId: postgres
+        ownership: authoritative
+      providers:
+        postgres:
+          kind: system-of-record
+          deployment: core
+          componentId: postgres
+          capabilities:
+            data:
+              interfaces: [sql]
+              configurationRefs: []
+          adapterIds: []
+        postgrest:
+          kind: internal-scoped-api
+          deployment: profile-component
+          componentId: postgrest
+          capabilities:
+            data:
+              interfaces: [api]
+              configurationRefs: [POSTGREST_PUBLIC_URL]
+          adapterIds: [postgrest]
+        notion:
+          kind: external-workspace
+          deployment: external
+          componentId: null
+          capabilities:
+            tables:
+              interfaces: [ui, api]
+              configurationRefs: [NOTION_TABLE_DATABASE_ID, NOTION_TABLE_DATA_SOURCE_ID]
+            documents:
+              interfaces: [ui, api]
+              configurationRefs: [NOTION_DOCUMENTS_PAGE_ID]
+          adapterIds: [notion]
+      internalApis:
+        scoped-data-api:
+          providerId: postgrest
+          capability: data
+          interface: api
+          endpointRef: POSTGREST_PUBLIC_URL
+          adapterId: postgrest
+      images:
+        postgrest: postgrest/postgrest:v14.15@sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326
+      licenses:
+        postgrest: MIT
+      licenseExceptions: {}
+      roles:
+        tablesUi:
+          providerId: notion
+          capability: tables
+          interface: ui
+          endpointRef: NOTION_API_BASE_URL
+          adapterId: notion
+        tablesApi:
+          providerId: notion
+          capability: tables
+          interface: api
+          endpointRef: NOTION_API_BASE_URL
+          adapterId: notion
+        documentsUi:
+          providerId: notion
+          capability: documents
+          interface: ui
+          endpointRef: NOTION_API_BASE_URL
+          adapterId: notion
+        documentsApi:
+          providerId: notion
+          capability: documents
+          interface: api
+          endpointRef: NOTION_API_BASE_URL
+          adapterId: notion
+      adapters:
+        postgrest:
+          script: server-postgrest.py
+          providerId: postgrest
+          componentId: postgrest
+          capabilities: [data]
+          actions: [database, provision, verify]
+        notion:
+          script: server-notion.py
+          providerId: notion
+          componentId: null
+          capabilities: [tables, documents]
+          actions: [provision, verify]
+      activationBlockers: []
+    baserow-wikijs:
+      contractVersion: 2
+      selectable: false
+      contractComplete: false
+      componentIds: [postgrest, baserow, wikijs]
+      canonicalKeyPrefixes: [POSTGREST_, MTE_POSTGREST_, BASEROW_, WIKIJS_, MTE_BASEROW_, MTE_WIKIJS_]
+      systemOfRecord:
+        providerId: postgres
+        componentId: postgres
+        ownership: authoritative
+      providers:
+        postgres:
+          kind: system-of-record
+          deployment: core
+          componentId: postgres
+          capabilities:
+            data:
+              interfaces: [sql]
+              configurationRefs: []
+          adapterIds: []
+        postgrest:
+          kind: internal-scoped-api
+          deployment: profile-component
+          componentId: postgrest
+          capabilities:
+            data:
+              interfaces: [api]
+              configurationRefs: [POSTGREST_PUBLIC_URL]
+          adapterIds: [postgrest]
+        baserow:
+          kind: self-hosted-workspace
+          deployment: profile-component
+          componentId: baserow
+          capabilities:
+            tables:
+              interfaces: [ui, api]
+              configurationRefs: []
+          adapterIds: [baserow]
+        wikijs:
+          kind: self-hosted-workspace
+          deployment: profile-component
+          componentId: wikijs
+          capabilities:
+            documents:
+              interfaces: [ui, api]
+              configurationRefs: []
+          adapterIds: [wikijs]
+      internalApis:
+        scoped-data-api:
+          providerId: postgrest
+          capability: data
+          interface: api
+          endpointRef: POSTGREST_PUBLIC_URL
+          adapterId: postgrest
+      images:
+        postgrest: postgrest/postgrest:v14.15@sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326
+        baserow: baserow/baserow:2.3.1@sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a
+        wikijs: ghcr.io/requarks/wiki:2.5.314@sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e
+      licenses:
+        postgrest: MIT
+        baserow: MIT
+        wikijs: AGPL-3.0-only
+      licenseExceptions: {}
+      roles:
+        tablesUi:
+          providerId: baserow
+          capability: tables
+          interface: ui
+          endpointRef: BASEROW_PUBLIC_URL
+          adapterId: baserow
+        tablesApi:
+          providerId: baserow
+          capability: tables
+          interface: api
+          endpointRef: BASEROW_PUBLIC_URL
+          adapterId: baserow
+        documentsUi:
+          providerId: wikijs
+          capability: documents
+          interface: ui
+          endpointRef: WIKIJS_SITE_URL
+          adapterId: wikijs
+        documentsApi:
+          providerId: wikijs
+          capability: documents
+          interface: api
+          endpointRef: WIKIJS_SITE_URL
+          adapterId: wikijs
+      adapters:
+        postgrest:
+          script: server-postgrest.py
+          providerId: postgrest
+          componentId: postgrest
+          capabilities: [data]
+          actions: [database, provision, verify]
+        baserow:
+          script: server-baserow.py
+          providerId: baserow
+          componentId: baserow
+          capabilities: [tables]
+          actions: [database, provision, verify]
+        wikijs:
+          script: server-wikijs.py
+          providerId: wikijs
+          componentId: wikijs
+          capabilities: [documents]
+          actions: [database, provision, verify]
+      activationBlockers:
+        - inactive optional provider; requires explicit operator activation and refreshed acceptance
+    postgres-postgrest-nocodb-nocodocs:
+      contractVersion: 2
+      selectable: false
+      contractComplete: false
+      componentIds: [postgrest, nocodb]
+      canonicalKeyPrefixes: [POSTGREST_, NOCODB_, MTE_POSTGREST_, MTE_NOCODB_]
+      systemOfRecord:
+        providerId: postgres
+        componentId: postgres
+        ownership: authoritative
+      providers:
+        postgres:
+          kind: system-of-record
+          deployment: core
+          componentId: postgres
+          capabilities:
+            data:
+              interfaces: [sql]
+              configurationRefs: []
+          adapterIds: []
+        postgrest:
+          kind: internal-scoped-api
+          deployment: profile-component
+          componentId: postgrest
+          capabilities:
+            data:
+              interfaces: [api]
+              configurationRefs: [POSTGREST_PUBLIC_URL]
+          adapterIds: [postgrest]
+        nocodb:
+          kind: self-hosted-workspace
+          deployment: profile-component
+          componentId: nocodb
+          capabilities:
+            tables:
+              interfaces: [ui, api]
+              configurationRefs: []
+            documents:
+              interfaces: [ui, api]
+              configurationRefs: []
+          adapterIds: [nocodb]
+      internalApis:
+        scoped-data-api:
+          providerId: postgrest
+          capability: data
+          interface: api
+          endpointRef: POSTGREST_PUBLIC_URL
+          adapterId: postgrest
+      images:
+        postgrest: postgrest/postgrest:v14.15@sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326
+        nocodb: nocodb/nocodb:2026.06.2@sha256:0745850b14869bde4c972181c52607d72b1f3f85b9f7c96180803f0ced76e465
+      licenses:
+        postgrest: MIT
+        nocodb: LicenseRef-NocoDB-Sustainable-Use-1.0
+      licenseExceptions:
+        nocodb:
+          component: nocodb
+          scope: internal-self-hosted-tables-ui-and-nocodocs
+          approval: user-approved-2026-07-15
+          source: https://github.com/nocodb/nocodb/blob/2026.06.2/LICENSE.md
+      roles:
+        tablesUi:
+          providerId: nocodb
+          capability: tables
+          interface: ui
+          endpointRef: NOCODB_PUBLIC_URL
+          adapterId: nocodb
+        tablesApi:
+          providerId: nocodb
+          capability: tables
+          interface: api
+          endpointRef: NOCODB_PUBLIC_URL
+          adapterId: nocodb
+        documentsUi:
+          providerId: nocodb
+          capability: documents
+          interface: ui
+          endpointRef: NOCODB_PUBLIC_URL
+          adapterId: nocodb
+        documentsApi:
+          providerId: nocodb
+          capability: documents
+          interface: api
+          endpointRef: NOCODB_PUBLIC_URL
+          adapterId: nocodb
+      adapters:
+        postgrest:
+          script: server-postgrest.py
+          providerId: postgrest
+          componentId: postgrest
+          capabilities: [data]
+          actions: [database, provision, verify]
+        nocodb:
+          script: server-nocodb.py
+          providerId: nocodb
+          componentId: nocodb
+          capabilities: [tables, documents]
+          actions: [database, provision, verify]
+      activationBlockers:
+        - inactive optional provider; requires explicit operator activation and refreshed license acceptance
+  images:
+    nodeHarness: node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37
+    openTofu: ghcr.io/opentofu/opentofu:1.12.1@sha256:1cdf44e7a44a67c7838ada83c71ad28b4c4e1571b47ad1c5b592624c2c8f35b5
+    cloudflared: cloudflare/cloudflared:2026.7.1@sha256:188bb03589a32affed3cf4d0590565ffe67b78866e6b5582574afab2b705bafe
+    mcpEverything: mcp/everything@sha256:330885a0c4b2eed6f0cd3aae0f0b37152ccdf2852e2f6af6d616a5d5c1e9817d
+    postgres: postgres:17.10-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    activepieces: ghcr.io/activepieces/activepieces:0.86.2@sha256:f61d5c9ce4ad09d6d6a05909a31be0983943cbc242617e3885818ae7a428159a
+    baserow: baserow/baserow:2.3.1@sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a
+    wikijs: ghcr.io/requarks/wiki:2.5.314@sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e
+    postgrest: postgrest/postgrest:v14.15@sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326
+    nocodb: nocodb/nocodb:2026.06.2@sha256:0745850b14869bde4c972181c52607d72b1f3f85b9f7c96180803f0ced76e465
+    searxng: searxng/searxng:2026.7.14-58e02a01a@sha256:af9aec5c8fe88767106e8043004a1232d43cabde22869e6355f3a63d26e41351

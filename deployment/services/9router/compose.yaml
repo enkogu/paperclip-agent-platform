@@ -1,0 +1,54 @@
+name: mte-9router
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '5'
+services:
+  9router:
+    image: ${MTE_9ROUTER_9ROUTER_IMAGE:?required}
+    environment:
+      DATA_DIR: /app/data
+      PORT: ${MTE_9ROUTER_9ROUTER_ENV_PORT:?required}
+      HOSTNAME: 0.0.0.0
+      NODE_ENV: production
+      INITIAL_PASSWORD: ${NINEROUTER_INITIAL_PASSWORD:?required}
+      JWT_SECRET: ${NINEROUTER_JWT_SECRET:?required}
+      API_KEY_SECRET: ${NINEROUTER_API_KEY_SECRET:?required}
+      MACHINE_ID_SALT: ${NINEROUTER_MACHINE_ID_SALT:?required}
+      REQUIRE_API_KEY: 'true'
+    volumes:
+    - ninerouter-data:/app/data
+    ports:
+    - ${MTE_9ROUTER_9ROUTER_PORT_1_MAPPING:?required}
+    networks:
+      llm:
+        aliases:
+        - 9router
+      agent-plane:
+        aliases:
+        - 9router
+    healthcheck:
+      test:
+      - CMD
+      - node
+      - -e
+      - fetch('http://127.0.0.1:20128/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 45s
+    restart: unless-stopped
+    cpus: ${NINEROUTER_CPU_LIMIT:?required}
+    mem_limit: ${NINEROUTER_MEMORY_LIMIT:?required}
+    pids_limit: 768
+    logging: *id001
+volumes:
+  ninerouter-data:
+    name: mte-9router-data
+networks:
+  llm:
+    name: mte-llm
+  agent-plane:
+    name: ${MTE_AGENT_PLANE_NETWORK:?required}
+    external: true

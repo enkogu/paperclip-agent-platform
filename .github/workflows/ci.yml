@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tools/platform-cli/pyproject.toml
+
+      - name: Verify Docker Compose
+        run: docker compose version
+
+      - name: Run offline release gate
+        run: make release-check

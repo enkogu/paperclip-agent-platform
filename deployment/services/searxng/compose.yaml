@@ -1,0 +1,107 @@
+name: mte-searxng
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+services:
+  config-init:
+    image: ${MTE_SEARXNG_CONFIG_INIT_IMAGE:?required}
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?required}
+      SEARXNG_VALKEY_PASSWORD: ${SEARXNG_VALKEY_PASSWORD:?required}
+      SEARXNG_VALKEY_URL: ${SEARXNG_VALKEY_URL:?required}
+    command:
+    - /bin/sh
+    - -ec
+    - |-
+      umask 077
+      secret=$$(printf '%s' "$${SEARXNG_SECRET:?required}" | sed 's/[\\&|]/\\&/g')
+      valkey_url=$$(printf '%s' "$${SEARXNG_VALKEY_URL:?required}" | sed 's/[\\&|]/\\&/g')
+      sed \
+        -e "s|\$${SEARXNG_SECRET}|$$secret|g" \
+        -e "s|\$${SEARXNG_VALKEY_URL}|$$valkey_url|g" \
+        /template/settings.yml > /config/settings.yml
+      chmod 0600 /config/settings.yml
+      unset secret valkey_url SEARXNG_SECRET SEARXNG_VALKEY_PASSWORD
+    volumes:
+    - /opt/mte-platform/config/services/searxng/settings.yml:/template/settings.yml:ro
+    - searxng-config:/config
+    restart: 'no'
+    logging: *id001
+    ports: []
+  searxng:
+    image: ${MTE_SEARXNG_SEARXNG_IMAGE:?required}
+    environment:
+      SEARXNG_BASE_URL: ${SEARXNG_BASE_URL:?required}
+      SEARXNG_REDIS_URL: ${SEARXNG_VALKEY_URL:?required}
+    ports:
+    - ${MTE_SEARXNG_SEARXNG_PORT_1_MAPPING:?required}
+    volumes:
+    - searxng-config:/etc/searxng
+    - searxng-cache:/var/cache/searxng
+    networks:
+      search:
+        aliases:
+        - searxng
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    cpus: ${SEARXNG_CPU_LIMIT:?required}
+    mem_limit: ${SEARXNG_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+  valkey:
+    image: ${MTE_SEARXNG_VALKEY_IMAGE:?required}
+    user: 999:1000
+    environment:
+      SEARXNG_VALKEY_PASSWORD: ${SEARXNG_VALKEY_PASSWORD:?required}
+    command:
+    - /bin/sh
+    - -ec
+    - "umask 077\npassword=$$(printenv SEARXNG_VALKEY_PASSWORD)\ntest -n \"$$password\"\
+      \nconfig=/run/mte-searxng-valkey/valkey.conf\n{\n  printf '%s\\n' 'save 30 1'\
+      \ 'loglevel warning'\n  printf 'requirepass %s\\n' \"$$password\"\n} > \"$$config\"\
+      \nchmod 0600 \"$$config\"\nunset password SEARXNG_VALKEY_PASSWORD\nexec valkey-server\
+      \ \"$$config\""
+    tmpfs:
+    - /run/mte-searxng-valkey:rw,noexec,nosuid,nodev,mode=0700,uid=999,gid=1000
+    volumes:
+    - searxng-valkey:/data
+    networks:
+    - search
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - VALKEYCLI_AUTH="$${SEARXNG_VALKEY_PASSWORD:?required}" valkey-cli ping | grep
+        -q PONG
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    cpus: ${SEARXNG_VALKEY_CPU_LIMIT:?required}
+    mem_limit: ${SEARXNG_VALKEY_MEMORY_LIMIT:?required}
+    pids_limit: 128
+    logging: *id001
+    ports: []
+volumes:
+  searxng-config:
+    name: mte-searxng-config
+  searxng-cache:
+    name: mte-searxng-cache
+  searxng-valkey:
+    name: mte-searxng-valkey
+networks:
+  search:
+    name: mte-search

@@ -1,0 +1,39 @@
+model:
+  default: @@HERMES_LLM_MODEL@@
+  provider: @@HERMES_LLM_PROVIDER@@
+  base_url: @@HERMES_LLM_BASE_URL@@
+  api_mode: @@HERMES_LLM_API_MODE@@
+
+terminal:
+  backend: @@HERMES_TERMINAL_BACKEND@@
+  cwd: @@HERMES_TERMINAL_CWD@@
+  timeout: @@HERMES_TERMINAL_TIMEOUT@@
+  lifetime_seconds: @@HERMES_TERMINAL_LIFETIME_SECONDS@@
+  home_mode: @@HERMES_TERMINAL_HOME_MODE@@
+
+# The private deployment may grant the dedicated Hermes account broad sudo
+# access. Commands still follow Hermes' native approval policy; no custom API
+# bridge or command wrapper sits between Hermes and its terminal tool.
+command_allowlist: []
+
+approvals:
+  mode: @@HERMES_APPROVALS_MODE@@
+  timeout: @@HERMES_APPROVALS_TIMEOUT@@
+  cron_mode: @@HERMES_APPROVALS_CRON_MODE@@
+  mcp_reload_confirm: @@HERMES_APPROVALS_MCP_RELOAD_CONFIRM@@
+  destructive_slash_confirm: @@HERMES_APPROVALS_DESTRUCTIVE_SLASH_CONFIRM@@
+
+streaming:
+  enabled: @@HERMES_GATEWAY_STREAMING_ENABLED@@
+  transport: @@HERMES_GATEWAY_STREAMING_TRANSPORT@@
+
+telegram:
+  require_mention: @@HERMES_TELEGRAM_REQUIRE_MENTION@@
+  exclusive_bot_mentions: @@HERMES_TELEGRAM_EXCLUSIVE_BOT_MENTIONS@@
+  guest_mode: @@HERMES_TELEGRAM_GUEST_MODE@@
+
+display:
+  tool_progress: @@HERMES_DISPLAY_TOOL_PROGRESS@@
+  platforms:
+    telegram:
+      notifications: @@HERMES_TELEGRAM_NOTIFICATIONS@@

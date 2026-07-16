@@ -1,0 +1,37 @@
+datasources:
+  postgres:
+    url: jdbc:postgresql://mte-kestra-postgres:5432/kestra
+    driver-class-name: org.postgresql.Driver
+    username: kestra
+    password: ${KESTRA_DB_PASSWORD}
+
+kestra:
+  server:
+    basic-auth:
+      username: ${KESTRA_ADMIN_USER}
+      password: ${KESTRA_ADMIN_PASSWORD}
+      open-urls:
+        - /api/v1/main/executions/webhook/
+  repository:
+    type: postgres
+  storage:
+    type: local
+    local:
+      base-path: /app/storage
+  queue:
+    type: postgres
+  tasks:
+    tmp-dir:
+      path: /tmp/kestra-wd/tmp
+  url: http://127.0.0.1:8080/
+  anonymous-usage-report:
+    enabled: false
+
+endpoints:
+  all:
+    enabled: true
+    sensitive: false
+
+server:
+  liveness:
+    enabled: true

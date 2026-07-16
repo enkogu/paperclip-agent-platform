@@ -1,0 +1,53 @@
+name: mte-postgrest
+services:
+  postgrest:
+    image: ${MTE_POSTGREST_POSTGREST_IMAGE:?required}
+    environment:
+      PGRST_DB_URI: ${MTE_POSTGREST_POSTGREST_ENV_PGRST_DB_URI:?required}
+      PGHOST: ${POSTGREST_DB_HOST:?required}
+      PGPORT: ${POSTGREST_DB_PORT:?required}
+      PGSSLMODE: ${POSTGREST_DB_SSLMODE:?required}
+      PGUSER: ${POSTGREST_DB_LOGIN_ROLE:?required}
+      PGPASSWORD: ${POSTGREST_AUTHENTICATOR_PASSWORD:?required}
+      PGDATABASE: ${POSTGREST_DATA_DB_NAME:?required}
+      PGRST_DB_SCHEMAS: api
+      PGRST_DB_ANON_ROLE: ${POSTGREST_ANON_ROLE:?required}
+      PGRST_JWT_SECRET: ${POSTGREST_JWT_SECRET:?required}
+      PGRST_JWT_AUD: ${POSTGREST_API_AUDIENCE:?required}
+      PGRST_OPENAPI_MODE: ${MTE_POSTGREST_POSTGREST_ENV_PGRST_OPENAPI_MODE:?required}
+      PGRST_SERVER_PORT: ${MTE_POSTGREST_POSTGREST_ENV_PGRST_SERVER_PORT:?required}
+      PGRST_ADMIN_SERVER_PORT: ${MTE_POSTGREST_POSTGREST_ENV_PGRST_ADMIN_SERVER_PORT:?required}
+    ports:
+    - ${MTE_POSTGREST_POSTGREST_PORT_1_MAPPING:?required}
+    - ${MTE_POSTGREST_POSTGREST_PORT_2_MAPPING:?required}
+    networks:
+      data-plane:
+        aliases:
+        - postgrest
+    healthcheck:
+      test:
+      - CMD
+      - /bin/postgrest
+      - --version
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: ${POSTGREST_PIDS_LIMIT:?required}
+    security_opt:
+    - no-new-privileges:true
+    cpus: ${POSTGREST_CPU_LIMIT:?required}
+    mem_limit: ${POSTGREST_MEMORY_LIMIT:?required}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+networks:
+  data-plane:
+    name: mte-data-plane
+    external: true

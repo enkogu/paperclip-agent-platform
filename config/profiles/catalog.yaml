@@ -1,0 +1,421 @@
+apiVersion: micro-task-engine/v1alpha1
+kind: PaperclipProfileCatalog
+toolPolicies:
+  postgres-ssot-notion-readonly-v1:
+    sourceOfTruth: postgres
+    agentCanonicalWrite:
+      provider: postgrest
+      allowed: true
+      credentialRef: POSTGREST_PAPERCLIP_TOKEN
+    notionAgentAccess:
+      mode: read_only
+      rawCredentialInHarness: false
+      credentialDelivery: toolhive_workload_only
+      registry:
+        package: io.github.stacklok/notion
+        registryImage: ghcr.io/stacklok/dockyard/npx/notion:2.2.1
+        pinnedImage: ghcr.io/stacklok/dockyard/npx/notion@sha256:180a55ce48d1d08888abb9920a6d24ba178929e4131722579466c494eec3d08f
+        repositoryUrl: https://github.com/makenotion/notion-mcp-server
+        apiVersion: '2025-09-03'
+        secretRef: NOTION_TOKEN
+      allowedTools:
+        - API-get-block-children
+        - API-get-self
+        - API-get-user
+        - API-get-users
+        - API-list-data-source-templates
+        - API-post-search
+        - API-query-data-source
+        - API-retrieve-a-block
+        - API-retrieve-a-comment
+        - API-retrieve-a-data-source
+        - API-retrieve-a-database
+        - API-retrieve-a-page
+        - API-retrieve-a-page-property
+      deniedTools:
+        - API-create-a-comment
+        - API-create-a-data-source
+        - API-delete-a-block
+        - API-move-page
+        - API-patch-block-children
+        - API-patch-page
+        - API-post-page
+        - API-update-a-block
+        - API-update-a-data-source
+      enforcement:
+        provider: toolhive
+        runFlag: --tools
+        filtersToolsList: true
+        deniesToolsCall: true
+    notionWriteConnector:
+      identity: mte.notion.connector
+      executable: server-notion.py
+      credentialRef: NOTION_TOKEN
+      agentReachable: false
+      authority: postgres
+      operations:
+        - create
+        - update
+        - archive
+profiles:
+  - ref: coding-daytona-codex
+    title: Coding - Daytona / Codex
+    role: engineer
+    nativeAdapter: ${PROFILE_CODING_DAYTONA_CODEX_ADAPTER:?required}
+    defaultEnvironment: ${PROFILE_CODING_DAYTONA_CODEX_DEFAULT_ENVIRONMENT:?required}
+    workspaceMode: isolated_workspace
+    runtimeContract:
+      harnessKind: codex
+      adapterType: ${PROFILE_CODING_DAYTONA_CODEX_ADAPTER:?required}
+      protocol: openai-responses
+      packageKey: codex
+      runtimeSecretEnv: OPENAI_API_KEY
+      envAllowlist:
+        - CODEX_HOME
+        - GH_TOKEN
+        - GITHUB_TOKEN
+        - MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+        - MTE_TOOLHIVE_BEARER_TOKEN
+        - MTE_TOOLHIVE_BINDING_REF
+        - MTE_TOOLHIVE_BUNDLE_ID
+        - MTE_TOOLHIVE_CANARY_TOOL
+        - MTE_TOOLHIVE_ENDPOINT_REF
+        - MTE_TOOLHIVE_WORKLOAD_ID
+        - MTE_TOOLHIVE_WRONG_PROFILE_MCP_URL
+        - OPENAI_API_KEY
+        - OPENAI_BASE_URL
+        - PAPERCLIP_CODEX_PROVIDERS
+      providerManagedEnv:
+        CODEX_HOME:
+          kind: paperclip-agent-home
+          pathSuffix: codex-home
+      probe:
+        helloCode: codex_hello_probe_passed
+        acceptedWarnings: []
+    topology:
+      wrongProfileRef: coding-daytona-claude
+      toolhiveUpstreamRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_UPSTREAM
+      toolhiveGatewayPortRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_PORT
+      toolhiveProxyPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_PROXY_PORT
+      toolhiveIdentityPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_EVERYTHING_PROXY_PORT
+      toolhiveNotionPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_NOTION_PROXY_PORT
+    nativeAdapterConfig:
+      cwd: /home/daytona/workspaces/coding-daytona-codex
+      model: ${PROFILE_CODING_DAYTONA_CODEX_MODEL:?required}
+      extraArgs:
+        - -c
+        - model_provider="mte9router"
+        - -c
+        - model_providers.mte9router.name="MTE 9Router"
+        - -c
+        - model_providers.mte9router.base_url="${MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL:?required}"
+        - -c
+        - model_providers.mte9router.env_key="OPENAI_API_KEY"
+        - -c
+        - model_providers.mte9router.wire_api="responses"
+      timeoutSec: ${PROFILE_CODING_DAYTONA_CODEX_TIMEOUT_SEC:?required}
+      dangerouslyBypassApprovalsAndSandbox: true
+    instructions: instructions/coding.md
+    skills:
+      - verification-before-completion
+    mcpPolicy:
+      allow:
+        - github
+        - filesystem
+        - toolhive
+      deny:
+        - publishing
+    limits:
+      maxConcurrentRuns: ${PROFILE_CODING_DAYTONA_CODEX_MAX_CONCURRENT_RUNS:?required}
+      timeoutSeconds: ${PROFILE_CODING_DAYTONA_CODEX_TIMEOUT_SECONDS:?required}
+      cpu: ${PROFILE_CODING_DAYTONA_CODEX_CPU_LIMIT:?required}
+      memory: ${PROFILE_CODING_DAYTONA_CODEX_MEMORY_LIMIT:?required}
+    runtimePackages:
+      codex: ${PROFILE_CODING_DAYTONA_CODEX_PACKAGE_CODEX_VERSION:?required}
+      toolhive: ${PROFILE_CODING_DAYTONA_CODEX_PACKAGE_TOOLHIVE_VERSION:?required}
+    llmRouting:
+      provider: 9router
+      apiKeyRef: NINEROUTER_PROFILE_CODING_DAYTONA_CODEX_API_KEY
+    toolRouting:
+      provider: toolhive
+      mcpUrlRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+      bearerTokenRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN
+      servers:
+        - id: coding-daytona-codex-tools
+          endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+          credentialRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN
+          transport: streamable-http
+          aggregation: toolhive-vmcp
+          workloadRefs:
+            - mte-profile-codex
+            - mte-profile-codex-notion
+          capabilities:
+            - canary.echo
+            - notion.tables.read
+            - notion.documents.read
+    authPolicy:
+      oauthInImage: false
+      persistentSecretsInImage: false
+      runtimeSecretRefsOnly: true
+    toolAccess:
+      toolPolicyRef: postgres-ssot-notion-readonly-v1
+      bundleId: mte-profile-coding-daytona-codex
+      workloadId: mte-profile-codex
+      endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+      credentialRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN
+      canaryTool: echo
+      paperclipProfileRef: coding-daytona-codex
+      kestraCatalogKey: mte.profile.catalog
+      identityMode: mte_gateway_profile_bearer
+      identityEnforcer: mte-agent-plane-gateway
+      wrongProfileEndpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+      nativeToolHiveOidcConfigured: false
+      groupActsAsIdentity: false
+      aggregateMode: toolhive-vmcp
+      aggregateWorkloadIds:
+        - mte-profile-codex
+        - mte-profile-codex-notion
+      notionWorkloadId: mte-profile-codex-notion
+      notionRegistryPackage: io.github.stacklok/notion
+      notionSecretRef: NOTION_TOKEN
+      notionApiVersion: '2025-09-03'
+      notionToolCount: 13
+      notionRegistryToolCount: 22
+      notionAccessMode: read_only
+      notionRawCredentialInHarness: false
+      notionWriteConnectorIdentity: mte.notion.connector
+      capabilities:
+        - canary.echo
+        - notion.tables.read
+        - notion.documents.read
+  - ref: coding-daytona-claude
+    title: Coding - Daytona / Claude Code
+    role: engineer
+    nativeAdapter: ${PROFILE_CODING_DAYTONA_CLAUDE_ADAPTER:?required}
+    defaultEnvironment: ${PROFILE_CODING_DAYTONA_CLAUDE_DEFAULT_ENVIRONMENT:?required}
+    workspaceMode: isolated_workspace
+    runtimeContract:
+      harnessKind: claude
+      adapterType: ${PROFILE_CODING_DAYTONA_CLAUDE_ADAPTER:?required}
+      protocol: anthropic-messages
+      packageKey: claudeCode
+      runtimeSecretEnv: ANTHROPIC_API_KEY
+      envAllowlist:
+        - ANTHROPIC_API_KEY
+        - ANTHROPIC_BASE_URL
+        - GH_TOKEN
+        - GITHUB_TOKEN
+        - MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+        - MTE_TOOLHIVE_BEARER_TOKEN
+        - MTE_TOOLHIVE_BINDING_REF
+        - MTE_TOOLHIVE_BUNDLE_ID
+        - MTE_TOOLHIVE_CANARY_TOOL
+        - MTE_TOOLHIVE_ENDPOINT_REF
+        - MTE_TOOLHIVE_WORKLOAD_ID
+        - MTE_TOOLHIVE_WRONG_PROFILE_MCP_URL
+      providerManagedEnv: {}
+      probe:
+        helloCode: claude_hello_probe_passed
+        acceptedWarnings:
+          - claude_anthropic_api_key_overrides_subscription
+    topology:
+      wrongProfileRef: coding-daytona-pi
+      toolhiveUpstreamRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_UPSTREAM
+      toolhiveGatewayPortRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_PORT
+      toolhiveProxyPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_PROXY_PORT
+      toolhiveIdentityPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_EVERYTHING_PROXY_PORT
+      toolhiveNotionPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_NOTION_PROXY_PORT
+    nativeAdapterConfig:
+      cwd: /home/daytona/workspaces/coding-daytona-claude
+      model: ${PROFILE_CODING_DAYTONA_CLAUDE_MODEL:?required}
+      timeoutSec: ${PROFILE_CODING_DAYTONA_CLAUDE_TIMEOUT_SEC:?required}
+      dangerouslySkipPermissions: true
+    instructions: instructions/coding.md
+    skills:
+      - verification-before-completion
+    mcpPolicy:
+      allow:
+        - github
+        - filesystem
+        - toolhive
+      deny:
+        - publishing
+    limits:
+      maxConcurrentRuns: ${PROFILE_CODING_DAYTONA_CLAUDE_MAX_CONCURRENT_RUNS:?required}
+      timeoutSeconds: ${PROFILE_CODING_DAYTONA_CLAUDE_TIMEOUT_SECONDS:?required}
+      cpu: ${PROFILE_CODING_DAYTONA_CLAUDE_CPU_LIMIT:?required}
+      memory: ${PROFILE_CODING_DAYTONA_CLAUDE_MEMORY_LIMIT:?required}
+    runtimePackages:
+      claudeCode: ${PROFILE_CODING_DAYTONA_CLAUDE_PACKAGE_CLAUDECODE_VERSION:?required}
+      toolhive: ${PROFILE_CODING_DAYTONA_CLAUDE_PACKAGE_TOOLHIVE_VERSION:?required}
+    llmRouting:
+      provider: 9router
+      apiKeyRef: NINEROUTER_PROFILE_CODING_DAYTONA_CLAUDE_API_KEY
+    toolRouting:
+      provider: toolhive
+      mcpUrlRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+      bearerTokenRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN
+      servers:
+        - id: coding-daytona-claude-tools
+          endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+          credentialRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN
+          transport: streamable-http
+          aggregation: toolhive-vmcp
+          workloadRefs:
+            - mte-profile-claude
+            - mte-profile-claude-notion
+          capabilities:
+            - canary.echo
+            - notion.tables.read
+            - notion.documents.read
+    authPolicy:
+      oauthInImage: false
+      persistentSecretsInImage: false
+      runtimeSecretRefsOnly: true
+    toolAccess:
+      toolPolicyRef: postgres-ssot-notion-readonly-v1
+      bundleId: mte-profile-coding-daytona-claude
+      workloadId: mte-profile-claude
+      endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+      credentialRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN
+      canaryTool: echo
+      paperclipProfileRef: coding-daytona-claude
+      kestraCatalogKey: mte.profile.catalog
+      identityMode: mte_gateway_profile_bearer
+      identityEnforcer: mte-agent-plane-gateway
+      wrongProfileEndpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+      nativeToolHiveOidcConfigured: false
+      groupActsAsIdentity: false
+      aggregateMode: toolhive-vmcp
+      aggregateWorkloadIds:
+        - mte-profile-claude
+        - mte-profile-claude-notion
+      notionWorkloadId: mte-profile-claude-notion
+      notionRegistryPackage: io.github.stacklok/notion
+      notionSecretRef: NOTION_TOKEN
+      notionApiVersion: '2025-09-03'
+      notionToolCount: 13
+      notionRegistryToolCount: 22
+      notionAccessMode: read_only
+      notionRawCredentialInHarness: false
+      notionWriteConnectorIdentity: mte.notion.connector
+      capabilities:
+        - canary.echo
+        - notion.tables.read
+        - notion.documents.read
+  - ref: coding-daytona-pi
+    title: Coding - Daytona / Pi
+    role: engineer
+    nativeAdapter: ${PROFILE_CODING_DAYTONA_PI_ADAPTER:?required}
+    defaultEnvironment: ${PROFILE_CODING_DAYTONA_PI_DEFAULT_ENVIRONMENT:?required}
+    workspaceMode: isolated_workspace
+    runtimeContract:
+      harnessKind: pi
+      adapterType: ${PROFILE_CODING_DAYTONA_PI_ADAPTER:?required}
+      protocol: openai-chat-completions
+      packageKey: pi
+      runtimeSecretEnv: OPENAI_API_KEY
+      envAllowlist:
+        - GH_TOKEN
+        - GITHUB_TOKEN
+        - MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+        - MTE_TOOLHIVE_BEARER_TOKEN
+        - MTE_TOOLHIVE_BINDING_REF
+        - MTE_TOOLHIVE_BUNDLE_ID
+        - MTE_TOOLHIVE_CANARY_TOOL
+        - MTE_TOOLHIVE_ENDPOINT_REF
+        - MTE_TOOLHIVE_WORKLOAD_ID
+        - MTE_TOOLHIVE_WRONG_PROFILE_MCP_URL
+        - OPENAI_API_KEY
+        - OPENAI_BASE_URL
+        - PAPERCLIP_PI_PROVIDERS
+        - PI_CODING_AGENT_DIR
+      providerManagedEnv: {}
+      probe:
+        helloCode: pi_hello_probe_passed
+        acceptedWarnings: []
+    topology:
+      wrongProfileRef: coding-daytona-codex
+      toolhiveUpstreamRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_UPSTREAM
+      toolhiveGatewayPortRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_PORT
+      toolhiveProxyPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_PROXY_PORT
+      toolhiveIdentityPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_EVERYTHING_PROXY_PORT
+      toolhiveNotionPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_NOTION_PROXY_PORT
+    nativeAdapterConfig:
+      cwd: /home/daytona/workspaces/coding-daytona-pi
+      provider: ${PROFILE_CODING_DAYTONA_PI_PROVIDER:?required}
+      model: ${PROFILE_CODING_DAYTONA_PI_MODEL:?required}
+      timeoutSec: ${PROFILE_CODING_DAYTONA_PI_TIMEOUT_SEC:?required}
+    instructions: instructions/coding.md
+    skills:
+      - verification-before-completion
+    mcpPolicy:
+      allow:
+        - github
+        - filesystem
+        - toolhive
+      deny:
+        - publishing
+    limits:
+      maxConcurrentRuns: ${PROFILE_CODING_DAYTONA_PI_MAX_CONCURRENT_RUNS:?required}
+      timeoutSeconds: ${PROFILE_CODING_DAYTONA_PI_TIMEOUT_SECONDS:?required}
+      cpu: ${PROFILE_CODING_DAYTONA_PI_CPU_LIMIT:?required}
+      memory: ${PROFILE_CODING_DAYTONA_PI_MEMORY_LIMIT:?required}
+    runtimePackages:
+      pi: ${PROFILE_CODING_DAYTONA_PI_PACKAGE_PI_VERSION:?required}
+      toolhive: ${PROFILE_CODING_DAYTONA_PI_PACKAGE_TOOLHIVE_VERSION:?required}
+    llmRouting:
+      provider: 9router
+      apiKeyRef: NINEROUTER_PROFILE_CODING_DAYTONA_PI_API_KEY
+    toolRouting:
+      provider: toolhive
+      mcpUrlRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+      bearerTokenRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN
+      servers:
+        - id: coding-daytona-pi-tools
+          endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+          credentialRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN
+          transport: streamable-http
+          aggregation: toolhive-vmcp
+          workloadRefs:
+            - mte-profile-pi
+            - mte-profile-pi-notion
+          capabilities:
+            - canary.echo
+            - notion.tables.read
+            - notion.documents.read
+    authPolicy:
+      oauthInImage: false
+      persistentSecretsInImage: false
+      runtimeSecretRefsOnly: true
+    toolAccess:
+      toolPolicyRef: postgres-ssot-notion-readonly-v1
+      bundleId: mte-profile-coding-daytona-pi
+      workloadId: mte-profile-pi
+      endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+      credentialRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN
+      canaryTool: echo
+      paperclipProfileRef: coding-daytona-pi
+      kestraCatalogKey: mte.profile.catalog
+      identityMode: mte_gateway_profile_bearer
+      identityEnforcer: mte-agent-plane-gateway
+      wrongProfileEndpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+      nativeToolHiveOidcConfigured: false
+      groupActsAsIdentity: false
+      aggregateMode: toolhive-vmcp
+      aggregateWorkloadIds:
+        - mte-profile-pi
+        - mte-profile-pi-notion
+      notionWorkloadId: mte-profile-pi-notion
+      notionRegistryPackage: io.github.stacklok/notion
+      notionSecretRef: NOTION_TOKEN
+      notionApiVersion: '2025-09-03'
+      notionToolCount: 13
+      notionRegistryToolCount: 22
+      notionAccessMode: read_only
+      notionRawCredentialInHarness: false
+      notionWriteConnectorIdentity: mte.notion.connector
+      capabilities:
+        - canary.echo
+        - notion.tables.read
+        - notion.documents.read

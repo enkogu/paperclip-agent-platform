@@ -1,0 +1,33 @@
+[Unit]
+Description=Hermes Agent
+Documentation=https://github.com/NousResearch/hermes-agent
+Wants=network-online.target
+After=network-online.target docker.service
+ConditionPathExists=/root/.config/mte-secrets/hermes-runtime.env
+ConditionPathExists=/root/.config/mte-secrets/hermes-runtime.env.sha256
+
+[Service]
+Type=simple
+User=mte-hermes
+Group=mte-hermes
+WorkingDirectory=/opt/mte-platform
+Environment=HOME=/var/lib/mte-hermes
+Environment=HERMES_HOME=/var/lib/mte-hermes/.hermes
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/mte-hermes/current/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/root/.config/mte-secrets/hermes-runtime.env
+ExecStart=/opt/mte-hermes/current/venv/bin/hermes gateway run --replace
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=90s
+TimeoutStopSec=45s
+KillMode=mixed
+UMask=0077
+@@HERMES_PRIVILEGE_HARDENING@@
+
+# The installer renders a hardened unprivileged service by default. It removes
+# those directives only when the private deployment explicitly grants Hermes
+# broad host-administration access through the separately managed sudo policy.
+
+[Install]
+WantedBy=multi-user.target

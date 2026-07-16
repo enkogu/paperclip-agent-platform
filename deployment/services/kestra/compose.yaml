@@ -1,0 +1,78 @@
+name: mte-kestra
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '5'
+services:
+  kestra-storage-init:
+    image: ${MTE_KESTRA_KESTRA_IMAGE:?required}
+    user: 0:0
+    entrypoint:
+    - /bin/sh
+    - -ec
+    command:
+    - 'mkdir -p /app/storage
+
+      chown -R 1000:1000 /app/storage
+
+      chmod 0750 /app/storage
+
+      '
+    volumes:
+    - kestra-storage:/app/storage
+    restart: 'no'
+    logging: *id001
+    ports: []
+  kestra:
+    image: ${MTE_KESTRA_KESTRA_IMAGE:?required}
+    command:
+    - server
+    - standalone
+    - --config
+    - /etc/kestra/application.yaml
+    environment:
+      KESTRA_DB_PASSWORD: ${KESTRA_DB_PASSWORD:?required}
+      KESTRA_ADMIN_USER: ${KESTRA_ADMIN_USER:?required}
+      KESTRA_ADMIN_PASSWORD: ${KESTRA_ADMIN_PASSWORD:?required}
+    volumes:
+    - /opt/mte-platform/config/services/kestra/application.yaml:/etc/kestra/application.yaml:ro
+    - kestra-storage:/app/storage
+    depends_on:
+      kestra-storage-init:
+        condition: service_completed_successfully
+    ports:
+    - ${MTE_KESTRA_KESTRA_PORT_1_MAPPING:?required}
+    - ${MTE_KESTRA_KESTRA_PORT_2_MAPPING:?required}
+    extra_hosts:
+    - host.docker.internal:host-gateway
+    networks:
+    - kestra-data
+    - control
+    - llm
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - curl -fsS http://127.0.0.1:8081/health >/dev/null || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+    restart: unless-stopped
+    stop_grace_period: 6m
+    cpus: ${KESTRA_CPU_LIMIT:?required}
+    mem_limit: ${KESTRA_MEMORY_LIMIT:?required}
+    pids_limit: 1024
+    logging: *id001
+volumes:
+  kestra-storage:
+    name: mte-kestra-storage
+networks:
+  kestra-data:
+    name: mte-kestra-data
+    external: true
+  control:
+    name: mte-control
+  llm:
+    name: mte-llm
+    external: true

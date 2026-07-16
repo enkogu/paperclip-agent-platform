@@ -1,0 +1,459 @@
+apiVersion: micro-task-engine/v1alpha1
+kind: PlatformDeployment
+metadata:
+  name: mte-platform
+
+spec:
+  host:
+    name: managed-host
+    sshRef: MTE_SSH_TARGET
+    sshAllowedCidrsRef: MTE_OPERATOR_SSH_CIDRS
+    rootRef: MTE_PLATFORM_ROOT
+    secretsRootRef: MTE_SECRETS_ROOT
+    excludedRefs: [MTE_EXCLUDED_HOST_1, MTE_EXCLUDED_HOST_2]
+
+  domainRef: PLATFORM_BASE_DOMAIN
+  dataContentPlane:
+    profileRef: DATA_CONTENT_PROFILE
+    registrySection: dataContentProfiles
+    requiredRoles: [tablesUi, tablesApi, documentsUi, documentsApi]
+    projectionPath: config/data-content-plane.json
+    notionProjectionConsumer:
+      batchSizeRef: NOTION_SYNC_BATCH_SIZE
+      maxAttemptsRef: NOTION_SYNC_MAX_ATTEMPTS
+      leaseSecondsRef: NOTION_SYNC_LEASE_SECONDS
+      retryBaseSecondsRef: NOTION_SYNC_RETRY_BASE_SECONDS
+      intervalSecondsRef: NOTION_SYNC_INTERVAL_SECONDS
+  # Operator-visible availability belongs in the deployment manifest. The
+  # lock file still owns immutable provider contracts, image pins and
+  # licenses; the planner requires these selections to match it exactly.
+  providerProfiles:
+    postgres-notion:
+      providerIds: [postgres, postgrest, notion]
+      componentIds: [postgrest]
+    baserow-wikijs:
+      providerIds: [postgres, postgrest, baserow, wikijs]
+      componentIds: [postgrest, baserow, wikijs]
+    postgres-postgrest-nocodb-nocodocs:
+      providerIds: [postgres, postgrest, nocodb]
+      componentIds: [postgrest, nocodb]
+  provisionedCredentialRefs:
+    - BASEROW_PAPERCLIP_TOKEN
+    - BASEROW_PAPERCLIP_TOKEN_ID
+    - BASEROW_ACTIVEPIECES_TOKEN
+    - BASEROW_ACTIVEPIECES_TOKEN_ID
+    - POSTGREST_PAPERCLIP_TOKEN
+    - POSTGREST_ACTIVEPIECES_TOKEN
+    - NOCODB_API_TOKEN
+    - NOCODB_API_TOKEN_ID
+    - NOCODB_BASE_ID
+    - NOCODB_SOURCE_ID
+    - NOCODB_TABLE_ID
+    - NOTION_ROOT_PAGE_ID
+    - NOTION_DOCUMENTS_PAGE_ID
+    - NOTION_TABLE_DATABASE_ID
+    - NOTION_TABLE_DATA_SOURCE_ID
+    - NOTION_WORKSPACE_ID
+    - NOTION_BOT_ID
+    - WIKIJS_API_TOKEN
+    - WIKIJS_API_TOKEN_ID
+    - MATTERMOST_ALERT_WEBHOOK_URL
+  dokploy:
+    baseUrl: ${DOKPLOY_BASE_URL:?required}
+    project: MTE Platform
+    environment: production
+    apiKeyRef: DOKPLOY_API_TOKEN
+    ownerNameRef: DOKPLOY_ADMIN_NAME
+    ownerEmailRef: DOKPLOY_ADMIN_EMAIL
+    ownerPasswordRef: DOKPLOY_ADMIN_PASSWORD
+
+  cloudflare:
+    enabled: ${CLOUDFLARE_ENABLED:?required}
+    baseDomainRef: PLATFORM_BASE_DOMAIN
+    accountIdRef: CLOUDFLARE_ACCOUNT_ID
+    zoneIdRef: CLOUDFLARE_ZONE_ID
+    apiTokenRef: CLOUDFLARE_API_TOKEN
+    tunnelNameRef: CLOUDFLARE_TUNNEL_NAME
+    accessAllowedEmailsRef: CLOUDFLARE_ACCESS_ALLOWED_EMAILS
+    humanSessionDurationRef: CLOUDFLARE_ACCESS_SESSION_DURATION
+    serviceTokenDurationRef: CLOUDFLARE_SERVICE_TOKEN_DURATION
+    # Retained as an explicit empty compatibility field. New applications are
+    # first-class components with exposure declarations below.
+    additionalApps: []
+  components:
+    - id: dokploy
+      name: MTE Dokploy Control Plane
+      stage: 10
+      required: true
+      management: host-bootstrap
+      health:
+        command: "curl -fsS ${DOKPLOY_BASE_URL:?required}/settings.isCloud >/dev/null"
+      exposure:
+        subdomainRef: DOKPLOY_SUBDOMAIN
+        originPortRef: DOKPLOY_ORIGIN_PORT
+        accessClassRef: DOKPLOY_ACCESS_CLASS
+
+    - id: postgres
+      name: MTE Shared PostgreSQL
+      stage: 30
+      compose: deployment/services/postgres/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [POSTGRES_ADMIN_PASSWORD]
+      health:
+        command: "docker ps --filter \"label=com.docker.compose.project=$DOKPLOY_APP_NAME\" --filter health=healthy -q | grep -q ."
+
+    - id: mattermost-db
+      name: MTE Mattermost PostgreSQL
+      stage: 30
+      compose: deployment/services/mattermost-db/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [MATTERMOST_DB_PASSWORD]
+      health:
+        command: "docker ps --filter \"label=com.docker.compose.project=$DOKPLOY_APP_NAME\" --filter health=healthy -q | grep -q ."
+
+    - id: activepieces-data
+      name: MTE Activepieces Data
+      stage: 30
+      compose: deployment/services/activepieces-data/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [AP_POSTGRES_PASSWORD, AP_REDIS_PASSWORD]
+      health:
+        command: "test $(docker ps --filter \"label=com.docker.compose.project=$DOKPLOY_APP_NAME\" --filter health=healthy -q | wc -l) -ge 2"
+
+    - id: kestra-data
+      name: MTE Kestra Data
+      stage: 30
+      compose: deployment/services/kestra-data/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [KESTRA_DB_PASSWORD]
+      health:
+        command: "docker ps --filter \"label=com.docker.compose.project=$DOKPLOY_APP_NAME\" --filter health=healthy -q | grep -q ."
+
+    - id: 9router
+      name: MTE 9Router
+      stage: 40
+      compose: deployment/services/9router/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [NINEROUTER_INITIAL_PASSWORD, NINEROUTER_JWT_SECRET, NINEROUTER_API_KEY_SECRET, NINEROUTER_MACHINE_ID_SALT]
+      health:
+        url: ${NINEROUTER_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: NINEROUTER_SUBDOMAIN
+        originPortRef: NINEROUTER_ORIGIN_PORT
+        accessClassRef: NINEROUTER_ACCESS_CLASS
+
+    - id: kestra
+      name: MTE Kestra
+      stage: 40
+      compose: deployment/services/kestra/compose.yaml
+      required: true
+      dependsOn: [kestra-data, 9router]
+      secrets: [KESTRA_DB_PASSWORD, KESTRA_ADMIN_USER, KESTRA_ADMIN_PASSWORD]
+      health:
+        url: ${KESTRA_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: KESTRA_SUBDOMAIN
+        originPortRef: KESTRA_ORIGIN_PORT
+        accessClassRef: KESTRA_ACCESS_CLASS
+
+    - id: paperclip
+      name: MTE Paperclip
+      stage: 40
+      required: true
+      management: host-runtime
+      dependsOn: [9router]
+      health:
+        url: ${PAPERCLIP_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: PAPERCLIP_SUBDOMAIN
+        originPortRef: PAPERCLIP_ORIGIN_PORT
+        accessClassRef: PAPERCLIP_ACCESS_CLASS
+
+    - id: toolhive
+      name: MTE ToolHive
+      stage: 50
+      compose: deployment/services/toolhive/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets:
+        - TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN
+        - TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN
+        - TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN
+      health:
+        url: ${TOOLHIVE_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: TOOLHIVE_SUBDOMAIN
+        originPortRef: TOOLHIVE_ORIGIN_PORT
+        accessClassRef: TOOLHIVE_ACCESS_CLASS
+
+    - id: daytona
+      name: MTE Daytona Environment Provider
+      stage: 50
+      required: true
+      management: paperclip-plugin-runtime
+      dependsOn: [paperclip]
+      health:
+        command: "docker ps --filter name=^/mte-daytona-api$ --filter health=healthy -q | grep -q ."
+
+    - id: activepieces
+      name: MTE Activepieces
+      stage: 50
+      compose: deployment/services/activepieces/compose.yaml
+      required: true
+      dependsOn: [activepieces-data, toolhive, postgres, postgrest]
+      secrets: [AP_ENCRYPTION_KEY, AP_JWT_SECRET, AP_POSTGRES_PASSWORD, AP_REDIS_PASSWORD, POSTGREST_ACTIVEPIECES_TOKEN]
+      health:
+        url: ${ACTIVEPIECES_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: ACTIVEPIECES_SUBDOMAIN
+        originPortRef: ACTIVEPIECES_ORIGIN_PORT
+        accessClassRef: ACTIVEPIECES_ACCESS_CLASS
+
+    - id: baserow
+      name: MTE Baserow OSE
+      stage: 60
+      compose: deployment/services/baserow/compose.yaml
+      required: true
+      enabledForProfiles: [baserow-wikijs]
+      dependsOn: [postgres]
+      secrets:
+        - BASEROW_SECRET_KEY
+        - BASEROW_DB_PASSWORD
+        - BASEROW_REDIS_PASSWORD
+        - BASEROW_ADMIN_PASSWORD
+        - BASEROW_PAPERCLIP_TOKEN
+        - BASEROW_ACTIVEPIECES_TOKEN
+        - BASEROW_MCP_ENDPOINT_KEY
+      health:
+        url: ${BASEROW_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: BASEROW_SUBDOMAIN
+        originPortRef: BASEROW_ORIGIN_PORT
+        accessClassRef: BASEROW_ACCESS_CLASS
+
+    - id: wikijs
+      name: MTE Wiki.js
+      stage: 60
+      compose: deployment/services/wikijs/compose.yaml
+      required: true
+      enabledForProfiles: [baserow-wikijs]
+      dependsOn: [postgres]
+      secrets: [WIKIJS_DB_PASSWORD, WIKIJS_ADMIN_PASSWORD, WIKIJS_API_TOKEN]
+      health:
+        url: ${WIKIJS_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: WIKIJS_SUBDOMAIN
+        originPortRef: WIKIJS_ORIGIN_PORT
+        accessClassRef: WIKIJS_ACCESS_CLASS
+
+    - id: postgrest
+      name: MTE PostgREST Agent Data API
+      stage: 60
+      compose: deployment/services/postgrest/compose.yaml
+      required: true
+      enabledForProfiles: [postgres-notion, baserow-wikijs, postgres-postgrest-nocodb-nocodocs]
+      dependsOn: [postgres]
+      secrets: [POSTGREST_DATA_DB_PASSWORD, POSTGREST_AUTHENTICATOR_PASSWORD, POSTGREST_JWT_SECRET, POSTGREST_PAPERCLIP_TOKEN, POSTGREST_ACTIVEPIECES_TOKEN]
+      configurationRefs:
+        - POSTGREST_DB_HOST
+        - POSTGREST_DB_PORT
+        - POSTGREST_DB_SSLMODE
+        - POSTGREST_DATA_DB_NAME
+        - POSTGREST_DATA_DB_USER
+        - POSTGREST_DB_LOGIN_ROLE
+        - POSTGREST_ANON_ROLE
+        - POSTGREST_READER_ROLE
+        - POSTGREST_WRITER_ROLE
+        - POSTGREST_PAPERCLIP_ROLE
+        - POSTGREST_ACTIVEPIECES_ROLE
+        - POSTGREST_API_AUDIENCE
+      health:
+        url: ${POSTGREST_HEALTH_URL:?required}
+
+    - id: nocodb
+      name: MTE NocoDB Tables UI and NocoDocs
+      stage: 60
+      compose: deployment/services/nocodb/compose.yaml
+      required: true
+      enabledForProfiles: [postgres-postgrest-nocodb-nocodocs]
+      dependsOn: [postgres, postgrest]
+      secrets:
+        - NOCODB_META_DB_PASSWORD
+        - NOCODB_DATA_DB_PASSWORD
+        - NOCODB_ADMIN_PASSWORD
+        - NOCODB_JWT_SECRET
+        - NOCODB_API_TOKEN
+        - NOCODB_LICENSE_KEY
+      configurationRefs:
+        - NOCODB_DB_HOST
+        - NOCODB_DB_PORT
+        - NOCODB_DB_SSLMODE
+        - NOCODB_META_DB_NAME
+        - NOCODB_META_DB_USER
+        - NOCODB_DATA_DB_USER
+        - NOCODB_ADMIN_EMAIL
+        - NOCODB_BASE_TITLE
+        - NOCODB_TABLE_TITLE
+      health:
+        url: ${NOCODB_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: NOCODB_SUBDOMAIN
+        originPortRef: NOCODB_ORIGIN_PORT
+        accessClassRef: NOCODB_ACCESS_CLASS
+
+    - id: mattermost
+      name: MTE Mattermost
+      stage: 60
+      compose: deployment/services/mattermost/compose.yaml
+      required: true
+      dependsOn: [mattermost-db]
+      secrets: [MATTERMOST_DB_PASSWORD]
+      health:
+        url: ${MATTERMOST_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: MATTERMOST_SUBDOMAIN
+        originPortRef: MATTERMOST_ORIGIN_PORT
+        accessClassRef: MATTERMOST_ACCESS_CLASS
+
+    - id: searxng
+      name: MTE SearXNG
+      stage: 60
+      compose: deployment/services/searxng/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [SEARXNG_SECRET, SEARXNG_VALKEY_PASSWORD]
+      health:
+        url: ${SEARXNG_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: SEARXNG_SUBDOMAIN
+        originPortRef: SEARXNG_ORIGIN_PORT
+        accessClassRef: SEARXNG_ACCESS_CLASS
+
+    - id: firecrawl
+      name: MTE Firecrawl
+      stage: 60
+      compose: deployment/services/firecrawl/compose.yaml
+      required: true
+      dependsOn: [searxng]
+      secrets: [FIRECRAWL_DB_PASSWORD, FIRECRAWL_REDIS_PASSWORD]
+      health:
+        url: ${FIRECRAWL_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: FIRECRAWL_SUBDOMAIN
+        originPortRef: FIRECRAWL_ORIGIN_PORT
+        accessClassRef: FIRECRAWL_ACCESS_CLASS
+
+    - id: observability
+      name: MTE Observability
+      stage: 70
+      compose: deployment/services/observability/compose.yaml
+      required: true
+      dependsOn: [dokploy]
+      secrets: [GRAFANA_ADMIN_USER, GRAFANA_ADMIN_PASSWORD, MATTERMOST_ALERT_WEBHOOK_URL]
+      health:
+        url: ${OBSERVABILITY_HEALTH_URL:?required}
+      exposure:
+        subdomainRef: GRAFANA_SUBDOMAIN
+        originPortRef: GRAFANA_ORIGIN_PORT
+        accessClassRef: GRAFANA_ACCESS_CLASS
+
+    - id: hermes
+      name: MTE Hermes Operator
+      stage: 80
+      required: true
+      management: systemd
+      runtime:
+        command: /opt/mte-hermes/current/venv/bin/hermes gateway run --replace
+        apiExposure: loopback
+        llmRoute: 9router
+        messaging: [telegram, mattermost]
+        operatorMode: unrestricted_host_repair
+      dependsOn: [paperclip, kestra, 9router, toolhive, mattermost]
+      secrets:
+        - HERMES_LLM_API_KEY
+        - HERMES_TELEGRAM_BOT_TOKEN
+        - HERMES_TELEGRAM_ALLOWED_USERS
+      health:
+        command: systemctl is-active --quiet mte-hermes
+
+    - id: cloudflare-edge
+      name: MTE Cloudflare Tunnel and Access
+      stage: 90
+      required: true
+      management: opentofu-and-cloudflared
+      dependsOn: [dokploy, 9router, kestra, paperclip, toolhive, activepieces, mattermost, searxng, firecrawl, observability]
+      health:
+        command: "docker ps --filter name=^/mte-cloudflared$ --filter status=running -q | grep -q ."
+
+  profiles:
+    catalog: config/profiles/catalog.yaml
+    generatedRoot: /opt/mte-platform/generated/profiles
+
+  paperclipExperimental:
+    apiBase: ${PAPERCLIP_API_BASE:?required}
+    localEnvironment:
+      name: MTE Local Isolated Workspaces
+      workspaceRoot: ${PAPERCLIP_WORKSPACE_ROOT:?required}
+      projectName: MTE Isolated Workspace Canary
+      branchTemplate: "{{issue.identifier}}"
+    secrets:
+      strictMode: ${PAPERCLIP_SECRETS_STRICT_MODE:?required}
+      provider: local_encrypted
+      bindingName: MTE_PLATFORM_SERVICE_TOKEN
+      secretName: mte-platform-service-token
+      valueRef: PAPERCLIP_SERVICE_TOKEN
+    daytona:
+      enabled: ${DAYTONA_ENABLED:?required}
+      pluginPackage: "@paperclipai/plugin-daytona"
+      pluginVersion: ${DAYTONA_PLUGIN_VERSION:?required}
+      environmentName: ${MTE_DAYTONA_ENVIRONMENT_NAME:?required}
+      apiKeyRef: DAYTONA_API_KEY
+      apiUrlRef: DAYTONA_API_URL
+      targetRef: DAYTONA_TARGET
+      secretName: mte-daytona-api-key
+      image: ${MTE_DAYTONA_CODING_IMAGE:?required}
+      memoryGiB: ${DAYTONA_MEMORY_GIB:?required}
+      diskGiB: ${MTE_DAYTONA_DISK_GIB:?required}
+      timeoutMs: ${MTE_DAYTONA_TIMEOUT_MS:?required}
+      customImageLifecycle: ${DAYTONA_CUSTOM_IMAGE_LIFECYCLE:?required}
+      probe: ${DAYTONA_PROBE_ENABLED:?required}
+
+  e2eCanary:
+    runner: server-e2e-canary.py
+    profiles:
+      - coding-daytona-codex
+      - coding-daytona-claude
+      - coding-daytona-pi
+    profileContracts:
+      coding-daytona-codex:
+        nativeAdapter: codex_local
+        requireExplicitProvider: false
+      coding-daytona-claude:
+        nativeAdapter: claude_local
+        requireExplicitProvider: false
+      coding-daytona-pi:
+        nativeAdapter: pi_local
+        requireExplicitProvider: true
+    paperclipPortRef: PAPERCLIP_PORT
+    paperclipLoopbackHost: ${PAPERCLIP_LOOPBACK_HOST:?required}
+    paperclipContainerHost: ${PAPERCLIP_CONTAINER_HOST:?required}
+    kestraPortRef: KESTRA_HTTP_PORT
+    kestraLoopbackHost: ${KESTRA_LOOPBACK_HOST:?required}
+    githubOwner: enkogu
+    githubRepository: aesthetic-diagrams
+    baseBranch: main
+    cleanup: ${E2E_CLEANUP_ENABLED:?required}
+    requireArtifactsEndpoint: ${E2E_REQUIRE_ARTIFACTS_ENDPOINT:?required}
+    requireGitHubDraftPr: ${E2E_REQUIRE_GITHUB_DRAFT_PR:?required}
+    requireChecks: ${E2E_REQUIRE_CHECKS:?required}
+    llmCredentialRefs: [MINIMAX_API_KEY, MINIMAX_BASE_URL, MINIMAX_MODEL]
+    githubCredentialRefs: [GITHUB_TOKEN]
+
+  evidence:
+    local: evidence/platform
+    server: /opt/mte-platform/evidence

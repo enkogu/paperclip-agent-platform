@@ -1,0 +1,32 @@
+# Paperclip Agent Platform currently ships as an infrastructure repository, not
+# as an importable Python wheel. PEP 735 dependency groups keep the development
+# environment declarative without publishing an empty or misleading package.
+
+[dependency-groups]
+release-check = [
+  "PyYAML==6.0.3",
+  "pytest==9.1.1",
+  "ruff==0.12.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests"]
+addopts = "--strict-config --strict-markers"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+extend-exclude = [
+  ".npm-cache",
+  ".runtime",
+  "evidence",
+  "state",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

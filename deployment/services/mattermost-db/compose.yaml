@@ -1,0 +1,40 @@
+name: mte-mattermost-db
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '5'
+services:
+  postgres:
+    image: ${MTE_MATTERMOST_DB_POSTGRES_IMAGE:?required}
+    environment:
+      POSTGRES_USER: ${MATTERMOST_DB_USER:?required}
+      POSTGRES_PASSWORD: ${MATTERMOST_DB_PASSWORD:?required}
+      POSTGRES_DB: ${MATTERMOST_DB_NAME:?required}
+    volumes:
+    - mattermost-db-data:/var/lib/postgresql/data
+    networks:
+      mattermost-data:
+        aliases:
+        - mte-mattermost-postgres
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U ${MATTERMOST_DB_USER:?required} -d ${MATTERMOST_DB_NAME:?required}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 60s
+    cpus: ${MATTERMOST_DB_CPU_LIMIT:?required}
+    mem_limit: ${MATTERMOST_DB_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+    ports: []
+volumes:
+  mattermost-db-data:
+    name: mte-mattermost-db-data
+networks:
+  mattermost-data:
+    name: mte-mattermost-data

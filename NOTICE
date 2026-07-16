@@ -1,0 +1,16 @@
+Paperclip Agent Platform
+Copyright 2026 Paperclip Agent Platform contributors
+
+This product includes original orchestration, deployment, verification, and
+integration code licensed under the Apache License, Version 2.0.
+
+The project configures and interoperates with independently distributed
+third-party software. Those projects, container images, command-line tools,
+hosted APIs, names, and trademarks remain governed by their respective
+licenses and policies. The Apache-2.0 license in this repository does not
+relicense them. See docs/en/third-party.md and platform.lock.yaml.
+
+Licensing rationale: Apache-2.0 gives downstream operators an explicit patent
+grant and permissive rights for the original platform code, while preserving
+all third-party license boundaries. Copyleft runtime components are consumed
+as separate services or images; their source is not relicensed by this notice.

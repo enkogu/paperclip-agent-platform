@@ -1,0 +1,25 @@
+id: platform-canary
+namespace: system.health
+description: Checks internal platform endpoints once a minute.
+
+concurrency:
+  limit: 1
+  behavior: CANCEL
+
+tasks:
+  - id: router_health
+    type: io.kestra.plugin.core.http.Request
+    uri: http://9router:20128/api/health
+    method: GET
+    timeout: PT5S
+
+  - id: paperclip_health
+    type: io.kestra.plugin.core.http.Request
+    uri: http://host.docker.internal:3100/api/health
+    method: GET
+    timeout: PT5S
+
+triggers:
+  - id: every_minute
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "* * * * *"

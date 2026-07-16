@@ -1,0 +1,425 @@
+name: mte-observability
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+services:
+  config-init:
+    image: ${MTE_OBSERVABILITY_CONFIG_INIT_IMAGE:?required}
+    environment:
+      MATTERMOST_ALERT_WEBHOOK_URL: ${MATTERMOST_ALERT_WEBHOOK_URL:?required}
+    volumes:
+    - observability-config:/config
+    entrypoint:
+    - /bin/sh
+    - -ec
+    command:
+    - "mkdir -p /config/datasources /config/dashboards /config/dashboards-json\ncat\
+      \ > /config/blackbox.yml <<'EOF'\nmodules:\n  http_2xx:\n    prober: http\n\
+      \    timeout: 5s\n    http:\n      method: GET\n      preferred_ip_protocol:\
+      \ ip4\n      valid_status_codes: [200, 204]\nEOF\ncat > /config/otel.yml <<'EOF'\n\
+      receivers:\n  otlp:\n    protocols:\n      grpc:\n        endpoint: 127.0.0.1:4317\n\
+      \      http:\n        endpoint: 127.0.0.1:4318\n  hostmetrics:\n    root_path:\
+      \ /hostfs\n    collection_interval: 30s\n    scrapers:\n      cpu: {}\n    \
+      \  disk: {}\n      filesystem:\n        exclude_mount_points:\n          mount_points:\
+      \ [/dev/*, /proc/*, /sys/*, /var/lib/docker/*]\n          match_type: regexp\n\
+      \      load: {}\n      memory: {}\n      network: {}\n      paging: {}\n  filelog/docker:\n\
+      \    include: [/var/lib/docker/containers/*/*.log]\n    include_file_path: true\n\
+      \    start_at: end\n    operators:\n      - type: json_parser\n        id: docker_json\n\
+      \      - type: move\n        from: attributes.log\n        to: body\n      -\
+      \ type: regex_parser\n        id: container_id\n        parse_from: attributes[\"\
+      log.file.path\"]\n        regex: '^/var/lib/docker/containers/(?P<container_id>[^/]+)/.*$'\n\
+      \  prometheus:\n    config:\n      scrape_configs:\n        - job_name: node\n\
+      \          scrape_interval: 30s\n          static_configs:\n            - targets:\
+      \ [127.0.0.1:19100]\n        - job_name: containers\n          scrape_interval:\
+      \ 30s\n          static_configs:\n            - targets: [127.0.0.1:18094]\n\
+      \        - job_name: observability\n          scrape_interval: 30s\n       \
+      \   static_configs:\n            - targets:\n                - 127.0.0.1:18428\n\
+      \                - 127.0.0.1:19428\n                - 127.0.0.1:10428\n    \
+      \            - 127.0.0.1:18881\n                - 127.0.0.1:18888\n        -\
+      \ job_name: platform_health\n          scrape_interval: 30s\n          metrics_path:\
+      \ /probe\n          params:\n            module: [http_2xx]\n          static_configs:\n\
+      \            - targets: [http://127.0.0.1:20128/api/health]\n              labels:\
+      \ {service: 9router}\n            - targets: [http://127.0.0.1:18081/health]\n\
+      \              labels: {service: kestra}\n            - targets: [http://127.0.0.1:3100/api/health]\n\
+      \              labels: {service: paperclip}\n            - targets: [http://127.0.0.1:18880/api/openapi.json]\n\
+      \              labels: {service: toolhive}\n            - targets: [http://127.0.0.1:18090/api/v1/health]\n\
+      \              labels: {service: activepieces}\n            - targets: [http://127.0.0.1:18085/api/_health/]\n\
+      \              labels: {service: baserow}\n            - targets: [http://127.0.0.1:18086/healthz]\n\
+      \              labels: {service: wikijs}\n            - targets: [http://127.0.0.1:18065/api/v4/system/ping]\n\
+      \              labels: {service: mattermost}\n            - targets: [http://127.0.0.1:13002/]\n\
+      \              labels: {service: firecrawl}\n            - targets: [http://127.0.0.1:18088/]\n\
+      \              labels: {service: searxng}\n            - targets: [http://127.0.0.1:13000/api/health]\n\
+      \              labels: {service: observability}\n          relabel_configs:\n\
+      \            - source_labels: [__address__]\n              target_label: __param_target\n\
+      \            - source_labels: [__param_target]\n              target_label:\
+      \ instance\n            - target_label: __address__\n              replacement:\
+      \ 127.0.0.1:19115\nprocessors:\n  memory_limiter:\n    check_interval: 2s\n\
+      \    limit_mib: 384\n    spike_limit_mib: 96\n  resource:\n    attributes:\n\
+      \      - action: upsert\n        key: deployment.environment\n        value:\
+      \ production\n      - action: upsert\n        key: host.name\n        value:\
+      \ storage-161-97-99-120\n  batch:\n    timeout: 5s\n    send_batch_size: 1024\n\
+      exporters:\n  otlphttp/victoriametrics:\n    compression: gzip\n    encoding:\
+      \ proto\n    metrics_endpoint: http://127.0.0.1:18428/opentelemetry/v1/metrics\n\
+      \  otlphttp/victorialogs:\n    compression: gzip\n    encoding: proto\n    logs_endpoint:\
+      \ http://127.0.0.1:19428/insert/opentelemetry/v1/logs\n    headers:\n      VL-Stream-Fields:\
+      \ host.name,service.name,container_id\n  otlphttp/victoriatraces:\n    compression:\
+      \ gzip\n    encoding: proto\n    traces_endpoint: http://127.0.0.1:10428/insert/opentelemetry/v1/traces\n\
+      extensions:\n  health_check:\n    endpoint: 127.0.0.1:13133\nservice:\n  extensions:\
+      \ [health_check]\n  telemetry:\n    metrics:\n      readers:\n        - pull:\n\
+      \            exporter:\n              prometheus:\n                host: 127.0.0.1\n\
+      \                port: 18888\n  pipelines:\n    metrics:\n      receivers: [otlp,\
+      \ hostmetrics, prometheus]\n      processors: [memory_limiter, resource, batch]\n\
+      \      exporters: [otlphttp/victoriametrics]\n    logs:\n      receivers: [otlp,\
+      \ filelog/docker]\n      processors: [memory_limiter, resource, batch]\n   \
+      \   exporters: [otlphttp/victorialogs]\n    traces:\n      receivers: [otlp]\n\
+      \      processors: [memory_limiter, resource, batch]\n      exporters: [otlphttp/victoriatraces]\n\
+      EOF\ncat > /config/rules.yml <<'EOF'\ngroups:\n  - name: platform-health\n \
+      \   interval: 30s\n    rules:\n      - alert: PlatformEndpointDown\n       \
+      \ expr: probe_success{service.name=\"platform_health\"} == 0\n        for: 2m\n\
+      \        labels:\n          severity: critical\n        annotations:\n     \
+      \     summary: \"{{ $$labels.service }} endpoint is down\"\n          description:\
+      \ \"Health probe failed for {{ $$labels.instance }}\"\n      - alert: HostMemoryPressure\n\
+      \        expr: 100 * (1 - system_memory_usage{state=\"used\"} / system_memory_limit)\
+      \ < 10\n        for: 5m\n        labels:\n          severity: warning\n    \
+      \    annotations:\n          summary: Host free memory is below 10 percent\n\
+      \      - alert: ContainerRestarting\n        expr: increase(container_start_time_seconds[10m])\
+      \ > 1\n        for: 2m\n        labels:\n          severity: warning\n     \
+      \   annotations:\n          summary: \"Container {{ $$labels.name }} restarted\"\
+      \nEOF\nif [ -n \"$${MATTERMOST_ALERT_WEBHOOK_URL:?required}\" ]; then\n  cat\
+      \ > /config/alertmanager.yml <<EOF\nroute:\n  receiver: mattermost\n  group_by:\
+      \ [alertname, service]\n  group_wait: 30s\n  group_interval: 5m\n  repeat_interval:\
+      \ 4h\nreceivers:\n  - name: mattermost\n    slack_configs:\n      - api_url:\
+      \ \"$${MATTERMOST_ALERT_WEBHOOK_URL:?required}\"\n        send_resolved: true\n\
+      \        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'\n\
+      \        text: '{{ range .Alerts }}{{ .Annotations.summary }}\\\\n{{ .Annotations.description\
+      \ }}{{ end }}'\nEOF\nelse\n  cat > /config/alertmanager.yml <<'EOF'\nroute:\n\
+      \  receiver: local-null\n  group_by: [alertname, service]\nreceivers:\n  - name:\
+      \ local-null\nEOF\nfi\ncat > /config/datasources/datasources.yml <<'EOF'\napiVersion:\
+      \ 1\ndeleteDatasources:\n  - {name: VictoriaMetrics, orgId: 1}\n  - {name: VictoriaLogs,\
+      \ orgId: 1}\n  - {name: VictoriaTraces, orgId: 1}\ndatasources:\n  - name: VictoriaMetrics\n\
+      \    uid: victoriametrics\n    type: prometheus\n    access: proxy\n    url:\
+      \ http://victoriametrics:8428\n    isDefault: true\n    editable: false\n  -\
+      \ name: VictoriaLogs\n    uid: victorialogs\n    type: victoriametrics-logs-datasource\n\
+      \    access: proxy\n    url: http://victorialogs:9428\n    editable: false\n\
+      \  - name: VictoriaTraces\n    uid: victoriatraces\n    type: jaeger\n    access:\
+      \ proxy\n    url: http://victoriatraces:10428/select/jaeger\n    editable: false\n\
+      EOF\ncat > /config/dashboards/provider.yml <<'EOF'\napiVersion: 1\nproviders:\n\
+      \  - name: mte-platform\n    orgId: 1\n    folder: MTE Platform\n    type: file\n\
+      \    disableDeletion: true\n    editable: false\n    options:\n      path: /etc/grafana/provisioning/dashboards-json\n\
+      EOF\ncat > /config/dashboards-json/platform.json <<'EOF'\n{\n  \"annotations\"\
+      :{\"list\":[]},\n  \"editable\":false,\n  \"graphTooltip\":1,\n  \"panels\"\
+      :[\n    {\"type\":\"stat\",\"title\":\"Platform endpoints up\",\"datasource\"\
+      :{\"type\":\"prometheus\",\"uid\":\"victoriametrics\"},\"targets\":[{\"expr\"\
+      :\"sum(probe_success{service.name=\\\"platform_health\\\",service=~\\\"$$service\\\
+      \"})\",\"refId\":\"A\"}],\"gridPos\":{\"h\":7,\"w\":8,\"x\":0,\"y\":0}},\n \
+      \   {\"type\":\"timeseries\",\"title\":\"Endpoint availability\",\"datasource\"\
+      :{\"type\":\"prometheus\",\"uid\":\"victoriametrics\"},\"targets\":[{\"expr\"\
+      :\"probe_success{service.name=\\\"platform_health\\\",service=~\\\"$$service\\\
+      \"}\",\"legendFormat\":\"{{service}}\",\"refId\":\"A\"}],\"gridPos\":{\"h\"\
+      :7,\"w\":16,\"x\":8,\"y\":0}},\n    {\"type\":\"logs\",\"title\":\"Task and\
+      \ run log search\",\"datasource\":{\"type\":\"victoriametrics-logs-datasource\"\
+      ,\"uid\":\"victorialogs\"},\"targets\":[{\"expr\":\"\\\"$$task_id\\\" AND \\\
+      \"$$run_id\\\"\",\"refId\":\"A\"}],\"gridPos\":{\"h\":12,\"w\":24,\"x\":0,\"\
+      y\":7}}\n  ],\n  \"schemaVersion\":42,\n  \"tags\":[\"mte\",\"agents\",\"task_id\"\
+      ,\"run_id\"],\n  \"templating\":{\"list\":[\n    {\"name\":\"service\",\"type\"\
+      :\"query\",\"datasource\":{\"type\":\"prometheus\",\"uid\":\"victoriametrics\"\
+      },\"query\":{\"query\":\"label_values(probe_success{service.name=\\\"platform_health\\\
+      \"}, service)\",\"refId\":\"service\"},\"includeAll\":true,\"multi\":true,\"\
+      current\":{\"text\":\"All\",\"value\":\"$$__all\"}},\n    {\"name\":\"task_id\"\
+      ,\"type\":\"textbox\",\"label\":\"task_id\",\"query\":\"\",\"current\":{\"text\"\
+      :\"\",\"value\":\"\"}},\n    {\"name\":\"run_id\",\"type\":\"textbox\",\"label\"\
+      :\"run_id\",\"query\":\"\",\"current\":{\"text\":\"\",\"value\":\"\"}}\n  ]},\n\
+      \  \"time\":{\"from\":\"now-6h\",\"to\":\"now\"},\n  \"title\":\"MTE Platform:\
+      \ Agents and Services\",\n  \"uid\":\"mte-platform-overview\",\n  \"version\"\
+      :1\n}\nEOF\nchmod -R a+rX /config\n"
+    restart: 'no'
+    cpus: ${MTE_OBSERVABILITY_CONFIG_INIT_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_CONFIG_INIT_MEMORY_LIMIT:?required}
+    pids_limit: 64
+    logging: *id001
+    ports: []
+  victoriametrics:
+    image: ${MTE_OBSERVABILITY_VICTORIAMETRICS_IMAGE:?required}
+    command:
+    - -storageDataPath=/victoria-metrics-data
+    - -retentionPeriod=14d
+    - -httpListenAddr=:8428
+    - -vmalert.proxyURL=http://vmalert:8880
+    - -search.maxConcurrentRequests=4
+    ports:
+    - ${MTE_OBSERVABILITY_VICTORIAMETRICS_PORT_1_MAPPING:?required}
+    volumes:
+    - victoriametrics-data:/victoria-metrics-data
+    networks:
+    - observability
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O
+      - /dev/null
+      - http://127.0.0.1:8428/health
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_VICTORIAMETRICS_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_VICTORIAMETRICS_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+  victorialogs:
+    image: ${MTE_OBSERVABILITY_VICTORIALOGS_IMAGE:?required}
+    command:
+    - -storageDataPath=/victoria-logs-data
+    - -retentionPeriod=7d
+    - -httpListenAddr=:9428
+    ports:
+    - ${MTE_OBSERVABILITY_VICTORIALOGS_PORT_1_MAPPING:?required}
+    volumes:
+    - victorialogs-data:/victoria-logs-data
+    networks:
+    - observability
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O
+      - /dev/null
+      - http://127.0.0.1:9428/health
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_VICTORIALOGS_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_VICTORIALOGS_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+  victoriatraces:
+    image: ${MTE_OBSERVABILITY_VICTORIATRACES_IMAGE:?required}
+    command:
+    - -storageDataPath=/victoria-traces-data
+    - -retentionPeriod=7d
+    - -httpListenAddr=:10428
+    ports:
+    - ${MTE_OBSERVABILITY_VICTORIATRACES_PORT_1_MAPPING:?required}
+    volumes:
+    - victoriatraces-data:/victoria-traces-data
+    networks:
+    - observability
+    healthcheck:
+      test:
+      - CMD
+      - wget
+      - -q
+      - -O
+      - /dev/null
+      - http://127.0.0.1:10428/health
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_VICTORIATRACES_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_VICTORIATRACES_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+  blackbox-exporter:
+    image: ${MTE_OBSERVABILITY_BLACKBOX_EXPORTER_IMAGE:?required}
+    network_mode: host
+    command:
+    - --config.file=/etc/blackbox/blackbox.yml
+    - --web.listen-address=127.0.0.1:19115
+    volumes:
+    - observability-config:/etc/blackbox:ro
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_BLACKBOX_EXPORTER_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_BLACKBOX_EXPORTER_MEMORY_LIMIT:?required}
+    pids_limit: 128
+    logging: *id001
+    ports: []
+  node-exporter:
+    image: ${MTE_OBSERVABILITY_NODE_EXPORTER_IMAGE:?required}
+    network_mode: host
+    pid: host
+    command:
+    - --path.rootfs=/host
+    - --web.listen-address=127.0.0.1:19100
+    - --collector.systemd
+    volumes:
+    - type: bind
+      source: /
+      target: /host
+      read_only: true
+      bind:
+        propagation: rslave
+    - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket:ro
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_NODE_EXPORTER_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_NODE_EXPORTER_MEMORY_LIMIT:?required}
+    pids_limit: 128
+    logging: *id001
+    ports: []
+  cadvisor:
+    image: ${MTE_OBSERVABILITY_CADVISOR_IMAGE:?required}
+    privileged: true
+    ports:
+    - ${MTE_OBSERVABILITY_CADVISOR_PORT_1_MAPPING:?required}
+    command:
+    - --docker_only=true
+    - --housekeeping_interval=60s
+    - --max_housekeeping_interval=120s
+    - --enable_metrics=cpu,memory,network,oom_event
+    - --disable_root_cgroup_stats=true
+    - --store_container_labels=false
+    volumes:
+    - /:/rootfs:ro
+    - /var/run:/var/run:ro
+    - /sys:/sys:ro
+    - /var/lib/docker:/var/lib/docker:ro
+    - /dev/disk:/dev/disk:ro
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_CADVISOR_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_CADVISOR_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+  otel-collector:
+    image: ${MTE_OBSERVABILITY_OTEL_COLLECTOR_IMAGE:?required}
+    network_mode: host
+    command:
+    - --config=/etc/otel/otel.yml
+    user: 0:0
+    volumes:
+    - observability-config:/etc/otel:ro
+    - /:/hostfs:ro
+    - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+      victoriametrics:
+        condition: service_healthy
+      victorialogs:
+        condition: service_healthy
+      victoriatraces:
+        condition: service_healthy
+      blackbox-exporter:
+        condition: service_started
+      node-exporter:
+        condition: service_started
+      cadvisor:
+        condition: service_started
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_OTEL_COLLECTOR_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_OTEL_COLLECTOR_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+    ports: []
+  alertmanager:
+    image: ${MTE_OBSERVABILITY_ALERTMANAGER_IMAGE:?required}
+    command:
+    - --config.file=/etc/alertmanager/alertmanager.yml
+    - --storage.path=/alertmanager
+    - --web.listen-address=:9093
+    ports:
+    - ${MTE_OBSERVABILITY_ALERTMANAGER_PORT_1_MAPPING:?required}
+    volumes:
+    - observability-config:/etc/alertmanager:ro
+    - alertmanager-data:/alertmanager
+    networks:
+    - observability
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_ALERTMANAGER_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_ALERTMANAGER_MEMORY_LIMIT:?required}
+    pids_limit: 128
+    logging: *id001
+  vmalert:
+    image: ${MTE_OBSERVABILITY_VMALERT_IMAGE:?required}
+    command:
+    - -rule=/etc/vmalert/rules.yml
+    - -datasource.url=http://victoriametrics:8428
+    - -remoteWrite.url=http://victoriametrics:8428
+    - -remoteRead.url=http://victoriametrics:8428
+    - -notifier.url=http://alertmanager:9093
+    - -httpListenAddr=:8880
+    - -evaluationInterval=30s
+    ports:
+    - ${MTE_OBSERVABILITY_VMALERT_PORT_1_MAPPING:?required}
+    volumes:
+    - observability-config:/etc/vmalert:ro
+    networks:
+    - observability
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+      victoriametrics:
+        condition: service_healthy
+      alertmanager:
+        condition: service_started
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_VMALERT_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_VMALERT_MEMORY_LIMIT:?required}
+    pids_limit: 128
+    logging: *id001
+  grafana:
+    image: ${MTE_OBSERVABILITY_GRAFANA_IMAGE:?required}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:?required}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?required}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: ${MTE_OBSERVABILITY_GRAFANA_ENV_GF_AUTH_ANONYMOUS_ENABLED:?required}
+      GF_ANALYTICS_REPORTING_ENABLED: ${MTE_OBSERVABILITY_GRAFANA_ENV_GF_ANALYTICS_REPORTING_ENABLED:?required}
+      GF_ANALYTICS_CHECK_FOR_UPDATES: 'false'
+      GF_PLUGINS_PREINSTALL_SYNC: victoriametrics-logs-datasource
+    ports:
+    - ${MTE_OBSERVABILITY_GRAFANA_PORT_1_MAPPING:?required}
+    volumes:
+    - grafana-data:/var/lib/grafana
+    - observability-config:/etc/grafana/provisioning:ro
+    networks:
+    - observability
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+      victoriametrics:
+        condition: service_healthy
+      victorialogs:
+        condition: service_healthy
+      victoriatraces:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+    cpus: ${MTE_OBSERVABILITY_GRAFANA_CPU_LIMIT:?required}
+    mem_limit: ${MTE_OBSERVABILITY_GRAFANA_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+volumes:
+  observability-config:
+    name: mte-observability-config
+  victoriametrics-data:
+    name: mte-victoriametrics-data
+  victorialogs-data:
+    name: mte-victorialogs-data
+  victoriatraces-data:
+    name: mte-victoriatraces-data
+  alertmanager-data:
+    name: mte-alertmanager-data
+  grafana-data:
+    name: mte-grafana-data
+networks:
+  observability:
+    name: mte-observability

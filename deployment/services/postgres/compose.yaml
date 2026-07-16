@@ -1,0 +1,40 @@
+name: mte-postgres
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '5'
+services:
+  postgres:
+    image: ${MTE_POSTGRES_POSTGRES_IMAGE:?required}
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?required}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?required}
+      POSTGRES_DB: ${POSTGRES_ADMIN_DB:?required}
+    volumes:
+    - postgres-data:/var/lib/postgresql/data
+    networks:
+      data-plane:
+        aliases:
+        - mte-postgres
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U ${POSTGRES_ADMIN_USER:?required} -d ${POSTGRES_ADMIN_DB:?required}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 60s
+    cpus: ${POSTGRES_CPU_LIMIT:?required}
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+    ports: []
+volumes:
+  postgres-data:
+    name: mte-postgres-data
+networks:
+  data-plane:
+    name: mte-data-plane

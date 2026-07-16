@@ -1,0 +1,183 @@
+{
+  "schemaVersion": 1,
+  "kind": "RuntimeDependencyLock",
+  "metadata": {
+    "digestScope": "multi-platform registry manifest",
+    "registryResolutionDate": "2026-07-16"
+  },
+  "imageSources": {
+    "composeSeeds": "config/compose-seeds.lock.json",
+    "directComposeGlobs": [
+      "deployment/services/*/compose.yaml"
+    ]
+  },
+  "runtimeImages": {
+    "MTE_DAYTONA_CODING_IMAGE": {
+      "ref": "daytonaio/sandbox:0.8.0@sha256:edb66f95f2f09a28a029a0e03d516cf5482ef13a218e93ab1d80954f6ee7ebbb",
+      "declarations": [
+        {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"},
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_SANDBOX_BASE_IMAGE": {
+      "ref": "daytonaio/sandbox:0.8.0@sha256:edb66f95f2f09a28a029a0e03d516cf5482ef13a218e93ab1d80954f6ee7ebbb",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_API_IMAGE": {
+      "ref": "daytonaio/daytona-api@sha256:8de6315a378430a58a44ce6c20b41050c2f602446e75f3ff559edbaa0b3758a7",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_PROXY_IMAGE": {
+      "ref": "daytonaio/daytona-proxy@sha256:63834f0477e154f92de8d44efb0809dffbd2392c188b6cf41dac94ed8ade26c2",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_RUNNER_IMAGE": {
+      "ref": "daytonaio/daytona-runner@sha256:3253f4fdfda80bfc3b13e9e7ddf022cb5412dca94230371091e16cd0860427e0",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_SSH_IMAGE": {
+      "ref": "daytonaio/daytona-ssh-gateway@sha256:b931ec8b4713bc80596d867f892febd7638220b92ad0825a0fbae9e3e4cef17f",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_POSTGRES_IMAGE": {
+      "ref": "postgres:18@sha256:c2d42a104eb6b37b286a2d9c5cf83f349de4d6516d513d00a2bd9610e2c2e5e4",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_REDIS_IMAGE": {
+      "ref": "redis@sha256:0b13f549ab871acafaa84b673c4e29bd7dce8d12526aaafe3b4ea3366c322daf",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_DEX_IMAGE": {
+      "ref": "dexidp/dex:v2.42.0@sha256:1b4a6eee8550240b0faedad04d984ca939513650e1d9bd423502c67355e3822f",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_REGISTRY_IMAGE": {
+      "ref": "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "MTE_DAYTONA_MINIO_IMAGE": {
+      "ref": "minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e",
+      "declarations": [
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "PAPERCLIP_NODE_IMAGE": {
+      "ref": "node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
+      "declarations": [
+        {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"}
+      ]
+    },
+    "MTE_AGENT_GATEWAY_IMAGE": {
+      "ref": "python:3.13-slim@sha256:bffeb7bd6a85767587059c6ba23e1e9122078e3aa3fa836099171b9bb5a9bb00",
+      "declarations": [
+        {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"},
+        {"path": "deployment/steps/60-daytona.sh", "kind": "mapping-literal"}
+      ]
+    },
+    "TOOLHIVE_CANARY_IMAGE": {
+      "ref": "mcp/everything@sha256:330885a0c4b2eed6f0cd3aae0f0b37152ccdf2852e2f6af6d616a5d5c1e9817d",
+      "declarations": [
+        {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"}
+      ]
+    },
+    "TOOLHIVE_NOTION_IMAGE": {
+      "ref": "ghcr.io/stacklok/dockyard/npx/notion@sha256:180a55ce48d1d08888abb9920a6d24ba178929e4131722579466c494eec3d08f",
+      "declarations": [
+        {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"}
+      ]
+    },
+    "CLOUDFLARED_IMAGE": {
+      "ref": "cloudflare/cloudflared:2026.7.1@sha256:188bb03589a32affed3cf4d0590565ffe67b78866e6b5582574afab2b705bafe",
+      "declarations": [
+        {"path": "deployment/steps/90-cloudflare-tunnel.sh", "kind": "shell-variable", "variable": "IMAGE"}
+      ]
+    }
+  },
+  "npmPackages": {
+    "paperclipai": {
+      "version": "2026.707.0",
+      "integrity": "sha512-ibgW6muVlzmZT3v4Qsi7MAuPYSlPHfUT2yowlHeLUTpfr1P4h4J4qRZPiGoMc2zyhieoSKKiE2XkDiMMPT3Y3w==",
+      "versionKey": "PAPERCLIP_RUNTIME_VERSION",
+      "installPaths": ["deployment/steps/50-paperclip.sh", "tools/platform-cli/start-paperclip.sh"]
+    },
+    "@openai/codex": {
+      "version": "0.144.4",
+      "integrity": "sha512-DTHzYatlKq9dw55E0/HsbK4tRCEKabuJ10ybbqpsG8gVv/kvwEdg3Z4OI3cvLXKa21xkIa4lkGlZoO/HmqmFFw==",
+      "versionKey": "CODEX_CLI_VERSION",
+      "installPaths": ["deployment/steps/50-paperclip.sh", "deployment/steps/60-daytona.sh"]
+    },
+    "@openai/codex-linux-x64": {
+      "version": "0.144.4-linux-x64",
+      "integrity": "sha512-2jxrmV6+/7eBNdg5uhhmOEPFu2o28eYY/ClLzWhSBHH8uo3f2KA1z9JQcVtwlbToW03nEPlEzYNYfCF1UBqsVQ==",
+      "aliasOf": "@openai/codex",
+      "installPaths": ["deployment/steps/50-paperclip.sh", "deployment/steps/60-daytona.sh"]
+    },
+    "@anthropic-ai/claude-code": {
+      "version": "2.1.209",
+      "integrity": "sha512-pouVZMdA3Dl4+x4Nlr+AInZla+L6yCiHe0L+AuprM3L6Gko4ErQxwl/DprLKXMF/IhckJhdsgGEaO1gYku+lZw==",
+      "versionKey": "CLAUDE_CODE_CLI_VERSION",
+      "installPaths": ["deployment/steps/50-paperclip.sh", "deployment/steps/60-daytona.sh"]
+    },
+    "@anthropic-ai/claude-code-linux-x64": {
+      "version": "2.1.209",
+      "integrity": "sha512-3iYBnPhuN3X+OJeBn2dIpa0DQ+c0UF9Fc68NKq7Q0fT5SvI5bR9zkll2xIHym1MAlQcfHpT9xbc8CraEBYP85Q==",
+      "aliasOf": "@anthropic-ai/claude-code",
+      "installPaths": ["deployment/steps/50-paperclip.sh", "deployment/steps/60-daytona.sh"]
+    },
+    "@earendil-works/pi-coding-agent": {
+      "version": "0.80.7",
+      "integrity": "sha512-mxq3IClhdgmCrYiKuzKehs4QKCVJgKmlA70nUEzsgeNsGdxriT7o5sKQTCcxzVJkzDRMcHD/8tAP4/eGrV4gKQ==",
+      "versionKey": "PI_CLI_VERSION",
+      "installPaths": ["deployment/steps/50-paperclip.sh", "deployment/steps/60-daytona.sh"]
+    },
+    "@paperclipai/plugin-daytona": {
+      "version": "2026.707.0",
+      "integrity": "sha512-m0rAOFmPsTT09aZgpiEni+t5KX7oTWteub4l0urWNy62AVjMWjl4gkziL1mEBJ9fHUOnquY9STTLZGN/E9oBvA==",
+      "versionKey": "MTE_DAYTONA_PLUGIN_NPM_VERSION",
+      "installPaths": ["deployment/steps/60-daytona.sh"]
+    }
+  },
+  "downloads": {
+    "dokploy-installer": {
+      "url": "https://github.com/Dokploy/dokploy/releases/download/v0.29.12/install.sh",
+      "sha256": "f169b483cd03cd135b56db414cbdde99e818214702065c216804c454f6fe49e5",
+      "paths": ["deployment/steps/10-host.sh"]
+    },
+    "toolhive-linux-amd64": {
+      "url": "https://github.com/stacklok/toolhive/releases/download/v0.36.0/toolhive_0.36.0_linux_amd64.tar.gz",
+      "sha256": "ca87b9d9eec394d953868a8fbbbda88d7c6105ac65c1a45327b7af75bfcfbce9",
+      "paths": ["tools/platform-cli/server-config.py", "tools/platform-cli/server-toolhive.py", "deployment/steps/60-daytona.sh"]
+    },
+    "github-cli-linux-amd64": {
+      "url": "https://github.com/cli/cli/releases/download/v2.96.0/gh_2.96.0_linux_amd64.tar.gz",
+      "sha256": "83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60",
+      "paths": ["deployment/steps/60-daytona.sh"]
+    }
+  },
+  "signedRepositories": {
+    "docker-ubuntu": {
+      "keyUrl": "https://download.docker.com/linux/ubuntu/gpg",
+      "repositoryUrl": "https://download.docker.com/linux/ubuntu",
+      "signedBy": "/etc/apt/keyrings/docker.asc",
+      "path": "deployment/steps/10-host.sh"
+    }
+  }
+}

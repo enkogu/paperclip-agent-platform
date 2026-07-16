@@ -1,0 +1,40 @@
+name: mte-kestra-data
+x-logging: &id001
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '5'
+services:
+  postgres:
+    image: ${MTE_KESTRA_DATA_POSTGRES_IMAGE:?required}
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: ${KESTRA_DB_PASSWORD:?required}
+    volumes:
+    - kestra-postgres:/var/lib/postgresql/data
+    networks:
+      kestra-data:
+        aliases:
+        - mte-kestra-postgres
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U kestra -d kestra
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 60s
+    cpus: ${KESTRA_DB_CPU_LIMIT:?required}
+    mem_limit: ${KESTRA_DB_MEMORY_LIMIT:?required}
+    pids_limit: 256
+    logging: *id001
+    ports: []
+volumes:
+  kestra-postgres:
+    name: mte-kestra-postgres
+networks:
+  kestra-data:
+    name: mte-kestra-data

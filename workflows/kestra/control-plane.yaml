@@ -1,0 +1,8 @@
+id: control-plane
+namespace: mte.platform
+description: Anchors the MTE control namespace used for declarative KV catalogs.
+
+tasks:
+  - id: ready
+    type: io.kestra.plugin.core.log.Log
+    message: MTE control plane is ready
