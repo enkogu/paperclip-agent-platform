@@ -104,6 +104,12 @@
         {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"}
       ]
     },
+    "TOOLHIVE_FIRECRAWL_IMAGE": {
+      "ref": "docker.io/mcp/firecrawl@sha256:00f5e4f01d3d63185059f39ecb091df13b159e2a63bc840e9d7a414a139425fe",
+      "declarations": [
+        {"path": "tools/platform-cli/server-config.py", "kind": "python-dict", "assignment": "ONE_TIME_MIGRATION_SEEDS"}
+      ]
+    },
     "CLOUDFLARED_IMAGE": {
       "ref": "cloudflare/cloudflared:2026.7.1@sha256:188bb03589a32affed3cf4d0590565ffe67b78866e6b5582574afab2b705bafe",
       "declarations": [

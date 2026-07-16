@@ -436,63 +436,18 @@ def c013(values: dict[str, str], run_id: str) -> dict[str, Any]:
         mcp_token = ""
 
 
-def start_marker_server(name: str, marker: str) -> None:
-    run(["docker", "rm", "-f", name], check=False)
-    code = """
-import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-marker = os.environ["MARKER"].encode()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(marker)
-
-    def log_message(self, *_args):
-        return
-
-ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
-"""
-    run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-d",
-            "--name",
-            name,
-            "--network",
-            "mte-firecrawl",
-            "-e",
-            f"MARKER={marker}",
-            "python:3.13-slim",
-            "python",
-            "-c",
-            code,
-        ],
-        timeout=120,
-    )
-    time.sleep(1)
-
-
 def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
     manager = toolhive_manager()
     suffix = run_id[-8:].lower()
     workload = f"mte-firecrawl-canary-{suffix}"
-    marker_server = f"mte-marker-{suffix}"
     env_file = f"/tmp/{workload}.env"
     marker = f"MTE-C023-{run_id}"
     proxy_port = 19500 + int(hashlib.sha256(run_id.encode()).hexdigest()[:3], 16) % 300
     cleanup = {
         "workloadRemoved": False,
         "envFileRemoved": False,
-        "markerServerRemoved": False,
     }
     try:
-        start_marker_server(marker_server, marker)
         write_manager_secret(
             manager,
             env_file,
@@ -510,11 +465,13 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             "--isolate-network=false",
             "--permission-profile",
             "network",
+            "--transport",
+            "stdio",
             "--proxy-port",
             str(proxy_port),
             "--env-file",
             env_file,
-            "io.github.stacklok/firecrawl",
+            values["TOOLHIVE_FIRECRAWL_IMAGE"],
             timeout=240,
         )
         wait_toolhive_tool(manager, workload, "firecrawl_scrape", timeout=120)
@@ -531,7 +488,8 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             "json",
             input_text=json.dumps(
                 {
-                    "url": f"http://{marker_server}:8080/",
+                    "url": "https://httpbin.org/anything/"
+                    + urllib.parse.quote(marker, safe=""),
                     "formats": ["markdown"],
                     "onlyMainContent": False,
                 }
@@ -544,7 +502,7 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             "id": "C023",
             "ok": True,
             "state": "passed",
-            "source": "toolhive_firecrawl_mcp_workload",
+            "source": "toolhive_firecrawl_mcp_public_echo",
             "action": "firecrawl_scrape",
             "controlledMarkerObserved": True,
             "resultSha256": hashlib.sha256(called.encode()).hexdigest(),
@@ -555,8 +513,6 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
         cleanup["workloadRemoved"] = True
         remove_manager_file(manager, env_file)
         cleanup["envFileRemoved"] = True
-        run(["docker", "rm", "-f", marker_server], check=False)
-        cleanup["markerServerRemoved"] = True
 
 
 def c024(_values: dict[str, str], run_id: str) -> dict[str, Any]:

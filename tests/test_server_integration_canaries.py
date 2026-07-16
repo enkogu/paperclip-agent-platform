@@ -233,7 +233,6 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.module, "toolhive_manager", return_value="manager"),
-            mock.patch.object(self.module, "start_marker_server"),
             mock.patch.object(self.module, "write_manager_secret") as write_secret,
             mock.patch.object(self.module, "toolhive", side_effect=toolhive),
             mock.patch.object(
@@ -245,17 +244,36 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
             mock.patch.object(self.module, "run"),
         ):
             result = self.module.c023(
-                {"FIRECRAWL_API_KEY": "unit-secret-value"}, run_id
+                {
+                    "FIRECRAWL_API_KEY": "unit-secret-value",
+                    "TOOLHIVE_FIRECRAWL_IMAGE": (
+                        "docker.io/mcp/firecrawl@sha256:" + "1" * 64
+                    ),
+                },
+                run_id,
             )
 
         workload_run = next(row for row in calls if "run" in row[0])
         network_index = workload_run[0].index("--network")
         self.assertEqual(workload_run[0][network_index + 1], "host")
+        transport_index = workload_run[0].index("--transport")
+        self.assertEqual(workload_run[0][transport_index + 1], "stdio")
+        self.assertIn(
+            "docker.io/mcp/firecrawl@sha256:" + "1" * 64,
+            workload_run[0],
+        )
+        self.assertNotIn("io.github.stacklok/firecrawl", workload_run[0])
         projected = write_secret.call_args.args[2]
         self.assertIn("FIRECRAWL_API_URL=http://firecrawl-api:3002", projected)
         self.assertNotIn("unit-secret-value", str(calls))
         self.assertNotIn("unit-secret-value", str(result))
         self.assertTrue(result["controlledMarkerObserved"])
+        call = next(row for row in calls if "call" in row[0])
+        arguments = json.loads(call[1]["input_text"])
+        self.assertEqual(
+            arguments["url"],
+            "https://httpbin.org/anything/" + marker,
+        )
 
 
 class SearxngIntegrationCanaryTests(unittest.TestCase):
