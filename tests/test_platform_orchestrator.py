@@ -2000,7 +2000,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertLess(
             steps.index("tool-bundles"), steps.index("tool-bundles-idempotency")
         )
-        self.assertLess(steps.index("tool-bundles-idempotency"), steps.index("daytona"))
+        self.assertLess(steps.index("tool-bundles-idempotency"), steps.index("hermes"))
+        self.assertLess(steps.index("hermes"), steps.index("daytona"))
         self.assertLess(steps.index("daytona"), steps.index("harness-auth"))
         self.assertLess(steps.index("daytona"), steps.index("kestra-e2e-canary"))
         self.assertLess(
@@ -2683,6 +2684,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "kestra-control",
                 "tool-bundles",
                 "tool-bundles",
+                "hermes",
                 "daytona",
                 "source-rollback",
             ],

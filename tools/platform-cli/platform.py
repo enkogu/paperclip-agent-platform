@@ -58,9 +58,11 @@ FULL_DEPLOY_STEPS = (
     "kestra-control",
     "tool-bundles",
     "tool-bundles-idempotency",
+    # Hermes install may create its native API key in the canonical env. Keep
+    # it before Daytona so the hash-bound runtime proof stays current for E2E.
+    "hermes",
     "daytona",
     "harness-auth",
-    "hermes",
     "kestra-e2e-canary",
     "profile-acceptance",
     "integration-canaries",
