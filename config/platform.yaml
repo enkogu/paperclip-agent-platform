@@ -339,7 +339,7 @@ spec:
       stage: 60
       compose: deployment/services/firecrawl/compose.yaml
       required: true
-      dependsOn: [searxng]
+      dependsOn: [searxng, toolhive]
       secrets: [FIRECRAWL_DB_PASSWORD, FIRECRAWL_REDIS_PASSWORD]
       health:
         url: ${FIRECRAWL_HEALTH_URL:?required}

@@ -68,6 +68,9 @@ services:
       tool-plane:
         aliases:
         - activepieces
+      tool-runtime:
+        aliases:
+        - activepieces
     healthcheck:
       test:
       - CMD-SHELL
@@ -143,4 +146,7 @@ networks:
     external: true
   data-plane:
     name: mte-data-plane
+    external: true
+  tool-runtime:
+    name: mte-tool-runtime
     external: true

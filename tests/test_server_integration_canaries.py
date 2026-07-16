@@ -181,6 +181,8 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
         )
         run_call = next(row for row in calls if "python:3.13-slim" in row[0])
         self.assertIn("stdio", run_call[0])
+        network_index = run_call[0].index("--network")
+        self.assertEqual(run_call[0][network_index + 1], "host")
         self.assertNotIn("--target-port", run_call[0])
         self.assertIn("/run/secret/token:ro", " ".join(run_call[0]))
         self.assertNotIn("short-lived-only", str(run_call))
@@ -214,9 +216,105 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
             self.module.write_manager_secret(
                 "toolhive",
                 "/tmp/firecrawl.env",
-                "FIRECRAWL_API_KEY=unit\nFIRECRAWL_API_URL=http://api:3002\n",
+                "FIRECRAWL_API_KEY=unit\n"
+                "FIRECRAWL_API_URL=http://firecrawl-api:3002\n",
             )
         self.assertIn("chmod 600", run.call_args.args[0][-1])
+
+    def test_c023_uses_dind_host_namespace_and_outer_runtime_alias(self):
+        calls = []
+        run_id = "20260716T084549-9180af705fef"
+        marker = f"MTE-C023-{run_id}"
+
+        def toolhive(_manager, *args, **kwargs):
+            calls.append((args, kwargs))
+            stdout = marker if "call" in args else "{}"
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with (
+            mock.patch.object(self.module, "toolhive_manager", return_value="manager"),
+            mock.patch.object(self.module, "start_marker_server"),
+            mock.patch.object(self.module, "write_manager_secret") as write_secret,
+            mock.patch.object(self.module, "toolhive", side_effect=toolhive),
+            mock.patch.object(
+                self.module,
+                "wait_toolhive_tool",
+                return_value='{"tools":[{"name":"firecrawl_scrape"}]}',
+            ),
+            mock.patch.object(self.module, "remove_manager_file"),
+            mock.patch.object(self.module, "run"),
+        ):
+            result = self.module.c023(
+                {"FIRECRAWL_API_KEY": "unit-secret-value"}, run_id
+            )
+
+        workload_run = next(row for row in calls if "run" in row[0])
+        network_index = workload_run[0].index("--network")
+        self.assertEqual(workload_run[0][network_index + 1], "host")
+        projected = write_secret.call_args.args[2]
+        self.assertIn("FIRECRAWL_API_URL=http://firecrawl-api:3002", projected)
+        self.assertNotIn("unit-secret-value", str(calls))
+        self.assertNotIn("unit-secret-value", str(result))
+        self.assertTrue(result["controlledMarkerObserved"])
+
+
+class SearxngIntegrationCanaryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+
+    @staticmethod
+    def response(count: int, *, returncode: int = 0):
+        return subprocess.CompletedProcess(
+            (),
+            returncode,
+            stdout=json.dumps(
+                {
+                    "status": 200,
+                    "resultCount": count,
+                    "responseKeys": ["query", "results"],
+                }
+            ),
+            stderr="",
+        )
+
+    def test_c024_retries_empty_upstream_results_without_weakening_gate(self):
+        with (
+            mock.patch.object(self.module, "find_container", return_value="firecrawl"),
+            mock.patch.object(
+                self.module,
+                "run",
+                side_effect=[self.response(0), self.response(12)],
+            ) as run,
+            mock.patch.object(self.module.time, "sleep") as sleep,
+        ):
+            result = self.module.c024({}, "unique-run-id")
+
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(result["attemptCount"], 2)
+        self.assertEqual(result["resultCount"], 12)
+        for call in run.call_args_list:
+            self.assertEqual(json.loads(call.kwargs["input_text"]), {"query": "OpenAI"})
+            self.assertFalse(call.kwargs["check"])
+
+    def test_c024_fails_after_three_valid_but_empty_responses(self):
+        with (
+            mock.patch.object(self.module, "find_container", return_value="firecrawl"),
+            mock.patch.object(
+                self.module,
+                "run",
+                side_effect=[self.response(0), self.response(0), self.response(0)],
+            ) as run,
+            mock.patch.object(self.module.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                self.module.CanaryError, "searxng_json_results_missing"
+            ):
+                self.module.c024({}, "unique-run-id")
+
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
 
 class ConsentAndSanitizationTests(unittest.TestCase):

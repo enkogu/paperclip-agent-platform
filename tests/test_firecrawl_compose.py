@@ -13,6 +13,22 @@ COMPOSE = ROOT / "deployment/services/firecrawl/compose.yaml"
 
 
 class FirecrawlComposeTests(unittest.TestCase):
+    def test_api_exposes_only_an_internal_alias_to_toolhive_runtime(self):
+        compose = yaml.safe_load(COMPOSE.read_text())
+        api = compose["services"]["api"]
+
+        self.assertEqual(
+            api["networks"]["tool-runtime"]["aliases"], ["firecrawl-api"]
+        )
+        self.assertEqual(
+            compose["networks"]["tool-runtime"],
+            {"name": "mte-tool-runtime", "external": True},
+        )
+        self.assertNotIn("tool-runtime", compose["services"]["redis"]["networks"])
+        self.assertNotIn(
+            "tool-runtime", compose["services"]["nuq-postgres"]["networks"]
+        )
+
     def test_redis_runtime_secret_is_not_a_compose_or_process_argument(self):
         compose = yaml.safe_load(COMPOSE.read_text())
         redis = compose["services"]["redis"]

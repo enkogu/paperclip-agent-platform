@@ -377,7 +377,7 @@ def c013(values: dict[str, str], run_id: str) -> dict[str, Any]:
             "--name",
             workload,
             "--network",
-            "mte-tool-plane",
+            "host",
             "--isolate-network=false",
             "--proxy-port",
             str(proxy_port),
@@ -498,7 +498,7 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             env_file,
             "FIRECRAWL_API_KEY="
             + values["FIRECRAWL_API_KEY"]
-            + "\nFIRECRAWL_API_URL=http://api:3002\n",
+            + "\nFIRECRAWL_API_URL=http://firecrawl-api:3002\n",
         )
         toolhive(
             manager,
@@ -506,7 +506,7 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             "--name",
             workload,
             "--network",
-            "mte-firecrawl",
+            "host",
             "--isolate-network=false",
             "--permission-profile",
             "network",
@@ -582,14 +582,31 @@ fetch(endpoint + '/search?q=' + encodeURIComponent(input.query) + '&format=json'
     process.exitCode = 1;
   });
 """
-    completed = run(
-        ["docker", "exec", "-i", container, "node", "-e", script],
-        input_text=json.dumps({"query": f"OpenAI integration canary {run_id[:8]}"}),
-        timeout=90,
-    )
-    payload = json.loads(completed.stdout or "{}")
-    ok = payload.get("status") == 200 and payload.get("resultCount", 0) > 0
-    if not ok:
+    payload: dict[str, Any] = {}
+    attempt_count = 0
+    for attempt_count in range(1, 4):
+        completed = run(
+            ["docker", "exec", "-i", container, "node", "-e", script],
+            input_text=json.dumps({"query": "OpenAI"}),
+            check=False,
+            timeout=90,
+        )
+        try:
+            candidate = json.loads(completed.stdout or "{}")
+        except (json.JSONDecodeError, TypeError):
+            candidate = {}
+        payload = candidate if isinstance(candidate, dict) else {}
+        ok = (
+            completed.returncode == 0
+            and payload.get("status") == 200
+            and "results" in payload.get("responseKeys", [])
+            and payload.get("resultCount", 0) > 0
+        )
+        if ok:
+            break
+        if attempt_count < 3:
+            time.sleep(3)
+    else:
         raise CanaryError("searxng_json_results_missing")
     return {
         "id": "C024",
@@ -600,6 +617,7 @@ fetch(endpoint + '/search?q=' + encodeURIComponent(input.query) + '&format=json'
         "httpStatus": payload.get("status"),
         "resultCount": payload.get("resultCount"),
         "responseKeys": payload.get("responseKeys"),
+        "attemptCount": attempt_count,
     }
 
 

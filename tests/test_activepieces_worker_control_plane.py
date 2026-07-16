@@ -44,6 +44,14 @@ class ActivepiecesWorkerControlPlaneTests(unittest.TestCase):
             app["networks"]["activepieces-data"]["aliases"],
         )
         self.assertIn("activepieces-data", worker["networks"])
+        self.assertEqual(
+            app["networks"]["tool-runtime"]["aliases"], ["activepieces"]
+        )
+        self.assertEqual(
+            compose["networks"]["tool-runtime"],
+            {"name": "mte-tool-runtime", "external": True},
+        )
+        self.assertNotIn("tool-runtime", worker["networks"])
 
     def test_internal_worker_url_is_reviewed_fill_only_ssot_seed(self):
         key = "MTE_ACTIVEPIECES_WORKER_ENV_AP_FRONTEND_URL"

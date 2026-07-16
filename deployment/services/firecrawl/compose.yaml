@@ -54,8 +54,11 @@ services:
     ports:
     - ${MTE_FIRECRAWL_API_PORT_1_MAPPING:?required}
     networks:
-    - firecrawl
-    - search
+      firecrawl: {}
+      search: {}
+      tool-runtime:
+        aliases:
+        - firecrawl-api
     depends_on:
       redis:
         condition: service_healthy
@@ -210,4 +213,7 @@ networks:
     name: mte-firecrawl
   search:
     name: mte-search
+    external: true
+  tool-runtime:
+    name: mte-tool-runtime
     external: true
