@@ -99,6 +99,47 @@ class ProfileReconcileTests(unittest.TestCase):
             [row["bundleSha256"] for row in changed],
         )
 
+    def test_notion_registry_tool_order_is_not_contract_drift(self):
+        entry = {
+            "name": self.module.NOTION_REGISTRY_PACKAGE,
+            "tier": "Official",
+            "status": "Active",
+            "transport": "stdio",
+            "repository_url": self.module.NOTION_REPOSITORY_URL,
+            "image": self.module.NOTION_REGISTRY_IMAGE,
+            "tools": list(reversed(self.module.NOTION_TOOLS)),
+        }
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(entry), stderr=""
+        )
+        with mock.patch.object(self.module, "thv", return_value=result):
+            contract = self.module.notion_registry_contract(
+                "toolhive", self.module.NOTION_IMAGE
+            )
+        self.assertEqual(contract["toolCount"], len(self.module.NOTION_TOOLS))
+        self.assertEqual(len(contract["toolsSha256"]), 64)
+
+    def test_notion_registry_still_rejects_a_different_tool_set(self):
+        entry = {
+            "name": self.module.NOTION_REGISTRY_PACKAGE,
+            "tier": "Official",
+            "status": "Active",
+            "transport": "stdio",
+            "repository_url": self.module.NOTION_REPOSITORY_URL,
+            "image": self.module.NOTION_REGISTRY_IMAGE,
+            "tools": [*self.module.NOTION_TOOLS[:-1], "unexpected-tool"],
+        }
+        result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(entry), stderr=""
+        )
+        with (
+            mock.patch.object(self.module, "thv", return_value=result),
+            self.assertRaisesRegex(
+                RuntimeError, "profile_notion_registry_contract_drift"
+            ),
+        ):
+            self.module.notion_registry_contract("toolhive", self.module.NOTION_IMAGE)
+
     def test_generated_attestation_does_not_change_runtime_catalog_identity(self):
         document = {
             "_generated": {"sourceSha256": "1" * 64},

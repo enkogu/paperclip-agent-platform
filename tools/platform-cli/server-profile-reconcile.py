@@ -578,6 +578,7 @@ def notion_registry_contract(target: str, notion_image: str) -> dict[str, Any]:
         entry = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("profile_notion_registry_contract_invalid") from exc
+    registry_tools = entry.get("tools") if isinstance(entry, dict) else None
     if (
         not isinstance(entry, dict)
         or entry.get("name") != NOTION_REGISTRY_PACKAGE
@@ -586,7 +587,9 @@ def notion_registry_contract(target: str, notion_image: str) -> dict[str, Any]:
         or entry.get("transport") != "stdio"
         or entry.get("repository_url") != NOTION_REPOSITORY_URL
         or entry.get("image") != NOTION_REGISTRY_IMAGE
-        or tuple(entry.get("tools") or ()) != NOTION_TOOLS
+        or not isinstance(registry_tools, list)
+        or len(registry_tools) != len(NOTION_TOOLS)
+        or sorted(registry_tools) != sorted(NOTION_TOOLS)
         or notion_image != NOTION_IMAGE
     ):
         raise RuntimeError("profile_notion_registry_contract_drift")
@@ -601,7 +604,7 @@ def notion_registry_contract(target: str, notion_image: str) -> dict[str, Any]:
         "imagePinned": True,
         "apiVersion": NOTION_API_VERSION,
         "toolCount": len(NOTION_TOOLS),
-        "toolsSha256": sha256_bytes(canonical_json(list(NOTION_TOOLS))),
+        "toolsSha256": sha256_bytes(canonical_json(sorted(NOTION_TOOLS))),
         "egress": {"allowHost": ["api.notion.com"], "allowPort": [443]},
     }
     return {**contract, "contractSha256": sha256_bytes(canonical_json(contract))}
