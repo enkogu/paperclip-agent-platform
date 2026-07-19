@@ -4,6 +4,16 @@ model:
   base_url: @@HERMES_LLM_BASE_URL@@
   api_mode: @@HERMES_LLM_API_MODE@@
 
+# Hermes deliberately does not forward OPENAI_API_KEY to arbitrary custom
+# hosts (including loopback). Give the private 9router endpoint an explicit
+# named-provider identity so upstream Hermes resolves the credential from the
+# service environment without embedding it in this file.
+custom_providers:
+  - name: mte9router
+    base_url: @@HERMES_LLM_BASE_URL@@
+    key_env: OPENAI_API_KEY
+    api_mode: @@HERMES_LLM_API_MODE@@
+
 terminal:
   backend: @@HERMES_TERMINAL_BACKEND@@
   cwd: @@HERMES_TERMINAL_CWD@@
@@ -37,3 +47,7 @@ display:
   platforms:
     telegram:
       notifications: @@HERMES_TELEGRAM_NOTIFICATIONS@@
+
+@@HERMES_MATTERMOST_CONFIG@@
+
+@@HERMES_CONTEXT7_MCP@@

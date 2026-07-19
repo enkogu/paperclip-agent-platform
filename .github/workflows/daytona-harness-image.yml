@@ -1,0 +1,337 @@
+name: daytona-harness-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      approve_private_harness_distribution:
+        description: Confirm the private image may contain the pinned Codex and Claude clients
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daytona-harness-image-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: inputs.approve_private_harness_distribution == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      image_name: ${{ steps.image.outputs.name }}
+    steps:
+      - name: Check out the immutable source revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate dependency and license contracts
+        run: python3 tools/platform-cli/validate-dependencies.py --source-contract-only
+
+      - id: image
+        name: Derive the canonical lowercase GHCR image name
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          [[ "$owner" =~ ^[a-z0-9][a-z0-9._-]*$ ]]
+          printf 'name=ghcr.io/%s/paperclip-daytona-harness\n' "$owner" >> "$GITHUB_OUTPUT"
+
+  build-sign-sbom:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    env:
+      IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}
+      RELEASE_TAG: daytona-harness-${{ github.sha }}
+      SOURCE_REVISION: ${{ github.sha }}
+    steps:
+      - name: Check out the immutable source revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Authenticate to the private GitHub container registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        name: Build and push the immutable harness image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: deployment/image-build/daytona-harness/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify the exact harness and tool ABI from the published digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --network none "$IMAGE_NAME@$IMAGE_DIGEST" node <<'NODE'
+          const cp = require("node:child_process");
+          const fs = require("node:fs");
+          const expected = {
+            "@openai/codex": "0.144.4",
+            "@anthropic-ai/claude-code": "2.1.209",
+            "@earendil-works/pi-coding-agent": "0.80.7",
+            "@upstash/context7-pi": "0.1.1",
+          };
+          for (const [name, version] of Object.entries(expected)) {
+            const actual = JSON.parse(
+              fs.readFileSync(`/opt/mte-harness/node_modules/${name}/package.json`, "utf8")
+            ).version;
+            if (actual !== version) throw new Error(`${name} version drifted`);
+          }
+          const versionPatterns = {
+            "codex --version": /^(?:codex(?:-cli)?\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)$/,
+            "claude --version": /^(?:claude\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)(?: \(Claude Code\))?$/,
+            "pi --version": /^(?:pi\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)$/,
+            "thv version": /^(?:ToolHive|toolhive|thv)(?: version)?\s+v?([0-9]+\.[0-9]+\.[0-9]+)$/,
+            "gh --version": /^gh version ([0-9]+\.[0-9]+\.[0-9]+)(?: \([^\n]+\))?$/,
+            "jq --version": /^jq-([0-9]+\.[0-9]+\.[0-9]+)$/,
+          };
+          for (const [command, version] of Object.entries({
+            "codex --version": "0.144.4",
+            "claude --version": "2.1.209",
+            "pi --version": "0.80.7",
+            "thv version": "0.36.0",
+            "gh --version": "2.96.0",
+            "jq --version": "1.8.1",
+          })) {
+            const output = cp.execFileSync("/bin/sh", ["-c", command], {encoding: "utf8"});
+            const normalized = output.trim().replace(/\r\n/g, "\n").split("\n")[0];
+            const actual = normalized.match(versionPatterns[command])?.[1];
+            if (actual !== version) throw new Error(`${command} ABI drifted`);
+          }
+          for (const path of [
+            "/home/daytona/.agents/skills/verification-before-completion/SKILL.md",
+            "/home/daytona/.claude/skills/verification-before-completion/SKILL.md",
+            "/home/daytona/.pi/mte-profile/skills/verification-before-completion/SKILL.md",
+            "/home/daytona/.pi/mte-profile/extensions/mte-toolhive.js",
+            "/etc/claude-code/managed-mcp.json",
+          ]) if (!fs.existsSync(path)) throw new Error(`missing image ABI path: ${path}`);
+          NODE
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      - name: Sign the digest with GitHub OIDC
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_NAME@$IMAGE_DIGEST"
+
+      - name: Verify the keyless signature identity
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          EXPECTED_CERTIFICATE_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity "$EXPECTED_CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE_NAME@$IMAGE_DIGEST"
+
+      - name: Generate a digest-bound SPDX SBOM
+        uses: anchore/sbom-action@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          syft-version: v1.38.0
+          output-file: daytona-harness-${{ github.sha }}.spdx.json
+          upload-artifact: "false"
+          upload-release-assets: "false"
+
+      - id: sbom-identity
+        name: Derive the exact expected SPDX root identity
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path("tools/platform-cli/sbom-targets.py")
+          spec = importlib.util.spec_from_file_location("sbom_targets", path)
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
+          identity = module.image_identity(
+              f'{os.environ["IMAGE_NAME"]}@{os.environ["IMAGE_DIGEST"]}'
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              for key, value in identity.items():
+                  output.write(f"{key}={value}\n")
+          PY
+
+      - name: Verify the SBOM root identity and digest
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 tools/platform-cli/verify-sbom.py \
+            --expected-target "$SOURCE_REVISION" \
+            --expected-root-name "${{ steps.sbom-identity.outputs.root_name }}" \
+            --expected-root-version "${{ steps.sbom-identity.outputs.root_version }}" \
+            --expected-root-purl "${{ steps.sbom-identity.outputs.purl }}" \
+            --expected-digest "$IMAGE_DIGEST" \
+            daytona-harness-"$SOURCE_REVISION".spdx.json
+
+      - name: Emit the deploy input and provenance receipt
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          CERTIFICATE_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          digest = os.environ["IMAGE_DIGEST"]
+          if not digest.startswith("sha256:") or len(digest) != 71:
+              raise SystemExit("build did not return a sha256 image digest")
+          receipt = {
+              "image": f'{os.environ["IMAGE_NAME"]}@{digest}',
+              "sourceUrl": os.environ["SOURCE_URL"],
+              "revision": os.environ["SOURCE_REVISION"],
+              "signature": {
+                  "certificateIdentity": os.environ["CERTIFICATE_IDENTITY"],
+                  "oidcIssuer": "https://token.actions.githubusercontent.com",
+                  "type": "sigstore-keyless",
+              },
+              "sbom": f'daytona-harness-{os.environ["SOURCE_REVISION"]}.spdx.json',
+          }
+          sbom = Path(receipt["sbom"])
+          receipt["sbomSha256"] = hashlib.sha256(sbom.read_bytes()).hexdigest()
+          Path("daytona-harness-image.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n"
+          )
+          Path("daytona-harness-release.md").write_text(
+              "# Immutable Daytona harness image\n\n"
+              "This release is bound to the source revision and image digest below.\n\n"
+              "```json\n"
+              + json.dumps(receipt, indent=2, sort_keys=True)
+              + "\n```\n"
+          )
+          PY
+
+      - name: Publish or verify the durable tag-bound release receipt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          asset_receipt=daytona-harness-image.json
+          asset_sbom=daytona-harness-"$SOURCE_REVISION".spdx.json
+          existing_release="$(mktemp)"
+          error_log="$(mktemp)"
+          trap 'rm -f "$existing_release" "$error_log"; rm -rf existing-release-assets' EXIT
+
+          fetch_release() {
+            gh release view "$RELEASE_TAG" \
+              --json tagName,isDraft,body,assets >"$existing_release" 2>"$error_log"
+          }
+          verify_release_tag() {
+            local tag_target
+            tag_target="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha')"
+            [[ "$tag_target" == "commit:$SOURCE_REVISION" ]] || {
+              echo "release tag is not immutably bound to the requested source revision" >&2
+              exit 1
+            }
+          }
+
+          set +e
+          fetch_release
+          status=$?
+          set -e
+          if (( status != 0 )); then
+            if ! grep -qi 'release not found' "$error_log"; then
+              cat "$error_log" >&2
+              exit "$status"
+            fi
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --target "$SOURCE_REVISION" \
+              --title "$RELEASE_TAG" \
+              --notes-file daytona-harness-release.md
+            fetch_release
+          fi
+
+          verify_release_tag
+          [[ "$(jq -r .tagName "$existing_release")" == "$RELEASE_TAG" ]]
+          [[ "$(jq -r .body "$existing_release")" == "$(cat daytona-harness-release.md)" ]]
+          [[ "$(jq --arg receipt "$asset_receipt" --arg sbom "$asset_sbom" \
+            '[.assets[].name | select(. != $receipt and . != $sbom)] | length' \
+            "$existing_release")" == 0 ]]
+
+          mkdir existing-release-assets
+          for asset in "$asset_receipt" "$asset_sbom"; do
+            if jq -e --arg name "$asset" '.assets | any(.name == $name)' "$existing_release" >/dev/null; then
+              gh release download "$RELEASE_TAG" --dir existing-release-assets --pattern "$asset"
+              cmp "$asset" "existing-release-assets/$asset"
+            elif [[ "$(jq -r .isDraft "$existing_release")" == true ]]; then
+              gh release upload "$RELEASE_TAG" "$asset"
+            else
+              echo "published immutable release is missing $asset" >&2
+              exit 1
+            fi
+          done
+
+          fetch_release
+          expected_assets="$(printf '%s\n%s\n' "$asset_receipt" "$asset_sbom" | sort)"
+          actual_assets="$(jq -r '.assets[].name' "$existing_release" | sort)"
+          [[ "$actual_assets" == "$expected_assets" ]]
+          rm -rf existing-release-assets
+          mkdir existing-release-assets
+          gh release download "$RELEASE_TAG" --dir existing-release-assets \
+            --pattern "$asset_receipt" --pattern "$asset_sbom"
+          cmp "$asset_receipt" "existing-release-assets/$asset_receipt"
+          cmp "$asset_sbom" "existing-release-assets/$asset_sbom"
+          verify_release_tag
+          if [[ "$(jq -r .isDraft "$existing_release")" == true ]]; then
+            verify_release_tag
+            gh release edit "$RELEASE_TAG" --draft=false
+            verify_release_tag
+            fetch_release
+          fi
+          [[ "$(jq -r .isDraft "$existing_release")" == false ]]
+          verify_release_tag
+
+      - name: Retain the exact deploy receipt and SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: daytona-harness-image-${{ github.sha }}
+          path: |
+            daytona-harness-image.json
+            daytona-harness-${{ github.sha }}.spdx.json
+          if-no-files-found: error
+          retention-days: 90

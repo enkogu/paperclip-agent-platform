@@ -2,15 +2,15 @@ name: mte-mattermost
 x-logging: &id001
   driver: json-file
   options:
-    max-size: 10m
-    max-file: '5'
+    max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+    max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
 services:
   mattermost:
     image: ${MTE_MATTERMOST_MATTERMOST_IMAGE:?required}
     environment:
       TZ: UTC
       MM_SQLSETTINGS_DRIVERNAME: postgres
-      MM_SQLSETTINGS_DATASOURCE: postgres://${MATTERMOST_DB_USER:?required}:${MATTERMOST_DB_PASSWORD:?required}@mte-mattermost-postgres:5432/${MATTERMOST_DB_NAME:?required}?sslmode=disable&connect_timeout=10
+      MM_SQLSETTINGS_DATASOURCE: postgres://${MATTERMOST_DB_USER:?required}:${MATTERMOST_DB_PASSWORD:?required}@${MATTERMOST_DB_HOST:?required}:${MATTERMOST_DB_PORT:?required}/${MATTERMOST_DB_NAME:?required}?sslmode=disable&connect_timeout=10
       MM_BLEVESETTINGS_INDEXDIR: /mattermost/bleve-indexes
       MM_SERVICESETTINGS_SITEURL: ${MATTERMOST_SITE_URL:?required}
       MM_SERVICESETTINGS_LISTENADDRESS: :8065
@@ -30,15 +30,15 @@ services:
       - CMD
       - /mattermost/bin/mattermost
       - version
-      interval: 30s
-      timeout: 5s
-      retries: 10
-      start_period: 60s
+      interval: ${MTE_HEALTHCHECK_STANDARD_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_STANDARD_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_STANDARD_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_STANDARD_START_PERIOD:?required}
     restart: unless-stopped
     stop_grace_period: 90s
     cpus: ${MATTERMOST_CPU_LIMIT:?required}
     mem_limit: ${MATTERMOST_MEMORY_LIMIT:?required}
-    pids_limit: 512
+    pids_limit: ${MTE_PIDS_APP_LIMIT:?required}
     logging: *id001
 volumes:
   mattermost-config:

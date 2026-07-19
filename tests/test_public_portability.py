@@ -22,7 +22,9 @@ def load(path: Path, name: str):
 
 class PublicPortabilityTests(unittest.TestCase):
     def test_config_init_requires_explicit_operator_identity(self) -> None:
-        config = load(ROOT / "tools/platform-cli/server-config.py", "portability_server_config")
+        config = load(
+            ROOT / "tools/platform-cli/server-config.py", "portability_server_config"
+        )
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "platform.env"
             with (
@@ -90,6 +92,20 @@ class PublicPortabilityTests(unittest.TestCase):
         lines = (ROOT / templates[0]).read_text().splitlines()
         self.assertLess(len(lines), 80)
         self.assertIn("/root/.config/mte-secrets/platform.env", "\n".join(lines))
+
+    def test_public_test_fixtures_do_not_embed_the_operator_domain(self) -> None:
+        operator_domain = "".join(("prin7r", ".com"))
+        offenders = sorted(
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "tests").rglob("*.py")
+            if operator_domain in path.read_text(errors="ignore")
+        )
+        self.assertEqual(offenders, [])
+
+    def test_daytona_step_resolves_the_release_root_from_steps_directory(self) -> None:
+        source = (ROOT / "deployment/steps/daytona.sh").read_text()
+        self.assertIn('"$SCRIPT_DIR/.."', source)
+        self.assertNotIn('"$SCRIPT_DIR/../.."', source)
 
 
 if __name__ == "__main__":

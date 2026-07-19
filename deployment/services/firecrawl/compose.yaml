@@ -2,25 +2,9 @@ name: mte-firecrawl
 x-logging: &id001
   driver: json-file
   options:
-    max-size: 10m
-    max-file: '3'
+    max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+    max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
     compress: 'true'
-x-firecrawl-env:
-  REDIS_URL: ${FIRECRAWL_REDIS_URL:?required}
-  REDIS_RATE_LIMIT_URL: ${FIRECRAWL_REDIS_URL:?required}
-  PLAYWRIGHT_MICROSERVICE_URL: http://playwright-service:3000/scrape
-  POSTGRES_USER: ${FIRECRAWL_DB_USER:?required}
-  POSTGRES_PASSWORD: ${FIRECRAWL_DB_PASSWORD:?required}
-  POSTGRES_DB: ${FIRECRAWL_DB_NAME:?required}
-  POSTGRES_HOST: nuq-postgres
-  POSTGRES_PORT: '5432'
-  USE_DB_AUTHENTICATION: 'false'
-  NUM_WORKERS_PER_QUEUE: ${FIRECRAWL_WORKERS_PER_QUEUE:?required}
-  CRAWL_CONCURRENT_REQUESTS: ${FIRECRAWL_CRAWL_CONCURRENCY:?required}
-  MAX_CONCURRENT_JOBS: ${FIRECRAWL_MAX_JOBS:?required}
-  BROWSER_POOL_SIZE: ${FIRECRAWL_BROWSER_POOL_SIZE:?required}
-  SEARXNG_ENDPOINT: http://searxng:8080
-  LOGGING_LEVEL: ${FIRECRAWL_LOG_LEVEL:?required}
 services:
   api:
     image: ${MTE_FIRECRAWL_API_IMAGE:?required}
@@ -72,15 +56,15 @@ services:
       test:
       - CMD-SHELL
       - node -e "fetch('http://127.0.0.1:3002/').then(r=>{if(r.status>=500)process.exit(1)}).catch(()=>process.exit(1))"
-      interval: 30s
-      timeout: 10s
-      retries: 15
-      start_period: 90s
+      interval: ${MTE_HEALTHCHECK_SLOW_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_SLOW_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_SLOW_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_SLOW_START_PERIOD:?required}
     restart: unless-stopped
     stop_grace_period: 90s
     cpus: ${FIRECRAWL_API_CPU_LIMIT:?required}
     mem_limit: ${FIRECRAWL_API_MEMORY_LIMIT:?required}
-    pids_limit: 768
+    pids_limit: ${MTE_PIDS_APP_LIMIT:?required}
     ulimits:
       nofile:
         soft: 65535
@@ -98,23 +82,25 @@ services:
       test:
       - CMD-SHELL
       - node -e "fetch('http://127.0.0.1:3000/').then(()=>{}).catch(()=>process.exit(1))"
-      interval: 30s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
+      interval: ${MTE_HEALTHCHECK_SLOW_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_SLOW_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_SLOW_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_SLOW_START_PERIOD:?required}
     tmpfs:
     - /tmp/.cache:noexec,nosuid,size=512m
     restart: unless-stopped
     cpus: ${FIRECRAWL_BROWSER_CPU_LIMIT:?required}
     mem_limit: ${FIRECRAWL_BROWSER_MEMORY_LIMIT:?required}
-    pids_limit: 768
+    pids_limit: ${MTE_PIDS_BROWSER_LIMIT:?required}
     logging: *id001
     ports: []
   redis:
-    image: ${MTE_FIRECRAWL_REDIS_IMAGE:?required}
+    # Preserve Firecrawl's Redis-protocol hostname and named volume while the
+    # datastore implementation moves to BSD-licensed Valkey.
+    image: ${MTE_FIRECRAWL_VALKEY_IMAGE:?required}
     environment:
       FIRECRAWL_REDIS_PASSWORD: ${FIRECRAWL_REDIS_PASSWORD:?required}
-    user: redis
+    user: 999:1000
     command:
     - /bin/sh
     - -euc
@@ -127,27 +113,27 @@ services:
 
       unset FIRECRAWL_REDIS_PASSWORD
 
-      exec redis-server /tmp/mte-firecrawl-redis.conf
+      exec valkey-server /tmp/mte-firecrawl-redis.conf
 
       '
     tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,mode=1777
     volumes:
-    - firecrawl-redis:/data
+    - firecrawl-valkey:/data
     networks:
     - firecrawl
     healthcheck:
       test:
       - CMD-SHELL
-      - REDISCLI_AUTH="$${FIRECRAWL_REDIS_PASSWORD:?required}" redis-cli ping | grep
+      - VALKEYCLI_AUTH="$${FIRECRAWL_REDIS_PASSWORD:?required}" valkey-cli ping | grep
         -q PONG
-      interval: 10s
-      timeout: 5s
-      retries: 10
+      interval: ${MTE_HEALTHCHECK_FAST_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_FAST_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_FAST_RETRIES:?required}
     restart: unless-stopped
     cpus: ${FIRECRAWL_REDIS_CPU_LIMIT:?required}
     mem_limit: ${FIRECRAWL_REDIS_MEMORY_LIMIT:?required}
-    pids_limit: 128
+    pids_limit: ${MTE_PIDS_LIGHTWEIGHT_LIMIT:?required}
     logging: *id001
     ports: []
   rabbitmq:
@@ -163,14 +149,14 @@ services:
       - -z
       - 127.0.0.1
       - '5672'
-      interval: 10s
-      timeout: 15s
-      retries: 20
-      start_period: 120s
+      interval: ${MTE_HEALTHCHECK_SLOW_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_SLOW_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_SLOW_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_SLOW_START_PERIOD:?required}
     restart: unless-stopped
     cpus: ${FIRECRAWL_RABBIT_CPU_LIMIT:?required}
     mem_limit: ${FIRECRAWL_RABBIT_MEMORY_LIMIT:?required}
-    pids_limit: 256
+    pids_limit: ${MTE_PIDS_DATASTORE_LIMIT:?required}
     logging: *id001
     ports: []
   nuq-postgres:
@@ -191,19 +177,19 @@ services:
       test:
       - CMD-SHELL
       - pg_isready -U ${FIRECRAWL_DB_USER:?required} -d ${FIRECRAWL_DB_NAME:?required}
-      interval: 10s
-      timeout: 5s
-      retries: 15
-      start_period: 30s
+      interval: ${MTE_HEALTHCHECK_FAST_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_FAST_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_FAST_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_FAST_START_PERIOD:?required}
     restart: unless-stopped
     cpus: ${FIRECRAWL_DB_CPU_LIMIT:?required}
     mem_limit: ${FIRECRAWL_DB_MEMORY_LIMIT:?required}
-    pids_limit: 256
+    pids_limit: ${MTE_PIDS_DATASTORE_LIMIT:?required}
     logging: *id001
     ports: []
 volumes:
-  firecrawl-redis:
-    name: mte-firecrawl-redis
+  firecrawl-valkey:
+    name: mte-firecrawl-valkey
   firecrawl-rabbitmq:
     name: mte-firecrawl-rabbitmq
   firecrawl-postgres:
@@ -215,5 +201,5 @@ networks:
     name: mte-search
     external: true
   tool-runtime:
-    name: mte-tool-runtime
+    name: ${MTE_TOOL_RUNTIME_NETWORK:?required}
     external: true

@@ -1,0 +1,28 @@
+title = "Paperclip Agent Platform source scan"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Exact public Docker signing-key checksum that triggers generic-api-key."
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)config/dependencies\.lock\.json$''']
+regexTarget = "line"
+regexes = ['''"keySha256": "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"''']
+
+[[allowlists]]
+description = "Exact published Docker signing-key checksum in source constants."
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''(^|/)tools/platform-cli/server-config\.py$''']
+regexTarget = "line"
+regexes = ['''"MTE_DOCKER_APT_KEY_SHA256": "1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570"''']
+
+[[allowlists]]
+description = "Exact nonfunctional Cloudflare fixture value."
+condition = "AND"
+targetRules = ["cloudflare-api-key"]
+paths = ['''(^|/)tests/test_platform_orchestrator\.py$''']
+regexTarget = "line"
+regexes = ['''"CLOUDFLARE_API_TOKEN": "unit-cloudflare-token-must-stay-redacted"''']

@@ -22,7 +22,9 @@ def load(path: Path, name: str):
     return module
 
 
-contract = load(ROOT / "tools/platform-cli/data_content_plane.py", "test_data_content_contract")
+contract = load(
+    ROOT / "tools/platform-cli/data_content_plane.py", "test_data_content_contract"
+)
 server_verify = load(
     ROOT / "tools/platform-cli/server-verify.py", "test_data_content_server_verify"
 )
@@ -130,6 +132,37 @@ class DataContentPlaneTests(unittest.TestCase):
             hashlib.sha256(self.lock_path.read_bytes()).hexdigest(),
         )
 
+    def test_adapter_execution_order_is_reviewed_and_incomplete_projections_fail_closed(
+        self,
+    ) -> None:
+        plane = self.resolve()
+        # JSON object order is not part of the provider contract.  Rendering
+        # serializes keys alphabetically, while the reviewed lifecycle starts
+        # with the database provider.
+        plane["adapters"] = {
+            "notion": plane["adapters"]["notion"],
+            "postgrest": plane["adapters"]["postgrest"],
+        }
+        self.assertEqual(
+            contract.adapter_commands(plane, "provision"),
+            [
+                ("server-postgrest.py", "provision"),
+                ("server-notion.py", "provision"),
+            ],
+        )
+
+        incomplete = json.loads(json.dumps(plane))
+        incomplete["adapters"].pop("postgrest")
+        for resolver in (
+            lambda: contract.adapter_commands(incomplete, "provision"),
+            lambda: contract.projection_consumer_commands(incomplete, "verify"),
+        ):
+            with self.subTest(resolver=resolver):
+                with self.assertRaisesRegex(
+                    contract.DataContentError, "adapter set is incomplete"
+                ):
+                    resolver()
+
     def test_default_orchestration_selects_internal_postgrest_without_ui_containers(
         self,
     ) -> None:
@@ -147,10 +180,14 @@ class DataContentPlaneTests(unittest.TestCase):
         ):
             config = platform.config("example.test")
         ordered = [row["id"] for row in platform.component_order(config, None)]
-        self.assertNotIn("baserow", ordered)
-        self.assertNotIn("wikijs", ordered)
-        self.assertNotIn("nocodb", ordered)
-        self.assertLess(ordered.index("postgrest"), ordered.index("activepieces"))
+        self.assertEqual(
+            {
+                row["id"]
+                for row in config["spec"]["components"]
+                if "enabledForProfiles" in row
+            },
+            {"postgrest"},
+        )
         self.assertNotIn("notion", ordered)
 
         commands: list[str] = []
@@ -203,33 +240,12 @@ class DataContentPlaneTests(unittest.TestCase):
     def test_provider_manifest_filter_fails_closed_on_invalid_declarations(
         self,
     ) -> None:
-        missing_profile = json.loads(json.dumps(self.config))
-        del missing_profile["spec"]["providerProfiles"]["baserow-wikijs"]
-        with self.assertRaisesRegex(
-            contract.DataContentError, "missing=baserow-wikijs"
-        ):
-            contract.filter_platform_config(missing_profile, self.lock, self.values)
-
         ambiguous_provider = json.loads(json.dumps(self.config))
         ambiguous_provider["spec"]["providerProfiles"]["postgres-notion"][
             "providerIds"
         ].append("notion")
         with self.assertRaisesRegex(contract.DataContentError, "unique non-empty"):
             contract.filter_platform_config(ambiguous_provider, self.lock, self.values)
-
-        incomplete_component = json.loads(json.dumps(self.config))
-        postgrest = next(
-            row
-            for row in incomplete_component["spec"]["components"]
-            if row["id"] == "postgrest"
-        )
-        postgrest["enabledForProfiles"].remove("baserow-wikijs")
-        with self.assertRaisesRegex(
-            contract.DataContentError, "enabledForProfiles mapping is incomplete"
-        ):
-            contract.filter_platform_config(
-                incomplete_component, self.lock, self.values
-            )
 
         unknown_profile = json.loads(json.dumps(self.config))
         postgrest = next(
@@ -242,55 +258,30 @@ class DataContentPlaneTests(unittest.TestCase):
             contract.filter_platform_config(unknown_profile, self.lock, self.values)
 
         incompatible_dependency = json.loads(json.dumps(self.config))
-        activepieces = next(
+        postgrest = next(
             row
             for row in incompatible_dependency["spec"]["components"]
-            if row["id"] == "activepieces"
+            if row["id"] == "postgrest"
         )
-        activepieces["dependsOn"].append("nocodb")
+        postgrest["dependsOn"].append("unknown-component")
         with self.assertRaisesRegex(
-            contract.DataContentError, "unavailable dependencies: nocodb"
+            contract.DataContentError, "unavailable dependencies: unknown-component"
         ):
             contract.filter_platform_config(
                 incompatible_dependency, self.lock, self.values
             )
 
-    def test_connection_registry_targets_profile_scoped_internal_api(self) -> None:
-        connections = {
+    def test_acceptance_registry_requires_profile_scoped_internal_api(self) -> None:
+        requirements = {
             row["id"]: row
-            for row in yaml.safe_load((ROOT / "config/connections.yaml").read_text())[
-                "connections"
+            for row in yaml.safe_load(
+                (ROOT / "config/acceptance-requirements.yaml").read_text()
+            )[
+                "requirements"
             ]
         }
-        self.assertEqual(connections["C027"]["to"], "data-content/scopedDataApi")
-        self.assertEqual(connections["C028"]["to"], "data-content/scopedDataApi")
-        self.assertEqual(connections["C029"]["from"], "postgres-ssot")
-
-    def test_nocodb_bundle_remains_reviewed_but_inactive_and_non_blocking(
-        self,
-    ) -> None:
-        registry = contract.validate_registry(self.lock)
-        bundle = registry["postgres-postgrest-nocodb-nocodocs"]
-        self.assertFalse(bundle["selectable"])
-        self.assertFalse(bundle["contractComplete"])
-        self.assertTrue(bundle["activationBlockers"])
-        self.assertEqual(
-            {role: row["providerId"] for role, row in bundle["roles"].items()},
-            {
-                "tablesUi": "nocodb",
-                "tablesApi": "nocodb",
-                "documentsUi": "nocodb",
-                "documentsApi": "nocodb",
-            },
-        )
-        self.assertEqual(
-            bundle["licenseExceptions"]["nocodb"],
-            contract.REVIEWED_LICENSE_EXCEPTIONS[
-                "LicenseRef-NocoDB-Sustainable-Use-1.0"
-            ],
-        )
-        plane = self.resolve(values={**self.values, "NOCODB_LICENSE_KEY": "dormant"})
-        self.assertEqual(plane["profile"], "postgres-notion")
+        self.assertEqual(requirements["C027"]["to"], "data-content/scopedDataApi")
+        self.assertEqual(requirements["C029"]["from"], "postgres-ssot")
 
     def test_unknown_and_retired_profiles_fail_closed(self) -> None:
         for profile in ("unknown-provider", "mathesar-postgrest-memos"):
@@ -358,7 +349,9 @@ class DataContentPlaneTests(unittest.TestCase):
             config_source.write_text(json.dumps(self.config, sort_keys=True) + "\n")
             lock_source.write_text(self.lock_path.read_text())
             runtime_config.write_text(json.dumps(self.config, sort_keys=True) + "\n")
-            module_path.write_text((ROOT / "tools/platform-cli/data_content_plane.py").read_text())
+            module_path.write_text(
+                (ROOT / "tools/platform-cli/data_content_plane.py").read_text()
+            )
             source_sha = "a" * 64
             plane = contract.resolve_from_paths(
                 self.config,
@@ -411,7 +404,7 @@ class DataContentPlaneTests(unittest.TestCase):
                 {item["finding"] for item in findings},
             )
 
-    def test_server_verifier_filters_unselected_provider_components(self) -> None:
+    def test_server_verifier_uses_selected_provider_components(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config_path = root / "config/platform.json"
@@ -423,15 +416,16 @@ class DataContentPlaneTests(unittest.TestCase):
             runtime = json.loads(json.dumps(self.config))
             config_path.write_text(json.dumps(runtime))
             lock_path.write_text(self.lock_path.read_text())
-            plane_path.write_text(json.dumps({"componentIds": ["baserow", "wikijs"]}))
-            module_path.write_text((ROOT / "tools/platform-cli/data_content_plane.py").read_text())
+            plane_path.write_text(json.dumps({"componentIds": ["postgrest"]}))
+            module_path.write_text(
+                (ROOT / "tools/platform-cli/data_content_plane.py").read_text()
+            )
             with (
                 mock.patch.object(server_verify, "ROOT", root),
                 mock.patch.object(server_verify, "CONFIG", config_path),
             ):
                 component_ids = {row["id"] for row in server_verify.load_components()}
-            self.assertTrue({"baserow", "wikijs"} <= component_ids)
-            self.assertFalse({"postgrest", "nocodb"} & component_ids)
+            self.assertIn("postgrest", component_ids)
 
 
 if __name__ == "__main__":

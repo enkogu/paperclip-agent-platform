@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    },
+    "mte-profile-tools": {
+      "headers": {
+        "Authorization": "Bearer ${MTE_TOOLHIVE_BEARER_TOKEN}"
+      },
+      "type": "http",
+      "url": "http://172.20.0.1:22082/mcp"
+    }
+  }
+}

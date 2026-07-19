@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Produce sanitized live evidence for cross-service integration canaries.
-
-The controller runs on the deployment host. Long-lived credentials are read
-only from canonical state or renderer-owned projections. Activepieces MCP
-access tokens are deliberately short-lived: one is issued for each C013 run,
-placed in a mode-0600 file inside the ToolHive manager, and removed together
-with the remote workload in ``finally``. No expiring MCP token is persisted.
-"""
+"""Produce sanitized live evidence for cross-service integration canaries."""
 
 from __future__ import annotations
 
@@ -14,6 +7,7 @@ import base64
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -33,15 +27,16 @@ SECRET_ROOT = Path(os.environ.get("MTE_SECRET_ROOT", "/root/.config/mte-secrets"
 CANONICAL = SECRET_ROOT / "platform.env"
 SERVICES = SECRET_ROOT / "services"
 EVIDENCE = ROOT / "evidence/integration-canaries.json"
-SUPPORTED = ("C013", "C023", "C024", "C027", "C028", "C029", "C030")
-ACTIVEPIECES_LIST_FLOWS_TOOL = "ap_list_flows"
-POSTGREST_ACTIVEPIECES_VARIABLE = "MTE_POSTGREST_ACTIVEPIECES_TOKEN"
+SUPPORTED = ("C023", "C024", "C027", "C029", "C030")
 DEFAULT_DATA_CONTENT_PROFILE = "postgres-notion"
-LEGACY_NOCODB_PROFILE = "postgres-postgrest-nocodb-nocodocs"
-POSTGREST_DATA_PROFILES = frozenset(
-    (DEFAULT_DATA_CONTENT_PROFILE, LEGACY_NOCODB_PROFILE)
-)
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+API_VERSION = "micro-task-engine/v1alpha1"
+PAPERCLIP_TERMINAL_RUN_STATUSES = frozenset(
+    {"succeeded", "failed", "timed_out", "cancelled"}
+)
+PAPERCLIP_RUN_TIMEOUT_SECONDS = 210
+PAPERCLIP_CLEANUP_TIMEOUT_SECONDS = 30
+SENSITIVE_VALUE_KEY = re.compile(r"(?:TOKEN|SECRET|PASSWORD|API_KEY|LICENSE_KEY)$")
 
 
 class CanaryError(RuntimeError):
@@ -72,6 +67,41 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:12]
 
 
+def operator_base(values: dict[str, str], port_key: str) -> str:
+    """Build a host-only service origin from canonical operator-plane settings."""
+    raw_host = values.get("MTE_OPERATOR_LOOPBACK_HOST", "").strip()
+    try:
+        address = ipaddress.ip_address(raw_host)
+    except ValueError as exc:
+        raise CanaryError("operator_loopback_host_invalid") from exc
+    if not address.is_loopback:
+        raise CanaryError("operator_loopback_host_invalid")
+    raw_port = values.get(port_key, "").strip()
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise CanaryError("operator_origin_port_invalid") from exc
+    if not 1024 <= port <= 65535:
+        raise CanaryError("operator_origin_port_invalid")
+    host = f"[{address}]" if address.version == 6 else str(address)
+    return f"http://{host}:{port}"
+
+
+def canary_proxy_port(
+    values: dict[str, str], *, base_key: str, range_key: str, run_id: str
+) -> int:
+    """Select a stable transient proxy port inside a canonical configured range."""
+    try:
+        base = int(values.get(base_key, ""))
+        size = int(values.get(range_key, ""))
+    except ValueError as exc:
+        raise CanaryError("toolhive_canary_proxy_range_invalid") from exc
+    if base < 1024 or size < 1 or base + size - 1 > 65535:
+        raise CanaryError("toolhive_canary_proxy_range_invalid")
+    offset = int(hashlib.sha256(run_id.encode()).hexdigest()[:8], 16) % size
+    return base + offset
+
+
 def canonical_hash() -> str:
     return hashlib.sha256(CANONICAL.read_bytes()).hexdigest()
 
@@ -79,6 +109,19 @@ def canonical_hash() -> str:
 def producer_hash() -> str:
     path = Path(__file__)
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+
+
+def evidence_contains_canonical_secret(
+    payload: dict[str, Any], values: dict[str, str]
+) -> bool:
+    """Prevent status and persisted receipts from replaying canonical credentials."""
+
+    serialized = json.dumps(payload, sort_keys=True)
+    return any(
+        value in serialized
+        for key, value in values.items()
+        if SENSITIVE_VALUE_KEY.search(key) and len(value) >= 8
+    )
 
 
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -109,7 +152,12 @@ def request_json(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read(4_000_000)
-            return response.status, json.loads(raw) if raw else None
+            if not raw:
+                return response.status, None
+            try:
+                return response.status, json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise CanaryError("remote_json_invalid") from exc
     except urllib.error.HTTPError as exc:
         if allow_status and exc.code in allow_status:
             return exc.code, None
@@ -129,16 +177,21 @@ def run(
     process_environment = None
     if environment:
         process_environment = {**os.environ, **environment}
-    completed = subprocess.run(
-        argv,
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=process_environment,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            argv,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=process_environment,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CanaryError("command_timeout") from exc
+    except OSError as exc:
+        raise CanaryError("command_unavailable") from exc
     if check and completed.returncode != 0:
         raise CanaryError("command_failed")
     return completed
@@ -203,7 +256,7 @@ def toolhive(
 
 
 def write_manager_secret(manager: str, path: str, value: str) -> None:
-    if "\x00" in value:
+    if "\x00" in value or not re.fullmatch(r"/tmp/[A-Za-z0-9_.-]+\.env", path):
         raise CanaryError("unsafe_ephemeral_secret")
     run(
         [
@@ -213,21 +266,38 @@ def write_manager_secret(manager: str, path: str, value: str) -> None:
             manager,
             "sh",
             "-c",
-            f"umask 077; cat > {path}; chmod 600 {path}",
+            "umask 077; cat > \"$1\"; chmod 600 \"$1\"",
+            "sh",
+            path,
         ],
         input_text=value,
     )
 
 
-def remove_manager_file(manager: str, path: str) -> None:
-    run(
-        ["docker", "exec", manager, "rm", "-f", path],
+def remove_manager_file(manager: str, path: str) -> bool:
+    """Remove an ephemeral manager file and prove that it is gone."""
+
+    result = run(
+        [
+            "docker",
+            "exec",
+            manager,
+            "sh",
+            "-c",
+            "rm -f -- \"$1\" && test ! -e \"$1\"",
+            "sh",
+            path,
+        ],
         check=False,
+        timeout=60,
     )
+    return result.returncode == 0
 
 
-def remove_toolhive_workload(manager: str, name: str) -> None:
-    toolhive(manager, "rm", name, check=False, timeout=60)
+def remove_toolhive_workload(manager: str, name: str) -> bool:
+    """Remove a transient workload; callers must not infer cleanup from intent."""
+
+    return toolhive(manager, "rm", name, check=False, timeout=60).returncode == 0
 
 
 def wait_toolhive_tool(
@@ -278,176 +348,29 @@ def write_ephemeral_secret(path: Path, value: str) -> None:
         raise CanaryError("ephemeral_secret_mode_invalid")
 
 
-def activepieces_stdio_bridge_code() -> str:
-    return r"""
-import json
-import sys
-import urllib.request
-
-with open('/run/secret/token', encoding='utf-8') as source:
-    token = source.read().strip()
-if not token:
-    raise SystemExit('missing token')
-
-def response_payload(raw, content_type):
-    if not raw:
-        return None
-    if 'text/event-stream' not in content_type:
-        return json.loads(raw)
-    for line in raw.splitlines():
-        if line.startswith('data:'):
-            return json.loads(line[5:].strip())
-    raise RuntimeError('upstream_sse_data_missing')
-
-for raw_line in sys.stdin:
-    message = None
-    try:
-        message = json.loads(raw_line)
-        request = urllib.request.Request(
-            'http://activepieces/mcp',
-            data=json.dumps(message, separators=(',', ':')).encode(),
-            method='POST',
-            headers={
-                'Accept': 'application/json, text/event-stream',
-                'Authorization': 'Bearer ' + token,
-                'Content-Type': 'application/json',
-            },
-        )
-        with urllib.request.urlopen(request, timeout=180) as upstream:
-            payload = response_payload(
-                upstream.read(4_000_000).decode(),
-                upstream.headers.get('Content-Type', ''),
-            )
-        if payload is not None:
-            sys.stdout.write(json.dumps(payload, separators=(',', ':')) + '\n')
-            sys.stdout.flush()
-    except Exception:
-        request_id = message.get('id') if isinstance(message, dict) else None
-        if request_id is not None:
-            sys.stdout.write(json.dumps({
-                'jsonrpc': '2.0',
-                'id': request_id,
-                'error': {'code': -32603, 'message': 'upstream_mcp_error'},
-            }, separators=(',', ':')) + '\n')
-            sys.stdout.flush()
-"""
-
-
-def activepieces_session(values: dict[str, str]) -> tuple[str, str, str]:
-    base = "http://127.0.0.1:18090"
-    _status, auth = request_json(
-        "POST",
-        f"{base}/api/v1/authentication/sign-in",
-        body={
-            "email": values["ACTIVEPIECES_ADMIN_EMAIL"],
-            "password": values["ACTIVEPIECES_ADMIN_PASSWORD"],
-        },
-    )
-    token = str((auth or {}).get("token") or "")
-    project_id = str((auth or {}).get("projectId") or "")
-    if not token or not project_id:
-        raise CanaryError("activepieces_session_missing")
-    return base, token, project_id
-
-
-def c013(values: dict[str, str], run_id: str) -> dict[str, Any]:
-    base, session, project_id = activepieces_session(values)
-    _status, issued = request_json(
-        "POST",
-        f"{base}/api/v1/projects/{project_id}/mcp-server/token",
-        headers={"Authorization": f"Bearer {session}"},
-    )
-    mcp_token = str((issued or {}).get("mcpToken") or "")
-    if not mcp_token:
-        raise CanaryError("activepieces_mcp_token_missing")
-    manager = toolhive_manager()
-    suffix = run_id[-8:].lower()
-    workload = f"mte-ap-canary-{suffix}"
-    token_path = ROOT / "toolhive/tmp" / f"{workload}.token"
-    proxy_port = 19100 + int(hashlib.sha256(run_id.encode()).hexdigest()[:3], 16) % 400
-    cleanup = {
-        "workloadRemoved": False,
-        "tokenFileRemoved": False,
-    }
-    try:
-        write_ephemeral_secret(token_path, mcp_token)
-        toolhive(
-            manager,
-            "run",
-            "--name",
-            workload,
-            "--network",
-            "host",
-            "--isolate-network=false",
-            "--proxy-port",
-            str(proxy_port),
-            "--permission-profile",
-            "network",
-            "--transport",
-            "stdio",
-            "--volume",
-            f"{token_path}:/run/secret/token:ro",
-            "python:3.13-slim",
-            "--",
-            "python",
-            "-u",
-            "-c",
-            activepieces_stdio_bridge_code(),
-            timeout=180,
-        )
-        tool_schema = wait_toolhive_tool(
-            manager, workload, ACTIVEPIECES_LIST_FLOWS_TOOL
-        )
-        called = toolhive(
-            manager,
-            "mcp",
-            "call",
-            ACTIVEPIECES_LIST_FLOWS_TOOL,
-            "--server",
-            workload,
-            "--args-file",
-            "-",
-            "--format",
-            "json",
-            input_text="{}",
-            timeout=120,
-        ).stdout
-        return {
-            "id": "C013",
-            "ok": True,
-            "state": "passed",
-            "source": "toolhive_stdio_mcp_bridge_workload",
-            "action": ACTIVEPIECES_LIST_FLOWS_TOOL,
-            "toolSchemaSha256": hashlib.sha256(tool_schema.encode()).hexdigest(),
-            "activepiecesProjectId": project_id,
-            "bridgeTarget": "activepieces:80/mcp",
-            "bridgeManagedByToolHive": True,
-            "resultSha256": hashlib.sha256(called.encode()).hexdigest(),
-            "shortLivedToken": True,
-            "ephemeral0600TokenMount": True,
-            "tokenPersisted": False,
-            "cleanup": cleanup,
-        }
-    finally:
-        remove_toolhive_workload(manager, workload)
-        cleanup["workloadRemoved"] = True
-        token_path.unlink(missing_ok=True)
-        cleanup["tokenFileRemoved"] = not token_path.exists()
-        mcp_token = ""
-
-
 def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
     manager = toolhive_manager()
     suffix = run_id[-8:].lower()
     workload = f"mte-firecrawl-canary-{suffix}"
     env_file = f"/tmp/{workload}.env"
     marker = f"MTE-C023-{run_id}"
-    proxy_port = 19500 + int(hashlib.sha256(run_id.encode()).hexdigest()[:3], 16) % 300
+    proxy_port = canary_proxy_port(
+        values,
+        base_key="TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE",
+        range_key="TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE",
+        run_id=run_id,
+    )
     cleanup = {
         "workloadRemoved": False,
         "envFileRemoved": False,
+        # The canary uses an external stateless echo endpoint; it never starts
+        # a marker server of its own, so no server can survive this run.
+        "markerServerRemoved": True,
     }
+    env_file_touched = False
+    workload_touched = False
     try:
+        env_file_touched = True
         write_manager_secret(
             manager,
             env_file,
@@ -455,6 +378,7 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             + values["FIRECRAWL_API_KEY"]
             + "\nFIRECRAWL_API_URL=http://firecrawl-api:3002\n",
         )
+        workload_touched = True
         toolhive(
             manager,
             "run",
@@ -509,10 +433,15 @@ def c023(values: dict[str, str], run_id: str) -> dict[str, Any]:
             "cleanup": cleanup,
         }
     finally:
-        remove_toolhive_workload(manager, workload)
-        cleanup["workloadRemoved"] = True
-        remove_manager_file(manager, env_file)
-        cleanup["envFileRemoved"] = True
+        cleanup["workloadRemoved"] = (
+            not workload_touched
+            or bool(remove_toolhive_workload(manager, workload))
+        )
+        cleanup["envFileRemoved"] = (
+            not env_file_touched or bool(remove_manager_file(manager, env_file))
+        )
+        if not all(cleanup.values()):
+            raise CanaryError("toolhive_canary_cleanup_incomplete")
 
 
 def c024(_values: dict[str, str], run_id: str) -> dict[str, Any]:
@@ -663,7 +592,7 @@ def _jwt(values: dict[str, str], role: str, *, lifetime: int = 300) -> str:
 
 
 def _postgrest_url(values: dict[str, str], table: str, external_id: str = "") -> str:
-    base = f"http://127.0.0.1:{values['POSTGREST_ORIGIN_PORT']}/{table}"
+    base = f"{operator_base(values, 'POSTGREST_ORIGIN_PORT')}/{table}"
     if not external_id:
         return base
     return (
@@ -885,7 +814,10 @@ def _postgres_ssot_cleanup(
     return result
 
 
-def _notion_runtime_payload(values: dict[str, str], run_id: str) -> dict[str, Any]:
+def _direct_notion_connector_runtime_payload(
+    values: dict[str, str], run_id: str
+) -> dict[str, Any]:
+    """Legacy connector-only probe, deliberately not accepted as C029 evidence."""
     script = ROOT / "bin/server-notion.py"
     evidence_path = ROOT / "evidence/notion-connector-verify.json"
     if not script.is_file():
@@ -1063,236 +995,172 @@ def _linked_notion_projection(
     }
 
 
-def _c029_postgres_notion(values: dict[str, str], run_id: str) -> dict[str, Any]:
-    postgrest_reference = _postgrest_dependency_reference()
-    # The aggregate evidence intentionally retains its control run ID. Use a
-    # one-way-derived, separate linkage ID so neither that ID nor the raw
-    # deterministic Notion/PostgreSQL markers can appear in stored evidence.
-    linkage_run_id = hashlib.sha256(f"C029:{run_id}".encode()).hexdigest()[:24]
-    postgres, private = _postgres_ssot_prepare(values, linkage_run_id)
-    postgres_cleanup: dict[str, bool] = {}
+def _read_private_projection_evidence(path: Path, kind: str) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise CanaryError("notion_projection_evidence_missing")
+    info = path.stat()
+    if info.st_mode & 0o777 != 0o600:
+        raise CanaryError("notion_projection_evidence_mode_invalid")
+    if os.geteuid() == 0 and (info.st_uid != 0 or info.st_gid != 0):
+        raise CanaryError("notion_projection_evidence_owner_invalid")
     try:
-        notion_payload = _notion_runtime_payload(values, linkage_run_id)
-        notion = _linked_notion_projection(postgres, notion_payload)
-    finally:
-        postgres_cleanup = _postgres_ssot_cleanup(values, private)
-    if postgres_cleanup.get("verified") is not True:
-        raise CanaryError("postgres_ssot_cleanup_invalid")
-    for value in postgres.values():
-        value.update(
-            {
-                "postDeleteAbsent": True,
-                "cleanupVerified": True,
-            }
-        )
-    cleanup = {
-        **postgres_cleanup,
-        **notion["cleanup"],
-        "verified": postgres_cleanup["verified"] and notion["cleanup"]["verified"],
-    }
-    return {
-        "id": "C029",
-        "ok": True,
-        "state": "passed",
-        "source": "server_notion_connector_canary",
-        "dataContentProfile": DEFAULT_DATA_CONTENT_PROFILE,
-        "roles": {
-            "tablesUi": "notion",
-            "tablesApi": "notion",
-            "documentsUi": "notion",
-            "documentsApi": "notion",
-        },
-        "internalApis": {"scopedDataApi": "postgrest"},
-        "postgresSsot": postgres,
-        "notion": {
-            "table": notion["table"],
-            "document": notion["document"],
-        },
-        "tablePersistenceVerified": True,
-        "documentPersistenceVerified": True,
-        "crossProviderLinkageVerified": True,
-        "cleanupCompleted": cleanup["verified"],
-        "cleanup": cleanup,
-        "redacted": True,
-        "dependencyEvidence": notion_payload["_evidenceReference"],
-        "internalApiEvidence": postgrest_reference,
-    }
+        document = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise CanaryError("notion_projection_evidence_invalid") from exc
+    if not isinstance(document, dict) or document.get("kind") != kind:
+        raise CanaryError("notion_projection_evidence_invalid")
+    return document
 
 
-def c029(_values: dict[str, str], _run_id: str) -> dict[str, Any]:
-    profile = _values.get("DATA_CONTENT_PROFILE", "")
-    if profile == DEFAULT_DATA_CONTENT_PROFILE:
-        return _c029_postgres_notion(_values, _run_id)
-    if profile == LEGACY_NOCODB_PROFILE:
-        postgrest, postgrest_ref = bound_component_evidence(
-            "server-postgrest.py", "postgrest-verify.json", "PostgrestVerification"
+def _projection_runtime_payload(values: dict[str, str], run_id: str) -> dict[str, Any]:
+    """Bind C029 to the outbox consumer canary and its post-canary verify receipt."""
+
+    script = ROOT / "bin/server-notion-sync.py"
+    canary_path = ROOT / "evidence/notion-projection-live-canary.json"
+    verify_path = ROOT / "evidence/notion-projection-consumer-verify.json"
+    if not script.is_file():
+        raise CanaryError("notion_projection_consumer_missing")
+    producer_sha = hashlib.sha256(script.read_bytes()).hexdigest()
+    canary_result = run(
+        [sys.executable, str(script), "canary", "--run-id", run_id], timeout=900
+    )
+    verify_result = run([sys.executable, str(script), "verify"], timeout=300)
+    try:
+        canary = json.loads(canary_result.stdout)
+        verification = json.loads(verify_result.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise CanaryError("notion_projection_result_invalid") from exc
+    persisted_canary = _read_private_projection_evidence(
+        canary_path, "NotionProjectionLiveCanary"
+    )
+    persisted_verification = _read_private_projection_evidence(
+        verify_path, "NotionProjectionConsumerVerification"
+    )
+    if not isinstance(canary, dict) or not isinstance(verification, dict):
+        raise CanaryError("notion_projection_result_invalid")
+    def common(payload: dict[str, Any]) -> bool:
+        return (
+            payload.get("status") == "passed"
+            and payload.get("ok") is True
+            and payload.get("dataContentProfile") == DEFAULT_DATA_CONTENT_PROFILE
+            and payload.get("canonicalSourceSha256") == canonical_hash()
+            and payload.get("producerSha256") == producer_sha
+            and payload.get("redacted") is True
         )
-        nocodb, nocodb_ref = bound_component_evidence(
-            "server-nocodb.py",
-            "nocodb-verify.json",
-            "NocoDbNocoDocsVerification",
+    if (
+        not common(canary)
+        or not common(verification)
+        or persisted_canary != canary
+        or persisted_verification != verification
+        or any(
+            evidence_contains_canonical_secret(payload, values)
+            for payload in (canary, verification, persisted_canary, persisted_verification)
         )
-        tables = dict(postgrest.get("persistence") or {})
-        visibility = dict(nocodb.get("dataState") or {})
-        documents = dict(nocodb.get("documentsApi") or {})
-        if not all(
-            (
-                tables.get("restartObserved") is True,
-                tables.get("persistenceVerified") is True,
-                tables.get("postDeleteAbsent") is True,
-                tables.get("cleanupCompleted") is True,
-                visibility.get("owner") == "postgres-postgrest",
-                visibility.get("nocodbUniqueTableState") is False,
-                visibility.get("postgrestCreated") is True,
-                visibility.get("nocodbDiagnosticReadVisible") is True,
-                visibility.get("cleanupCompleted") is True,
-                documents.get("endpoint") == "/api/v3/docs",
-                documents.get("restartObserved") is True,
-                documents.get("persistenceVerified") is True,
-                documents.get("postDeleteAbsent") is True,
-                documents.get("cleanupCompleted") is True,
-            )
-        ):
-            raise CanaryError("data_content_persistence_invalid")
-        release = dict(nocodb.get("release") or {})
-        return {
-            "id": "C029",
-            "ok": True,
-            "state": "passed",
-            "source": "controlled_data_content_application_restarts",
-            "dataContentProfile": profile,
-            "roles": {
-                "tablesUi": "nocodb",
-                "tablesApi": "postgrest",
-                "documentsUi": "nocodb",
-                "documentsApi": "nocodb",
-            },
-            "tablesPersistence": {
-                **tables,
-                "nocodbVisibilityVerified": True,
-                "singlePostgresStateVerified": True,
-            },
-            "documentsPersistence": documents,
-            "licenses": [
-                {
-                    "component": "postgrest",
-                    "license": "MIT",
-                    "image": postgrest["release"]["image"],
-                    "exception": None,
-                },
-                {
-                    "component": "nocodb",
-                    "license": release["license"],
-                    "image": release["image"],
-                    "exception": release["exception"],
-                },
-            ],
-            "applicationRestartObserved": True,
-            "tablePersistenceVerified": True,
-            "documentPersistenceVerified": True,
-            "cleanupCompleted": True,
-            "dependencyEvidence": {
-                "postgrest": postgrest_ref,
-                "nocodb": nocodb_ref,
-            },
+    ):
+        raise CanaryError("notion_projection_evidence_binding_invalid")
+    canary["_canaryEvidenceReference"] = {
+        "path": str(canary_path),
+        "sha256": hashlib.sha256(canary_path.read_bytes()).hexdigest(),
+        "kind": "NotionProjectionLiveCanary",
+        "producerSha256": producer_sha,
+    }
+    canary["_consumerVerificationEvidenceReference"] = {
+        "path": str(verify_path),
+        "sha256": hashlib.sha256(verify_path.read_bytes()).hexdigest(),
+        "kind": "NotionProjectionConsumerVerification",
+        "producerSha256": producer_sha,
+    }
+    return canary
+
+
+def _c029_postgres_notion(values: dict[str, str], run_id: str) -> dict[str, Any]:
+    linkage_run_id = hashlib.sha256(f"C029:{run_id}".encode()).hexdigest()[:24]
+    payload = _projection_runtime_payload(values, linkage_run_id)
+    linkage = payload.get("linkage") if isinstance(payload.get("linkage"), dict) else {}
+    phases = payload.get("phases") if isinstance(payload.get("phases"), dict) else {}
+    cleanup = payload.get("cleanup") if isinstance(payload.get("cleanup"), dict) else {}
+
+    def phase_state(phase: str, kind: str) -> None:
+        value = phases.get(phase, {})
+        candidate = value.get("objects", {}).get(kind, {}) if isinstance(value, dict) else {}
+        if not isinstance(candidate, dict) or not all(
+            candidate.get(key) is True
+            for key in ("canonicalExact", "syncStateExact", "outboxDelivered", "leaseReleased", "errorFree")
+        ) or not isinstance(candidate.get("attemptCount"), int) or candidate["attemptCount"] < 1:
+            raise CanaryError("notion_projection_delivery_invalid")
+
+    def project(kind: str, document: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+        item = linkage.get(kind) if isinstance(linkage.get(kind), dict) else {}
+        required = {
+            "canonicalObjectIdSha256", "providerObjectIdSha256", "initialRevision",
+            "finalRevision", "initialContentSha256", "finalContentSha256",
         }
-    if profile != "baserow-wikijs":
-        raise CanaryError("data_content_profile_unsupported")
-    baserow, baserow_ref = bound_component_evidence(
-        "server-baserow.py", "baserow-verify.json", "BaserowAcceptance"
-    )
-    wikijs, wikijs_ref = bound_component_evidence(
-        "server-wikijs.py", "wikijs-verify.json", "WikiJsVerification"
-    )
-    baserow_persistence = dict(baserow.get("baserowPersistence") or {})
-    wiki_graphql = dict(wikijs.get("graphql") or {})
-    required_true = (
-        baserow_persistence.get("restartObserved") is True,
-        baserow_persistence.get("persistenceVerified") is True,
-        baserow_persistence.get("postDeleteStatus") == 404,
-        baserow_persistence.get("cleanupCompleted") is True,
-        wiki_graphql.get("restartObserved") is True,
-        wiki_graphql.get("persistenceVerified") is True,
-        wiki_graphql.get("postDeleteStatus404") == 404,
-        wiki_graphql.get("cleanupCompleted") is True,
-    )
-    if not all(required_true):
-        raise CanaryError("ose_data_content_persistence_invalid")
-    distribution = dict(baserow.get("distribution") or {})
-    wiki_image = dict(wikijs.get("image") or {})
+        if set(item) != required or not all(
+            SHA256.fullmatch(str(item.get(key) or ""))
+            for key in ("canonicalObjectIdSha256", "providerObjectIdSha256", "initialContentSha256", "finalContentSha256")
+        ) or item.get("initialRevision") != 1 or item.get("finalRevision") != 2:
+            raise CanaryError("notion_projection_linkage_invalid")
+        for phase in ("create", "update", "archive"):
+            phase_state(phase, kind)
+        postgres = {
+            "objectIdSha256": item["canonicalObjectIdSha256"],
+            "initialRevision": 1, "finalRevision": 2,
+            "initialContentSha256": item["initialContentSha256"],
+            "finalContentSha256": item["finalContentSha256"],
+            "created": True, "readBackVerified": True, "updated": True,
+            "projectionIntentVerified": True, "postDeleteAbsent": True,
+            "cleanupVerified": True,
+        }
+        notion = {
+            "pageIdSha256": item["providerObjectIdSha256"],
+            **{key: postgres[key] for key in (
+                "objectIdSha256", "initialRevision", "finalRevision", "initialContentSha256", "finalContentSha256"
+            )},
+            "created": True, "archived": True, "cleanupVerified": True,
+            "objectIdMatches": True, "initialRevisionMatches": True,
+            "finalRevisionMatches": True, "initialContentSha256Matches": True,
+            "finalContentSha256Matches": True, "linkageVerified": True,
+        }
+        if document:
+            notion.update({"appendVerified": True, "readBackVerified": True})
+        else:
+            notion.update({"queryVerified": True, "updated": True})
+        return postgres, notion
+
+    record, table = project("entity", False)
+    document, document_projection = project("document", True)
+    if cleanup != {
+        "postgresCanonicalAbsent": True, "postgresSyncStateAbsent": True,
+        "postgresOutboxAbsent": True, "notionEntityArchived": True,
+        "notionDocumentArchived": True, "verified": True,
+    } or phases.get("archive", {}).get("notionArchived") != {"entity": True, "document": True}:
+        raise CanaryError("notion_projection_cleanup_invalid")
     return {
-        "id": "C029",
-        "ok": True,
-        "state": "passed",
-        "source": "controlled_ose_application_restarts",
-        "dataContentProfile": profile,
-        "roles": {
-            "tablesUi": "baserow",
-            "tablesApi": "baserow",
-            "documentsUi": "wikijs",
-            "documentsApi": "wikijs",
+        "id": "C029", "ok": True, "state": "passed",
+        "source": "server_notion_projection_consumer_canary",
+        "dataContentProfile": DEFAULT_DATA_CONTENT_PROFILE,
+        "roles": {"tablesUi": "notion", "tablesApi": "notion", "documentsUi": "notion", "documentsApi": "notion"},
+        "internalApis": {"scopedDataApi": "postgrest"},
+        "postgresSsot": {"record": record, "document": document},
+        "notion": {"table": table, "document": document_projection},
+        "tablePersistenceVerified": True, "documentPersistenceVerified": True,
+        "crossProviderLinkageVerified": True, "cleanupCompleted": True,
+        "cleanup": {
+            "postgresRecordDeleted": True, "postgresDocumentDeleted": True,
+            "postgresProjectionRowsDeleted": True, "notionTableRowArchived": True,
+            "notionDocumentArchived": True, "verified": True,
         },
-        "tablesPersistence": {
-            "markerSha256": baserow_persistence["markerSha256"],
-            "restartObserved": baserow_persistence["restartObserved"],
-            "persistenceVerified": baserow_persistence["persistenceVerified"],
-            "postDeleteAbsent": baserow_persistence["postDeleteStatus"] == 404,
-            "cleanupCompleted": baserow_persistence["cleanupCompleted"],
-        },
-        "documentsPersistence": {
-            "markerSha256": wiki_graphql["markerSha256"],
-            "restartObserved": wiki_graphql["restartObserved"],
-            "persistenceVerified": wiki_graphql["persistenceVerified"],
-            "postDeleteAbsent": wiki_graphql["postDeleteStatus404"] == 404,
-            "cleanupCompleted": wiki_graphql["cleanupCompleted"],
-        },
-        "baserowPersistence": {
-            key: baserow_persistence[key]
-            for key in (
-                "databaseId",
-                "tableId",
-                "rowId",
-                "markerSha256",
-                "restartObserved",
-                "persistenceVerified",
-                "postDeleteStatus",
-                "cleanupCompleted",
-            )
-        },
-        "wikijsPersistence": {
-            "pageId": wiki_graphql["pageId"],
-            "pathHashSha256": wiki_graphql["pathHashSha256"],
-            "markerSha256": wiki_graphql["markerSha256"],
-            "restartObserved": wiki_graphql["restartObserved"],
-            "persistenceVerified": wiki_graphql["persistenceVerified"],
-            "postDeleteStatus": wiki_graphql["postDeleteStatus404"],
-            "cleanupCompleted": wiki_graphql["cleanupCompleted"],
-        },
-        "osiLicenses": [
-            {
-                "component": "baserow",
-                "version": distribution["version"],
-                "spdx": distribution["license"],
-                "imageDigest": distribution["image"].split("@", 1)[1],
-                "verified": distribution.get("enterpriseLicenseConfigured") is False,
-            },
-            {
-                "component": "wikijs",
-                "version": wiki_image["version"],
-                "spdx": wiki_image["license"]["spdx"],
-                "imageDigest": wiki_image["digest"],
-                "verified": True,
-            },
-        ],
-        "applicationRestartObserved": True,
-        "tablePersistenceVerified": True,
-        "documentPersistenceVerified": True,
-        "cleanupCompleted": True,
-        "dependencyEvidence": {
-            "baserow": baserow_ref,
-            "wikijs": wikijs_ref,
-        },
+        "redacted": True,
+        "dependencyEvidence": payload["_canaryEvidenceReference"],
+        "consumerVerificationEvidence": payload["_consumerVerificationEvidenceReference"],
+        "internalApiEvidence": _postgrest_dependency_reference(),
     }
+
+
+def c029(values: dict[str, str], run_id: str) -> dict[str, Any]:
+    if values.get("DATA_CONTENT_PROFILE", "") != DEFAULT_DATA_CONTENT_PROFILE:
+        raise CanaryError("data_content_profile_unsupported")
+    return _c029_postgres_notion(values, run_id)
 
 
 def paperclip_project(values: dict[str, str]) -> dict[str, Any]:
@@ -1301,7 +1169,8 @@ def paperclip_project(values: dict[str, str]) -> dict[str, Any]:
         headers["Authorization"] = f"Bearer {values['PAPERCLIP_BOARD_API_KEY']}"
     _status, project = request_json(
         "GET",
-        f"http://127.0.0.1:3100/api/projects/{values['PAPERCLIP_PROJECT_ID']}",
+        f"{operator_base(values, 'PAPERCLIP_PORT')}"
+        f"/api/projects/{values['PAPERCLIP_PROJECT_ID']}",
         headers=headers,
     )
     if not isinstance(project, dict):
@@ -1319,7 +1188,7 @@ def paperclip_request(
 ) -> Any:
     _status, value = request_json(
         method,
-        "http://127.0.0.1:3100" + path,
+        operator_base(values, "PAPERCLIP_PORT") + path,
         headers=paperclip_headers(values),
         body=body,
     )
@@ -1334,9 +1203,7 @@ def ensure_paperclip_canary_agent(
     )
     name = "MTE Integration Canary (process)"
     agent = next((row for row in agents if row.get("name") == name), None)
-    paperclip_port = int(values.get("PAPERCLIP_PORT") or 0)
-    if not 1024 <= paperclip_port <= 65535:
-        raise CanaryError("paperclip_origin_port_invalid")
+    paperclip_base = operator_base(values, "PAPERCLIP_PORT")
     adapter_config = {
         "command": "python3",
         "args": ["/prototype/scripts/integration_canary.py"],
@@ -1347,7 +1214,7 @@ def ensure_paperclip_canary_agent(
     }
     adapter_config["env"]["PAPERCLIP_API_URL"] = {
         "type": "plain",
-        "value": f"http://127.0.0.1:{paperclip_port}",
+        "value": paperclip_base,
     }
     body = {
         "name": name,
@@ -1456,10 +1323,6 @@ def _paperclip_integration_run(
     if not project_id or not company_id:
         raise CanaryError("paperclip_project_context_missing")
     required_env = {
-        "baserow_crud": (
-            "BASEROW_API_TOKEN",
-            "PAPERCLIP_SECRET_MTE_BASEROW_PAPERCLIP_ID",
-        ),
         "postgrest_crud": (
             "POSTGREST_API_TOKEN",
             "PAPERCLIP_SECRET_MTE_POSTGREST_PAPERCLIP_ID",
@@ -1506,7 +1369,7 @@ def _paperclip_integration_run(
     if not issue_id:
         raise CanaryError("paperclip_canary_task_missing")
     latest_run: dict[str, Any] = {}
-    deadline = time.monotonic() + 210
+    deadline = time.monotonic() + PAPERCLIP_RUN_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         issue = paperclip_request(values, "GET", f"/api/issues/{issue_id}")
         runs = list_value(
@@ -1514,15 +1377,14 @@ def _paperclip_integration_run(
         )
         if runs:
             latest_run = max(runs, key=lambda row: str(row.get("createdAt") or ""))
-        issue_status = str((issue or {}).get("status") or "")
-        run_status = str(latest_run.get("status") or "")
-        if issue_status == "done" and run_status in {"succeeded", "running", ""}:
+        issue_status = str((issue or {}).get("status") or "").lower()
+        run_status = str(latest_run.get("status") or "").lower()
+        if issue_status == "done" and run_status == "succeeded":
             break
-        if issue_status in {"blocked", "cancelled"} or run_status in {
-            "failed",
-            "timed_out",
-            "cancelled",
-        }:
+        if issue_status in {"blocked", "cancelled"} or (
+            run_status in PAPERCLIP_TERMINAL_RUN_STATUSES
+            and run_status != "succeeded"
+        ):
             raise CanaryError("paperclip_canary_run_failed")
         time.sleep(1)
     else:
@@ -1587,41 +1449,44 @@ def cleanup_paperclip_canary_run(
     for issue in issues:
         issue_id = str(issue.get("id") or "")
         if not issue_id:
+            cleanup["runTerminalOrCancelled"] = False
+            cleanup["issueDeleted"] = False
             continue
         runs = list_value(
             paperclip_request(values, "GET", f"/api/issues/{issue_id}/runs")
         )
         for heartbeat_run in runs:
             native_id = str(heartbeat_run.get("id") or "")
-            status = str(heartbeat_run.get("status") or "")
-            if native_id and status not in {
-                "succeeded",
-                "failed",
-                "timed_out",
-                "cancelled",
-            }:
+            status = str(heartbeat_run.get("status") or "").lower()
+            if not native_id:
+                cleanup["runTerminalOrCancelled"] = False
+                continue
+            if status not in PAPERCLIP_TERMINAL_RUN_STATUSES:
                 cancel_status, _cancelled = request_json(
                     "POST",
-                    f"http://127.0.0.1:3100/api/heartbeat-runs/{native_id}/cancel",
+                    operator_base(values, "PAPERCLIP_PORT")
+                    + f"/api/heartbeat-runs/{native_id}/cancel",
                     headers=paperclip_headers(values),
                     allow_status={404, 409},
                 )
-                cleanup["runTerminalOrCancelled"] = cancel_status in {
-                    200,
-                    201,
-                    204,
-                    404,
-                    409,
-                }
+                if cancel_status == 404:
+                    continue
+                terminal_or_absent = paperclip_run_terminal_or_absent(
+                    values, issue_id, native_id
+                )
+                cleanup["runTerminalOrCancelled"] = (
+                    cleanup["runTerminalOrCancelled"]
+                    and terminal_or_absent
+                )
         request_json(
             "DELETE",
-            f"http://127.0.0.1:3100/api/issues/{issue_id}",
+            operator_base(values, "PAPERCLIP_PORT") + f"/api/issues/{issue_id}",
             headers=paperclip_headers(values),
             allow_status={404},
         )
         after_status, _after = request_json(
             "GET",
-            f"http://127.0.0.1:3100/api/issues/{issue_id}",
+            operator_base(values, "PAPERCLIP_PORT") + f"/api/issues/{issue_id}",
             headers=paperclip_headers(values),
             allow_status={404},
         )
@@ -1629,6 +1494,31 @@ def cleanup_paperclip_canary_run(
     if not all(cleanup.values()):
         raise CanaryError("paperclip_canary_cleanup_incomplete")
     return cleanup
+
+
+def paperclip_run_terminal_or_absent(
+    values: dict[str, str], issue_id: str, heartbeat_run_id: str
+) -> bool:
+    """Prove that a cancellation reached a terminal state before issue deletion."""
+
+    deadline = time.monotonic() + PAPERCLIP_CLEANUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        runs = list_value(
+            paperclip_request(values, "GET", f"/api/issues/{issue_id}/runs")
+        )
+        matching = [
+            row for row in runs if str(row.get("id") or "") == heartbeat_run_id
+        ]
+        if not matching:
+            return True
+        if len(matching) != 1:
+            return False
+        if str(matching[0].get("status") or "").lower() in (
+            PAPERCLIP_TERMINAL_RUN_STATUSES
+        ):
+            return True
+        time.sleep(1)
+    return False
 
 
 def paperclip_integration_run(
@@ -1646,76 +1536,28 @@ def paperclip_integration_run(
 
 def c027(values: dict[str, str], run_id: str) -> dict[str, Any]:
     profile = values.get("DATA_CONTENT_PROFILE", "")
-    if profile in POSTGREST_DATA_PROFILES:
-        run_value = paperclip_integration_run(
-            values,
-            run_id,
-            "postgrest_crud",
-            {
-                "postgrestApiBase": (
-                    "http://127.0.0.1:" + values["POSTGREST_ORIGIN_PORT"]
-                )
-            },
-        )
-        result = run_value["result"]
-        if (
-            result.get("markerObserved") is not True
-            or result.get("cleanup") != "verified_deleted"
-            or result.get("postDeleteAbsent") is not True
-        ):
-            raise CanaryError("paperclip_postgrest_crud_failed")
-        postgrest_reference = _postgrest_dependency_reference()
-        return {
-            "id": "C027",
-            "ok": True,
-            "state": "passed",
-            "source": "paperclip_process_heartbeat_run",
-            "dataContentProfile": profile,
-            "tablesApiComponent": "postgrest",
-            "paperclipTaskId": str(run_value["issue"]["id"]),
-            "paperclipHeartbeatRunId": str(run_value["heartbeatRun"]["id"]),
-            "paperclipAgentId": str(run_value["agent"]["id"]),
-            "paperclipProjectId": str(run_value["project"]["id"]),
-            "bindingType": "secret_ref",
-            "secretIdMatchesManaged": True,
-            "credentialResolvedBy": "paperclip_runtime",
-            "secretAccessEventVerified": True,
-            "secretAccessEventId": str(run_value["secretAccessEvent"]["id"]),
-            "createStatus": result.get("createStatus"),
-            "readStatus": result.get("readStatus"),
-            "deleteStatus": result.get("deleteStatus"),
-            "postDeleteStatus": result.get("postDeleteStatus"),
-            "postDeleteAbsent": True,
-            "markerObserved": True,
-            "cleanup": "verified_deleted",
-            "paperclipCleanup": run_value["cleanup"],
-            "dependencyEvidence": postgrest_reference,
-        }
-    if profile != "baserow-wikijs":
+    if profile != DEFAULT_DATA_CONTENT_PROFILE:
         raise CanaryError("data_content_profile_unsupported")
     run_value = paperclip_integration_run(
         values,
         run_id,
-        "baserow_crud",
-        {
-            "baserowApiBase": ("http://127.0.0.1:" + values["BASEROW_ORIGIN_PORT"]),
-            "baserowTableId": values["BASEROW_TABLE_ID"],
-        },
+        "postgrest_crud",
+        {"postgrestApiBase": operator_base(values, "POSTGREST_ORIGIN_PORT")},
     )
     result = run_value["result"]
     if (
         result.get("markerObserved") is not True
         or result.get("cleanup") != "verified_deleted"
-        or result.get("postDeleteStatus") != 404
+        or result.get("postDeleteAbsent") is not True
     ):
-        raise CanaryError("paperclip_baserow_crud_failed")
+        raise CanaryError("paperclip_postgrest_crud_failed")
     return {
         "id": "C027",
         "ok": True,
         "state": "passed",
         "source": "paperclip_process_heartbeat_run",
         "dataContentProfile": profile,
-        "tablesApiComponent": "baserow",
+        "tablesApiComponent": "postgrest",
         "paperclipTaskId": str(run_value["issue"]["id"]),
         "paperclipHeartbeatRunId": str(run_value["heartbeatRun"]["id"]),
         "paperclipAgentId": str(run_value["agent"]["id"]),
@@ -1729,742 +1571,18 @@ def c027(values: dict[str, str], run_id: str) -> dict[str, Any]:
         "readStatus": result.get("readStatus"),
         "deleteStatus": result.get("deleteStatus"),
         "postDeleteStatus": result.get("postDeleteStatus"),
+        "postDeleteAbsent": True,
         "markerObserved": True,
         "cleanup": "verified_deleted",
         "paperclipCleanup": run_value["cleanup"],
+        "dependencyEvidence": _postgrest_dependency_reference(),
     }
 
 
-def projection_token(path: Path, key: str, source_hash: str) -> str:
-    values = dotenv(path)
-    if values.get("MTE_PROJECTION_SOURCE_SHA256") != source_hash:
-        raise CanaryError("projection_source_hash_mismatch")
-    token = values.get(key, "")
-    if not token:
-        raise CanaryError("projected_token_missing")
-    return token
-
-
-def activepieces_project_variable(
-    base: str,
-    project_id: str,
-    headers: dict[str, str],
-    *,
-    name: str,
-    expected_value: str,
-) -> dict[str, str]:
-    query = urllib.parse.urlencode({"projectId": project_id, "limit": 100})
-    _status, value = request_json(
-        "GET", f"{base}/api/v1/variables?{query}", headers=headers
-    )
-    matches = [row for row in list_value(value) if row.get("name") == name]
-    if len(matches) != 1:
-        raise CanaryError("activepieces_project_variable_not_unique")
-    variable_id = str(matches[0].get("id") or "")
-    if not variable_id:
-        raise CanaryError("activepieces_project_variable_id_missing")
-    _status, revealed = request_json(
-        "POST",
-        f"{base}/api/v1/variables/{urllib.parse.quote(variable_id)}/reveal",
-        headers=headers,
-    )
-    revealed_value = str((revealed or {}).get("value") or "")
-    try:
-        if not revealed_value or not hmac.compare_digest(
-            revealed_value, expected_value
-        ):
-            raise CanaryError("activepieces_project_variable_value_mismatch")
-    finally:
-        revealed_value = ""
-    return {"id": variable_id, "name": name}
-
-
-def c028_postgrest(values: dict[str, str], run_id: str) -> dict[str, Any]:
-    source_hash = canonical_hash()
-    token = projection_token(
-        SERVICES / "activepieces.env",
-        "POSTGREST_ACTIVEPIECES_TOKEN",
-        source_hash,
-    )
-    if token == values.get("POSTGREST_PAPERCLIP_TOKEN"):
-        raise CanaryError("postgrest_activepieces_token_not_distinct")
-    for container in (
-        find_container(image="activepieces", name="app"),
-        find_container(image="activepieces", name="worker"),
-    ):
-        resolution = run(
-            ["docker", "exec", container, "getent", "hosts", "postgrest"],
-            check=False,
-        )
-        if resolution.returncode != 0:
-            raise CanaryError("durable_network_missing")
-    base, session, project_id = activepieces_session(values)
-    headers = {"Authorization": f"Bearer {session}"}
-    suffix = run_id[-12:].lower()
-    webhook_secret = secrets.token_urlsafe(32)
-    marker = f"mte-ap-postgrest-{run_id}"
-    credential_variable = activepieces_project_variable(
-        base,
-        project_id,
-        headers,
-        name=POSTGREST_ACTIVEPIECES_VARIABLE,
-        expected_value=token,
-    )
-    flow_id = ""
-    flow_run_id = ""
-    record_key = ""
-    published = False
-    cleanup = {
-        "recordDeleted": False,
-        "flowDeleted": False,
-        "credentialVariablePreserved": False,
-    }
-
-    def http_action(
-        name: str,
-        display: str,
-        parent: str,
-        method: str,
-        url: str,
-        body: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return {
-            "type": "ADD_ACTION",
-            "request": {
-                "parentStep": parent,
-                "stepLocationRelativeToParent": "AFTER",
-                "action": {
-                    "name": name,
-                    "displayName": display,
-                    "valid": False,
-                    "type": "PIECE",
-                    "settings": {
-                        "pieceName": "@activepieces/piece-http",
-                        "pieceVersion": "0.11.10",
-                        "actionName": "send_request",
-                        "input": {
-                            "method": method,
-                            "url": url,
-                            "headers": (
-                                {"Prefer": "return=representation"}
-                                if method == "POST"
-                                else {}
-                            ),
-                            "queryParams": {},
-                            "authType": "BEARER_TOKEN",
-                            "authFields": {
-                                "token": (
-                                    "{{variables['"
-                                    + POSTGREST_ACTIVEPIECES_VARIABLE
-                                    + "']}}"
-                                )
-                            },
-                            "body_type": "json" if body is not None else "none",
-                            "body": {"data": body} if body is not None else {},
-                            "response_is_binary": False,
-                            "use_proxy": False,
-                            "timeout": 30,
-                            "followRedirects": False,
-                            "failureMode": "continue_none",
-                        },
-                        "propertySettings": {},
-                        "errorHandlingOptions": {},
-                    },
-                },
-            },
-        }
-
-    try:
-        _status, flow = request_json(
-            "POST",
-            f"{base}/api/v1/flows",
-            headers=headers,
-            body={
-                "displayName": f"MTE PostgREST CRUD canary {suffix}",
-                "projectId": project_id,
-            },
-        )
-        flow_id = str((flow or {}).get("id") or "")
-        if not flow_id:
-            raise CanaryError("activepieces_canary_flow_missing")
-        updates = [
-            {
-                "type": "UPDATE_TRIGGER",
-                "request": {
-                    "name": "trigger",
-                    "displayName": "Canary Webhook",
-                    "valid": False,
-                    "type": "PIECE_TRIGGER",
-                    "settings": {
-                        "pieceName": "@activepieces/piece-webhook",
-                        "pieceVersion": "0.1.36",
-                        "triggerName": "catch_webhook",
-                        "input": {
-                            "authType": "header",
-                            "authFields": {
-                                "headerName": "X-MTE-Canary",
-                                "headerValue": webhook_secret,
-                            },
-                        },
-                        "propertySettings": {},
-                    },
-                },
-            },
-            http_action(
-                "step_1",
-                "Create PostgREST record",
-                "trigger",
-                "POST",
-                "http://postgrest:3000/prototype_items",
-                {"title": "{{trigger['output'].body.marker}}", "status": "created"},
-            ),
-            http_action(
-                "step_2",
-                "Read PostgREST record",
-                "step_1",
-                "GET",
-                (
-                    "http://postgrest:3000/prototype_items?id=eq."
-                    "{{step_1['output'].body[0].id}}"
-                ),
-            ),
-            http_action(
-                "step_3",
-                "Delete PostgREST record",
-                "step_2",
-                "DELETE",
-                (
-                    "http://postgrest:3000/prototype_items?id=eq."
-                    "{{step_1['output'].body[0].id}}"
-                ),
-            ),
-        ]
-        for update in updates:
-            request_json(
-                "POST", f"{base}/api/v1/flows/{flow_id}", headers=headers, body=update
-            )
-        request_json(
-            "POST",
-            f"{base}/api/v1/flows/{flow_id}",
-            headers=headers,
-            body={"type": "LOCK_AND_PUBLISH", "request": {"status": "ENABLED"}},
-        )
-        published = True
-        created_after = utcnow()
-        trigger_status, _trigger = request_json(
-            "POST",
-            f"{base}/api/v1/webhooks/{flow_id}",
-            headers={"X-MTE-Canary": webhook_secret},
-            body={"marker": marker},
-        )
-        if trigger_status != 200:
-            raise CanaryError("activepieces_webhook_failed", status=trigger_status)
-        deadline = time.monotonic() + 180
-        full_run: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            query = urllib.parse.urlencode(
-                {
-                    "projectId": project_id,
-                    "flowId": flow_id,
-                    "createdAfter": created_after,
-                    "limit": 10,
-                }
-            )
-            _status, runs_value = request_json(
-                "GET", f"{base}/api/v1/flow-runs?{query}", headers=headers
-            )
-            run_rows = list_value(runs_value)
-            if run_rows:
-                flow_run = max(run_rows, key=lambda row: str(row.get("created") or ""))
-                flow_run_id = str(flow_run.get("id") or "")
-                state = str(flow_run.get("status") or "").upper()
-                if state in {"SUCCEEDED", "FAILED", "TIMEOUT", "STOPPED"}:
-                    if state != "SUCCEEDED":
-                        raise CanaryError("activepieces_canary_flow_failed")
-                    _status, value = request_json(
-                        "GET", f"{base}/api/v1/flow-runs/{flow_run_id}", headers=headers
-                    )
-                    if isinstance(value, dict):
-                        full_run = value
-                    break
-            time.sleep(1)
-        if not full_run:
-            raise CanaryError("activepieces_canary_flow_timeout")
-        steps = full_run.get("steps") or {}
-        create_step = steps.get("step_1") or {}
-        read_step = steps.get("step_2") or {}
-        delete_step = steps.get("step_3") or {}
-        created_body = (create_step.get("output") or {}).get("body") or []
-        read_body = (read_step.get("output") or {}).get("body") or []
-        if isinstance(created_body, list) and created_body:
-            record_key = str((created_body[0] or {}).get("id") or "")
-        if (
-            create_step.get("status") != "SUCCEEDED"
-            or read_step.get("status") != "SUCCEEDED"
-            or delete_step.get("status") != "SUCCEEDED"
-            or not record_key
-            or not isinstance(read_body, list)
-            or len(read_body) != 1
-            or str(read_body[0].get("id") or "") != record_key
-            or read_body[0].get("title") != marker
-        ):
-            raise CanaryError("activepieces_canary_step_evidence_invalid")
-        after_status, after = request_json(
-            "GET",
-            (
-                f"http://127.0.0.1:{values['POSTGREST_ORIGIN_PORT']}"
-                f"/prototype_items?id=eq.{record_key}"
-            ),
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if after != []:
-            raise CanaryError("activepieces_postgrest_cleanup_not_observed")
-        record_key = ""
-        cleanup["recordDeleted"] = True
-        result = {
-            "flowRunStatus": "SUCCEEDED",
-            "triggerStatus": trigger_status,
-            "stepStatuses": {
-                "create": "SUCCEEDED",
-                "read": "SUCCEEDED",
-                "delete": "SUCCEEDED",
-            },
-            "markerObserved": True,
-            "postDeleteStatus": after_status,
-            "postDeleteAbsent": True,
-        }
-    finally:
-        webhook_secret = ""
-        if record_key:
-            request_json(
-                "DELETE",
-                (
-                    f"http://127.0.0.1:{values['POSTGREST_ORIGIN_PORT']}"
-                    f"/prototype_items?id=eq.{record_key}"
-                ),
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            cleanup["recordDeleted"] = True
-        if flow_id:
-            if published:
-                request_json(
-                    "POST",
-                    f"{base}/api/v1/flows/{flow_id}",
-                    headers=headers,
-                    body={"type": "CHANGE_STATUS", "request": {"status": "DISABLED"}},
-                    allow_status={404},
-                )
-            request_json(
-                "DELETE",
-                f"{base}/api/v1/flows/{flow_id}",
-                headers=headers,
-                allow_status={404},
-            )
-            for _attempt in range(30):
-                flow_status, _flow = request_json(
-                    "GET",
-                    f"{base}/api/v1/flows/{flow_id}",
-                    headers=headers,
-                    allow_status={404},
-                )
-                if flow_status == 404:
-                    cleanup["flowDeleted"] = True
-                    break
-                time.sleep(0.5)
-        else:
-            cleanup["flowDeleted"] = True
-        variable_query = urllib.parse.urlencode({"projectId": project_id, "limit": 100})
-        _status, variables_value = request_json(
-            "GET", f"{base}/api/v1/variables?{variable_query}", headers=headers
-        )
-        cleanup["credentialVariablePreserved"] = any(
-            row.get("id") == credential_variable["id"]
-            and row.get("name") == credential_variable["name"]
-            for row in list_value(variables_value)
-        )
-    if not all(cleanup.values()):
-        raise CanaryError("activepieces_canary_cleanup_incomplete")
-    postgrest_reference = _postgrest_dependency_reference()
-    return {
-        "id": "C028",
-        "ok": True,
-        "state": "passed",
-        "source": "activepieces_native_flow",
-        "dataContentProfile": values["DATA_CONTENT_PROFILE"],
-        "tablesApiComponent": "postgrest",
-        "activepiecesProjectId": project_id,
-        "activepiecesFlowRunId": flow_run_id,
-        "piece": "@activepieces/piece-http@0.11.10",
-        "actions": ["postgrest_create", "postgrest_read", "postgrest_delete"],
-        "credentialProjection": str(SERVICES / "activepieces.env"),
-        "projectionSourceHash": source_hash,
-        "tokenDistinctFromPaperclip": True,
-        "credentialStorage": "encrypted_project_variable",
-        "credentialVariableId": credential_variable["id"],
-        "credentialVariableName": credential_variable["name"],
-        "credentialReference": (
-            "{{variables['" + POSTGREST_ACTIVEPIECES_VARIABLE + "']}}"
-        ),
-        "credentialValueReadBackVerified": True,
-        "osiLicense": {
-            "component": "postgrest",
-            "version": "14.15",
-            "spdx": "MIT",
-            "imageDigest": (
-                "sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326"
-            ),
-            "verified": True,
-        },
-        **result,
-        "cleanup": cleanup,
-        "dependencyEvidence": postgrest_reference,
-    }
-
-
-def c028(values: dict[str, str], run_id: str) -> dict[str, Any]:
-    profile = values.get("DATA_CONTENT_PROFILE", "")
-    if profile in POSTGREST_DATA_PROFILES:
-        return c028_postgrest(values, run_id)
-    if profile != "baserow-wikijs":
-        raise CanaryError("data_content_profile_unsupported")
-    source_hash = canonical_hash()
-    token = projection_token(
-        SERVICES / "activepieces.env", "BASEROW_ACTIVEPIECES_TOKEN", source_hash
-    )
-    if token == values.get("BASEROW_PAPERCLIP_TOKEN"):
-        raise CanaryError("baserow_activepieces_token_not_distinct")
-    table_id = values["BASEROW_TABLE_ID"]
-    for container in (
-        find_container(image="activepieces", name="app"),
-        find_container(image="activepieces", name="worker"),
-    ):
-        resolution = run(
-            ["docker", "exec", container, "getent", "hosts", "baserow"], check=False
-        )
-        if resolution.returncode != 0:
-            raise CanaryError("durable_network_missing")
-    base, session, project_id = activepieces_session(values)
-    headers = {"Authorization": f"Bearer {session}"}
-    suffix = run_id[-12:].lower()
-    external_id = f"mte-baserow-canary-{suffix}"
-    webhook_secret = secrets.token_urlsafe(32)
-    marker = f"mte-ap-crud-{run_id}"
-    connection_id = ""
-    flow_id = ""
-    flow_run_id = ""
-    record_key = ""
-    published = False
-    cleanup = {
-        "recordDeleted": False,
-        "flowDeleted": False,
-        "connectionDeleted": False,
-    }
-    try:
-        _status, connection = request_json(
-            "POST",
-            f"{base}/api/v1/app-connections",
-            headers=headers,
-            body={
-                "externalId": external_id,
-                "displayName": f"MTE Baserow OSE canary {suffix}",
-                "pieceName": "@activepieces/piece-baserow",
-                "pieceVersion": "0.9.5",
-                "projectId": project_id,
-                "type": "CUSTOM_AUTH",
-                "value": {
-                    "type": "CUSTOM_AUTH",
-                    "props": {
-                        "authType": "database_token",
-                        "apiUrl": "http://baserow:80",
-                        "token": token,
-                    },
-                },
-            },
-        )
-        connection_id = str((connection or {}).get("id") or "")
-        if not connection_id:
-            raise CanaryError("activepieces_baserow_connection_missing")
-        _status, flow = request_json(
-            "POST",
-            f"{base}/api/v1/flows",
-            headers=headers,
-            body={
-                "displayName": f"MTE Baserow CRUD canary {suffix}",
-                "projectId": project_id,
-            },
-        )
-        flow_id = str((flow or {}).get("id") or "")
-        if not flow_id:
-            raise CanaryError("activepieces_canary_flow_missing")
-        updates = [
-            {
-                "type": "UPDATE_TRIGGER",
-                "request": {
-                    "name": "trigger",
-                    "displayName": "Canary Webhook",
-                    "valid": False,
-                    "type": "PIECE_TRIGGER",
-                    "settings": {
-                        "pieceName": "@activepieces/piece-webhook",
-                        "pieceVersion": "0.1.36",
-                        "triggerName": "catch_webhook",
-                        "input": {
-                            "authType": "header",
-                            "authFields": {
-                                "headerName": "X-MTE-Canary",
-                                "headerValue": webhook_secret,
-                            },
-                        },
-                        "propertySettings": {},
-                    },
-                },
-            },
-            {
-                "parent": "trigger",
-                "name": "step_1",
-                "display": "Create canary record",
-                "action": "baserow_create_row",
-                "input": {
-                    "auth": f"{{{{connections['{external_id}']}}}}",
-                    "table_id": table_id,
-                    "table_fields": {
-                        "Value": "{{trigger['output'].body.marker}}",
-                    },
-                    "create_missing_select_options": False,
-                },
-            },
-            {
-                "parent": "step_1",
-                "name": "step_2",
-                "display": "Read canary record",
-                "action": "baserow_get_row",
-                "input": {
-                    "auth": f"{{{{connections['{external_id}']}}}}",
-                    "table_id": table_id,
-                    "row_id": "{{step_1['output'].id}}",
-                },
-            },
-            {
-                "parent": "step_2",
-                "name": "step_3",
-                "display": "Delete canary record",
-                "action": "baserow_delete_row",
-                "input": {
-                    "auth": f"{{{{connections['{external_id}']}}}}",
-                    "table_id": table_id,
-                    "row_id": "{{step_1['output'].id}}",
-                },
-            },
-        ]
-        for update in updates:
-            if "type" in update:
-                body = update
-            else:
-                body = {
-                    "type": "ADD_ACTION",
-                    "request": {
-                        "parentStep": update["parent"],
-                        "stepLocationRelativeToParent": "AFTER",
-                        "action": {
-                            "name": update["name"],
-                            "displayName": update["display"],
-                            "valid": False,
-                            "type": "PIECE",
-                            "settings": {
-                                "pieceName": "@activepieces/piece-baserow",
-                                "pieceVersion": "0.9.5",
-                                "actionName": update["action"],
-                                "input": update["input"],
-                                "propertySettings": {},
-                                "errorHandlingOptions": {},
-                            },
-                        },
-                    },
-                }
-            request_json(
-                "POST", f"{base}/api/v1/flows/{flow_id}", headers=headers, body=body
-            )
-        request_json(
-            "POST",
-            f"{base}/api/v1/flows/{flow_id}",
-            headers=headers,
-            body={"type": "LOCK_AND_PUBLISH", "request": {"status": "ENABLED"}},
-        )
-        published = True
-        created_after = utcnow()
-        trigger_status, _trigger = request_json(
-            "POST",
-            f"{base}/api/v1/webhooks/{flow_id}",
-            headers={"X-MTE-Canary": webhook_secret},
-            body={"marker": marker},
-        )
-        if trigger_status != 200:
-            raise CanaryError("activepieces_webhook_failed", status=trigger_status)
-        deadline = time.monotonic() + 180
-        full_run: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            query = urllib.parse.urlencode(
-                {
-                    "projectId": project_id,
-                    "flowId": flow_id,
-                    "createdAfter": created_after,
-                    "limit": 10,
-                }
-            )
-            _status, runs_value = request_json(
-                "GET", f"{base}/api/v1/flow-runs?{query}", headers=headers
-            )
-            run_rows = list_value(runs_value)
-            if run_rows:
-                flow_run = max(run_rows, key=lambda row: str(row.get("created") or ""))
-                flow_run_id = str(flow_run.get("id") or "")
-                status = str(flow_run.get("status") or "").upper()
-                if status in {"SUCCEEDED", "FAILED", "TIMEOUT", "STOPPED"}:
-                    if status != "SUCCEEDED":
-                        raise CanaryError("activepieces_canary_flow_failed")
-                    _status, full_run_value = request_json(
-                        "GET",
-                        f"{base}/api/v1/flow-runs/{flow_run_id}",
-                        headers=headers,
-                    )
-                    if isinstance(full_run_value, dict):
-                        full_run = full_run_value
-                    break
-            time.sleep(1)
-        if not full_run:
-            raise CanaryError("activepieces_canary_flow_timeout")
-        steps = full_run.get("steps") or {}
-        create_step = steps.get("step_1") or {}
-        read_step = steps.get("step_2") or {}
-        delete_step = steps.get("step_3") or {}
-        record_key = str((create_step.get("output") or {}).get("id") or "")
-        read_output = read_step.get("output") or {}
-        if (
-            create_step.get("status") != "SUCCEEDED"
-            or read_step.get("status") != "SUCCEEDED"
-            or delete_step.get("status") != "SUCCEEDED"
-            or not record_key
-            or str(read_output.get("id") or "") != record_key
-            or read_output.get("Value") != marker
-        ):
-            raise CanaryError("activepieces_canary_step_evidence_invalid")
-        after_status, _after = request_json(
-            "GET",
-            f"http://127.0.0.1:{values['BASEROW_ORIGIN_PORT']}"
-            f"/api/database/rows/table/{table_id}/{record_key}/",
-            headers={"Authorization": f"Token {token}"},
-            allow_status={404},
-        )
-        if after_status != 404:
-            raise CanaryError("activepieces_baserow_cleanup_not_observed")
-        record_key = ""
-        cleanup["recordDeleted"] = True
-        result = {
-            "flowRunStatus": "SUCCEEDED",
-            "triggerStatus": trigger_status,
-            "stepStatuses": {
-                "create": "SUCCEEDED",
-                "read": "SUCCEEDED",
-                "delete": "SUCCEEDED",
-            },
-            "markerObserved": True,
-            "postDeleteStatus": after_status,
-        }
-    finally:
-        webhook_secret = ""
-        if record_key:
-            request_json(
-                "DELETE",
-                f"http://127.0.0.1:{values['BASEROW_ORIGIN_PORT']}"
-                f"/api/database/rows/table/{table_id}/{record_key}/",
-                headers={"Authorization": f"Token {token}"},
-                allow_status={404},
-            )
-            cleanup["recordDeleted"] = True
-        if flow_id:
-            if published:
-                request_json(
-                    "POST",
-                    f"{base}/api/v1/flows/{flow_id}",
-                    headers=headers,
-                    body={
-                        "type": "CHANGE_STATUS",
-                        "request": {"status": "DISABLED"},
-                    },
-                    allow_status={404},
-                )
-            request_json(
-                "DELETE",
-                f"{base}/api/v1/flows/{flow_id}",
-                headers=headers,
-                allow_status={404},
-            )
-            for _attempt in range(30):
-                flow_status, _flow = request_json(
-                    "GET",
-                    f"{base}/api/v1/flows/{flow_id}",
-                    headers=headers,
-                    allow_status={404},
-                )
-                if flow_status == 404:
-                    cleanup["flowDeleted"] = True
-                    break
-                time.sleep(0.5)
-        else:
-            cleanup["flowDeleted"] = True
-        if connection_id and cleanup["flowDeleted"]:
-            request_json(
-                "DELETE",
-                f"{base}/api/v1/app-connections/{connection_id}",
-                headers=headers,
-                allow_status={404},
-            )
-            connection_status, _connection = request_json(
-                "GET",
-                f"{base}/api/v1/app-connections/{connection_id}",
-                headers=headers,
-                allow_status={404},
-            )
-            cleanup["connectionDeleted"] = connection_status == 404
-        elif not connection_id:
-            cleanup["connectionDeleted"] = True
-    if not all(cleanup.values()):
-        raise CanaryError("activepieces_canary_cleanup_incomplete")
-    return {
-        "id": "C028",
-        "ok": True,
-        "state": "passed",
-        "source": "activepieces_native_flow",
-        "dataContentProfile": profile,
-        "tablesApiComponent": "baserow",
-        "activepiecesProjectId": project_id,
-        "activepiecesFlowRunId": flow_run_id,
-        "piece": "@activepieces/piece-baserow@0.9.5",
-        "actions": [
-            "baserow_create_row",
-            "baserow_get_row",
-            "baserow_delete_row",
-        ],
-        "credentialProjection": str(SERVICES / "activepieces.env"),
-        "projectionSourceHash": source_hash,
-        "tokenDistinctFromPaperclip": True,
-        "connectionType": "CUSTOM_AUTH",
-        "osiLicense": {
-            "component": "baserow",
-            "version": "2.3.1",
-            "spdx": "MIT",
-            "imageDigest": (
-                "sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a"
-            ),
-            "verified": True,
-        },
-        **result,
-        "cleanup": cleanup,
-    }
 
 
 def c030(values: dict[str, str], run_id: str) -> dict[str, Any]:
-    base = "http://127.0.0.1:18065"
+    base = operator_base(values, "MATTERMOST_ORIGIN_PORT")
     token = values["MATTERMOST_BOT_TOKEN"]
     headers = {"Authorization": f"Bearer {token}"}
     _status, channel = request_json(
@@ -2550,56 +1668,10 @@ def c030(values: dict[str, str], run_id: str) -> dict[str, Any]:
             )
 
 
-def oauth_assessment(values: dict[str, str]) -> list[dict[str, Any]]:
-    base, session, project_id = activepieces_session(values)
-    _status, payload = request_json(
-        "GET",
-        f"{base}/api/v1/app-connections?projectId={urllib.parse.quote(project_id)}&limit=100",
-        headers={"Authorization": f"Bearer {session}"},
-    )
-    connections = list_value(payload)
-    authorized = [
-        row
-        for row in connections
-        if "github" in str(row.get("pieceName") or "").lower()
-        and str(row.get("status") or "").upper() in {"ACTIVE", "VALID"}
-    ]
-    configured_client = bool(
-        values.get("ACTIVEPIECES_GITHUB_OAUTH_CLIENT_ID")
-        and values.get("ACTIVEPIECES_GITHUB_OAUTH_CLIENT_SECRET")
-    )
-    if authorized:
-        common = {
-            "state": "authorized_connection_requires_live_canary",
-            "liveGateIncluded": True,
-            "ok": False,
-            "authorizedGitHubConnectionCount": len(authorized),
-            "selfHostedOAuthClientConfigured": configured_client,
-            "humanAuthorizationRequired": False,
-            "reason": "authorized_connection_must_be_exercised_before_green",
-        }
-    else:
-        common = {
-            "state": "conditional_external_provider_consent",
-            "liveGateIncluded": False,
-            "ok": None,
-            "authorizedGitHubConnectionCount": 0,
-            "selfHostedOAuthClientConfigured": configured_client,
-            "humanAuthorizationRequired": True,
-            "reason": "external_provider_consent_required",
-        }
-    return [
-        {"id": "C021", **common},
-        {"id": "C022", **common},
-    ]
-
-
 CANARIES = {
-    "C013": c013,
     "C023": c023,
     "C024": c024,
     "C027": c027,
-    "C028": c028,
     "C029": c029,
     "C030": c030,
 }
@@ -2616,6 +1688,69 @@ def error_result(canary_id: str, exc: BaseException) -> dict[str, Any]:
     }
 
 
+def _status_error(state: str) -> dict[str, Any]:
+    return {"ok": False, "state": state}
+
+
+def validate_evidence_status(payload: Any) -> dict[str, Any]:
+    """Return only evidence that remains bound to this source and config."""
+
+    if not isinstance(payload, dict):
+        raise CanaryError("evidence_invalid")
+    if (
+        payload.get("apiVersion") != API_VERSION
+        or payload.get("kind") != "IntegrationCanaryEvidence"
+        or payload.get("producerSha256") != producer_hash()
+        or payload.get("canonicalSourceSha256") != canonical_hash()
+    ):
+        raise CanaryError("evidence_binding_invalid")
+    selected = payload.get("selected")
+    rows = payload.get("canaries")
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or len(set(selected)) != len(selected)
+        or any(identifier not in SUPPORTED for identifier in selected)
+        or not isinstance(rows, list)
+        or [row.get("id") if isinstance(row, dict) else None for row in rows]
+        != selected
+    ):
+        raise CanaryError("evidence_selection_invalid")
+    expected_ok = all(
+        isinstance(row, dict)
+        and row.get("ok") is True
+        and row.get("state") == "passed"
+        for row in rows
+    )
+    if payload.get("ok") is not expected_ok or payload.get("status") != (
+        "passed" if expected_ok else "failed"
+    ):
+        raise CanaryError("evidence_status_invalid")
+    return payload
+
+
+def status_payload() -> dict[str, Any]:
+    """Load a private, source-bound evidence document without executing canaries."""
+
+    try:
+        if not EVIDENCE.is_file() or EVIDENCE.is_symlink():
+            return _status_error("evidence_missing")
+        if EVIDENCE.stat().st_mode & 0o777 != 0o600:
+            return _status_error("evidence_mode_invalid")
+        try:
+            raw = json.loads(EVIDENCE.read_text())
+        except (OSError, json.JSONDecodeError):
+            return _status_error("evidence_invalid")
+        payload = validate_evidence_status(raw)
+        if evidence_contains_canonical_secret(payload, dotenv(CANONICAL)):
+            return _status_error("evidence_secret_leak")
+        return payload
+    except CanaryError as exc:
+        return _status_error(exc.code)
+    except OSError:
+        return _status_error("evidence_unavailable")
+
+
 def execute(selected: list[str]) -> dict[str, Any]:
     values = dotenv(CANONICAL)
     run_id = secrets.token_hex(12)
@@ -2625,38 +1760,26 @@ def execute(selected: list[str]) -> dict[str, Any]:
             rows.append(CANARIES[canary_id](values, run_id))
         except BaseException as exc:
             rows.append(error_result(canary_id, exc))
-    try:
-        external = oauth_assessment(values)
-    except BaseException as exc:
-        external = [
-            {
-                "id": canary_id,
-                "ok": None,
-                "state": "conditional_external_provider_consent",
-                "liveGateIncluded": False,
-                "assessmentErrorType": type(exc).__name__,
-            }
-            for canary_id in ("C021", "C022")
-        ]
     payload = {
-        "apiVersion": "micro-task-engine/v1alpha1",
+        "apiVersion": API_VERSION,
         "kind": "IntegrationCanaryEvidence",
         "generatedAt": utcnow(),
         "runId": run_id,
         "dataContentProfile": values.get("DATA_CONTENT_PROFILE", ""),
         "canonicalSourceSha256": canonical_hash(),
         "producerSha256": producer_hash(),
-        "ok": all(row.get("ok") is True for row in rows)
-        and all(
-            row.get("ok") is True
-            for row in external
-            if row.get("liveGateIncluded") is True
-        ),
+        "ok": all(row.get("ok") is True for row in rows),
         "selected": selected,
         "canaries": rows,
-        "externalProviderConsent": external,
     }
     payload["status"] = "passed" if payload["ok"] else "failed"
+    if evidence_contains_canonical_secret(payload, values):
+        payload["canaries"] = [
+            error_result(canary_id, CanaryError("evidence_secret_leak"))
+            for canary_id in selected
+        ]
+        payload["ok"] = False
+        payload["status"] = "failed"
     atomic_json(EVIDENCE, payload)
     # Keep one current, producer-bound attestation per criterion. A later run
     # of a different canary updates only the aggregate and its own split file,
@@ -2680,18 +1803,19 @@ def main() -> int:
     if action == "run":
         selected = sys.argv[2:] or list(SUPPORTED)
         unknown = sorted(set(selected) - set(SUPPORTED))
-        if unknown:
-            print(json.dumps({"ok": False, "error": "unknown_canary", "ids": unknown}))
+        if unknown or len(set(selected)) != len(selected):
+            error = "unknown_canary" if unknown else "duplicate_canary"
+            payload = {"ok": False, "error": error}
+            if unknown:
+                payload["ids"] = unknown
+            print(json.dumps(payload, sort_keys=True))
             return 2
         payload = execute(selected)
     elif action == "status" and len(sys.argv) == 2:
-        if not EVIDENCE.is_file():
-            payload = {"ok": False, "state": "evidence_missing"}
-        else:
-            payload = json.loads(EVIDENCE.read_text())
+        payload = status_payload()
     else:
         print(
-            "usage: server-integration-canaries.py run [C013 ...]|status",
+            "usage: server-integration-canaries.py run [C023 ...]|status",
             file=sys.stderr,
         )
         return 2

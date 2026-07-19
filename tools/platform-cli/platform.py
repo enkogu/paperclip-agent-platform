@@ -5,20 +5,20 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
-import time
-from typing import Any
 import uuid
+from typing import Any
 
 import yaml
 
@@ -27,72 +27,33 @@ TOOL_ROOT = Path(__file__).resolve().parent
 ROOT = TOOL_ROOT.parents[1]
 CONFIG_PATH = ROOT / "config/platform.yaml"
 LOCK_PATH = ROOT / "config/platform.lock.yaml"
-CONNECTIONS_PATH = ROOT / "config/connections.yaml"
+ACCEPTANCE_REQUIREMENTS_PATH = ROOT / "config/acceptance-requirements.yaml"
 SERVICES_ROOT = ROOT / "deployment/services"
 COMPOSE_SEEDS_PATH = ROOT / "config/compose-seeds.lock.json"
 PROFILES_ROOT = ROOT / "config/profiles"
 KESTRA_WORKFLOWS_ROOT = ROOT / "workflows/kestra"
 KESTRA_SERVICE_ROOT = SERVICES_ROOT / "kestra"
 HERMES_SERVICE_ROOT = SERVICES_ROOT / "hermes"
+SYSTEM_PLATFORM_SKILL_ROOT = ROOT / "skills/system-platform"
+VERIFICATION_PROFILE_SKILL_ROOT = ROOT / "skills/verification-before-completion"
 SEARXNG_SERVICE_ROOT = SERVICES_ROOT / "searxng"
 CLOUDFLARE_ROOT = ROOT / "deployment/cloudflare"
+AGENT_RUNTIME_ROOT = ROOT / "deployment/agent-runtime"
 CANONICAL_ENV_EXAMPLE = ROOT / "config/platform.env.example"
+RESOURCE_PREFLIGHT_STEP = ROOT / "deployment/steps/resource-preflight.sh"
+DAYTONA_HARNESS_MANIFEST = ROOT / "deployment/image-build/daytona-harness/package.json"
+PUBLIC_HARNESS_PACKAGES = frozenset(
+    {
+        "@anthropic-ai/claude-code",
+        "@earendil-works/pi-coding-agent",
+        "@openai/codex",
+    }
+)
+PROPRIETARY_HARNESS_ENABLEMENT_KEY = (
+    "MTE_ENABLE_OPERATOR_PROVIDED_PROPRIETARY_HARNESSES"
+)
 OPERATOR_ENV_OVERRIDE: Path | None = None
-FULL_DEPLOY_STEPS = (
-    "config-initialize",
-    "config-render",
-    "config-audit",
-    "bootstrap",
-    "toolhive-binary",
-    "dokploy-foundation",
-    "application-databases",
-    "dokploy-components",
-    "paperclip-runtime-config",
-    "paperclip-runtime",
-    "profiles",
-    "paperclip-environments",
-    "paperclip-secrets",
-    "provision",
-    "provision-idempotency",
-    "data-content-projections",
-    "kestra-control",
-    "tool-bundles",
-    "tool-bundles-idempotency",
-    # Hermes install may create its native API key in the canonical env. Keep
-    # it before Daytona so the hash-bound runtime proof stays current for E2E.
-    "hermes",
-    "daytona",
-    "harness-auth",
-    "kestra-e2e-canary",
-    "profile-acceptance",
-    "integration-canaries",
-    "hermes-acceptance",
-    "host-dokploy-acceptance",
-    "observability-reconcile-pass-1",
-    "observability-reconcile-pass-2",
-    "observability-idempotency",
-    "observability-acceptance",
-    "cloudflare-plan",
-    "cloudflare-apply",
-    "cloudflare-origin-firewall",
-    "post-cloudflare-evidence-rebind",
-    "cloudflare-acceptance",
-    "connections",
-    "verify",
-)
-
-PROMOTION_PATHS = (
-    "bin",
-    "templates",
-    "manifests",
-    "runtime/paperclip",
-    "steps",
-    "config/services",
-    "config/connections.yaml",
-)
-ACTIVE_DEPLOY_TRANSACTION: "DeployTransaction | None" = None
 DEFAULT_DATA_CONTENT_PROFILE = "postgres-notion"
-NOCODOCS_LICENSED_PROFILE = "postgres-postgrest-nocodb-nocodocs"
 NOTION_UPGRADE_IMPORT_KEYS = {
     "NOTION_TOKEN",
     "NOTION_ROOT_PAGE_ID",
@@ -107,6 +68,15 @@ NOTION_TOKEN_IMPORT_PRIORITY = (
     "PRIN7R_NOTION_API_KEY",
     "NOTION_TOKEN",
 )
+OPERATOR_ENV_ALIASES = frozenset(
+    {
+        "GH_TOKEN",
+        "MINIMAX_OPENAI_ENDPOINT",
+        "PRIN7R_HERMES_TELEGRAM_BOT_TOKEN",
+        "PRIN7R_NOTION_PAGE_ID",
+        *NOTION_TOKEN_IMPORT_PRIORITY,
+    }
+)
 SSH_TRANSPORT_OPTIONS = (
     "-o",
     "BatchMode=yes",
@@ -119,19 +89,27 @@ SSH_TRANSPORT_OPTIONS = (
     "-o",
     "TCPKeepAlive=yes",
 )
+HOST_BOOTSTRAP_SEED_KEYS = frozenset(
+    {
+        "MTE_CONTAINERD_IO_VERSION",
+        "MTE_DOCKER_ALLOW_PROVIDER_MIGRATION",
+        "MTE_DOCKER_APT_KEY_FINGERPRINT",
+        "MTE_DOCKER_APT_KEY_SHA256",
+        "MTE_DOCKER_APT_KEY_URL",
+        "MTE_DOCKER_APT_REPOSITORY_URL",
+        "MTE_DOCKER_CE_VERSION",
+        "MTE_DOCKER_CLI_VERSION",
+        "MTE_DOCKER_COMPOSE_VERSION",
+        "MTE_DOCKER_UBUNTU_COMPOSE_VERSION",
+        "MTE_DOCKER_UBUNTU_CONTAINERD_VERSION",
+        "MTE_DOCKER_UBUNTU_DOCKER_IO_VERSION",
+        "MTE_HOST_REQUIRED_TCP_PORTS",
+    }
+)
 
 
 class PlatformError(RuntimeError):
     pass
-
-
-class PreMutationGateError(PlatformError):
-    """A read-only deployment gate rejected the requested live mutation."""
-
-    def __init__(self, code: str, result: dict[str, str]):
-        super().__init__(code)
-        self.code = code
-        self.result = dict(result)
 
 
 def local_evidence_root() -> Path:
@@ -156,7 +134,14 @@ def operator_env_path(*, required: bool = False) -> Path | None:
     otherwise already-exported environment variables remain valid inputs.
     """
 
-    raw = str(OPERATOR_ENV_OVERRIDE or os.environ.get("MTE_OPERATOR_ENV", "")).strip()
+    override = str(OPERATOR_ENV_OVERRIDE or "").strip()
+    environment_override = str(os.environ.get("MTE_OPERATOR_ENV", "")).strip()
+    if override and environment_override:
+        override_path = Path(override).expanduser().resolve()
+        environment_path = Path(environment_override).expanduser().resolve()
+        if override_path != environment_path:
+            raise PlatformError("multiple operator env files were selected")
+    raw = override or environment_override
     if not raw:
         if required:
             raise PlatformError(
@@ -179,16 +164,26 @@ def operator_values(*, required: bool = False) -> dict[str, str]:
 
 
 def activate_operator_environment(path: Path | None) -> None:
-    """Fill missing process inputs from an explicit operator dotenv file."""
+    """Make one explicit operator dotenv authoritative for known input keys."""
 
     if path is None:
         return
-    for key, value in local_dotenv(path).items():
-        os.environ.setdefault(key, value)
+    contract = server_config_contract()
+    selected = normalized_operator_values(local_dotenv(path))
+    governed_keys = (
+        set(contract.REQUIRED_OPERATOR_ENV_KEYS)
+        | set(contract.OPTIONAL_OPERATOR_INPUT_KEYS)
+        | set(OPERATOR_ENV_ALIASES)
+        | set(contract.DOMAIN_INPUT_ALIASES)
+    )
+    for key in governed_keys - set(selected):
+        os.environ.pop(key, None)
+    for key in selected.keys() & governed_keys:
+        os.environ[key] = selected[key]
 
 
-def server_config_contract():
-    path = TOOL_ROOT / "server-config.py"
+def server_config_contract(path: Path | None = None):
+    path = path or TOOL_ROOT / "server-config.py"
     spec = importlib.util.spec_from_file_location("mte_server_config_contract", path)
     if spec is None or spec.loader is None:
         raise PlatformError("cannot load the canonical environment contract")
@@ -203,6 +198,7 @@ def normalized_operator_values(values: dict[str, str]) -> dict[str, str]:
     normalized = normalize_notion_token_import(values)
     aliases = {
         "GH_TOKEN": "GITHUB_TOKEN",
+        "PRIN7R_HERMES_TELEGRAM_BOT_TOKEN": "HERMES_TELEGRAM_BOT_TOKEN",
         "MINIMAX_OPENAI_ENDPOINT": "MINIMAX_BASE_URL",
         "PRIN7R_NOTION_PAGE_ID": "NOTION_ROOT_PAGE_ID",
     }
@@ -222,6 +218,12 @@ def validate_operator_environment(
 
     contract = server_config_contract()
     normalized = normalized_operator_values(values)
+    domain_aliases = sorted(set(contract.DOMAIN_INPUT_ALIASES) & set(values))
+    if domain_aliases:
+        raise PlatformError(
+            "legacy domain aliases are not accepted in operator env; use "
+            "PLATFORM_BASE_DOMAIN instead: " + ", ".join(domain_aliases)
+        )
     required = set(contract.REQUIRED_OPERATOR_ENV_KEYS)
     missing = sorted(
         key for key in required if not str(normalized.get(key, "")).strip()
@@ -229,6 +231,41 @@ def validate_operator_environment(
     if missing:
         raise PlatformError(
             "operator env is missing required keys: " + ", ".join(missing)
+        )
+    if not re.fullmatch(
+        r"[^\s@]+@sha256:[0-9a-f]{64}",
+        str(normalized["MTE_PAPERCLIP_IMAGE"]).strip(),
+    ):
+        raise PlatformError(
+            "MTE_PAPERCLIP_IMAGE must be an immutable sha256 digest reference"
+        )
+    try:
+        contract.validate_paperclip_fork_evidence(
+            str(normalized["MTE_PAPERCLIP_FORK_SOURCE_URL"]),
+            str(normalized["MTE_PAPERCLIP_FORK_REVISION"]),
+        )
+    except contract.ConfigError as exc:
+        raise PlatformError(str(exc)) from exc
+    if not re.fullmatch(
+        r"[^\s@]+@sha256:[0-9a-f]{64}",
+        str(normalized["MTE_DAYTONA_SANDBOX_IMAGE"]).strip(),
+    ):
+        raise PlatformError(
+            "MTE_DAYTONA_SANDBOX_IMAGE must be an immutable sha256 digest reference"
+        )
+    if not re.fullmatch(
+        r"https://[^\s]+",
+        str(normalized["MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL"]).strip(),
+    ):
+        raise PlatformError(
+            "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL must be an HTTPS source URL"
+        )
+    if not re.fullmatch(
+        r"[0-9a-f]{40}",
+        str(normalized["MTE_DAYTONA_SANDBOX_IMAGE_REVISION"]).strip(),
+    ):
+        raise PlatformError(
+            "MTE_DAYTONA_SANDBOX_IMAGE_REVISION must be an immutable 40-character commit"
         )
 
     raw_cidrs = str(normalized["MTE_OPERATOR_SSH_CIDRS"]).strip()
@@ -250,6 +287,11 @@ def validate_operator_environment(
         raise PlatformError("PLATFORM_BASE_DOMAIN must be a DNS name without scheme")
     if "@" not in str(normalized["CLOUDFLARE_EMAIL"]).strip():
         raise PlatformError("CLOUDFLARE_EMAIL must be an email address")
+    try:
+        contract.validate_e2e_github_target(normalized)
+        contract.resource_preflight_values(normalized)
+    except contract.ConfigError as exc:
+        raise PlatformError(str(exc)) from exc
 
     if reject_documentation_values:
         documented = parse_dotenv(CANONICAL_ENV_EXAMPLE)
@@ -269,7 +311,8 @@ def validate_operator_environment(
         "requiredKeyCount": len(required),
         "optionalKeyCount": len(contract.OPTIONAL_OPERATOR_INPUT_KEYS),
         "canonicalRuntimeSource": "/root/.config/mte-secrets/platform.env",
-        "fillOnly": True,
+        "operatorInputs": "reconciled",
+        "generatedValues": "fill-only",
     }
 
 
@@ -294,9 +337,37 @@ def operator_environment_schema() -> dict[str, Any]:
         "optionalKeys": sorted(contract.OPTIONAL_OPERATOR_INPUT_KEYS),
         "localOnlyBootstrapKeys": sorted(contract.LOCAL_ONLY_OPERATOR_INPUT_KEYS),
         "canonicalRuntimeSource": "/root/.config/mte-secrets/platform.env",
-        "fillOnly": True,
-        "generatedValues": "safe defaults, pinned runtime values, service secrets and provisioned IDs",
+        "operatorInputs": "reconciled",
+        "generatedValues": "fill-only safe defaults, pinned runtime values, service secrets and provisioned IDs",
     }
+
+
+def validate_public_harness_enablement(values: dict[str, str]) -> None:
+    """Fail before transport when the shipped all-harness bundle lacks consent.
+
+    Daytona is intentionally the only runtime installer for the Codex, Claude
+    Code and Pi harness closure.  Keeping this guard here means the public
+    default stops during local preflight, before host bootstrap, sync, Docker,
+    or a late Daytona package-install failure can mutate a deployment.
+    """
+
+    try:
+        manifest = json.loads(DAYTONA_HARNESS_MANIFEST.read_text())
+        dependencies = manifest.get("dependencies")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PlatformError("daytona harness manifest is unavailable") from exc
+    if not isinstance(dependencies, dict):
+        raise PlatformError("daytona harness manifest dependencies are invalid")
+    manifest_packages = {str(package) for package in dependencies}
+    if not PUBLIC_HARNESS_PACKAGES.issubset(manifest_packages):
+        raise PlatformError("public release harness manifest is incomplete")
+    if str(values.get(PROPRIETARY_HARNESS_ENABLEMENT_KEY, "")).strip() == "true":
+        return
+    raise PlatformError(
+        "public-release preflight blocked proprietary native harness installation; "
+        f"set {PROPRIETARY_HARNESS_ENABLEMENT_KEY}=true in the private operator input "
+        "to deliberately enable the shipped Codex, Claude Code, and Pi harness bundle"
+    )
 
 
 def locked_image(name: str) -> str:
@@ -312,6 +383,47 @@ def bootstrap_seeds() -> dict[str, str]:
     if not isinstance(values, dict):
         raise PlatformError("canonical bootstrap seed source is invalid")
     return {str(key): str(value) for key, value in values.items()}
+
+
+def host_bootstrap_seeds(*, contract_source: Path | None = None) -> dict[str, str]:
+    """Return the exact non-secret seed set consumed before the first sync."""
+
+    module = server_config_contract(contract_source)
+    source = getattr(module, "ONE_TIME_MIGRATION_SEEDS", None)
+    if not isinstance(source, dict):
+        raise PlatformError("canonical host bootstrap seed source is invalid")
+    missing = sorted(HOST_BOOTSTRAP_SEED_KEYS - set(source))
+    if missing:
+        raise PlatformError(
+            "canonical host bootstrap seeds are missing: " + ", ".join(missing)
+        )
+    forbidden = HOST_BOOTSTRAP_SEED_KEYS & (
+        set(getattr(module, "REQUIRED_OPERATOR_ENV_KEYS", set()))
+        | set(getattr(module, "OPTIONAL_OPERATOR_INPUT_KEYS", set()))
+        | set(getattr(module, "OPTIONAL_EMPTY_KEYS", set()))
+    )
+    sensitive = sorted(
+        key
+        for key in HOST_BOOTSTRAP_SEED_KEYS
+        if getattr(module, "SENSITIVE_KEY_PATTERN").search(key)
+    )
+    if forbidden or sensitive:
+        raise PlatformError(
+            "host bootstrap seed allowlist contains operator or sensitive keys"
+        )
+    result: dict[str, str] = {}
+    for key in sorted(HOST_BOOTSTRAP_SEED_KEYS):
+        value = source[key]
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\n" in value
+            or "\r" in value
+            or "\0" in value
+        ):
+            raise PlatformError(f"host bootstrap seed {key} is not a safe scalar")
+        result[key] = value
+    return result
 
 
 def data_content_contract():
@@ -345,11 +457,31 @@ def config(domain: str | None = None) -> dict[str, Any]:
     raw = load_yaml(CONFIG_PATH)
     spec = raw["spec"]
     seed_values = bootstrap_seeds()
+    selected_path = operator_env_path()
+    if selected_path is not None:
+        contract = server_config_contract()
+        selected_governed_keys = set(contract.REQUIRED_OPERATOR_ENV_KEYS) | set(
+            contract.OPTIONAL_OPERATOR_INPUT_KEYS
+        )
+        selected_values = normalized_operator_values(local_dotenv(selected_path))
+        selected_values = {
+            key: value
+            for key, value in selected_values.items()
+            if key in selected_governed_keys
+        }
+    else:
+        selected_governed_keys = set()
+        selected_values = {}
     host = spec["host"]
 
     def resolve_ref(name: str) -> str:
         ref = str(host.get(name, ""))
-        value = os.environ.get(ref) or seed_values.get(ref, "")
+        if selected_path is not None and ref in selected_governed_keys:
+            value = selected_values.get(ref, "")
+        elif selected_path is not None:
+            value = seed_values.get(ref, "")
+        else:
+            value = os.environ.get(ref) or seed_values.get(ref, "")
         if not value:
             raise PlatformError(f"bootstrap host ref {ref or name} is unresolved")
         return value
@@ -359,26 +491,44 @@ def config(domain: str | None = None) -> dict[str, Any]:
     host["secretsRoot"] = resolve_ref("secretsRootRef")
     excluded_refs = host.get("excludedRefs", [])
     host["excluded"] = [
-        os.environ.get(str(ref)) or seed_values.get(str(ref), "")
+        (
+            selected_values.get(str(ref), "")
+            if selected_path is not None and str(ref) in selected_governed_keys
+            else (
+                seed_values.get(str(ref), "")
+                if selected_path is not None
+                else os.environ.get(str(ref)) or seed_values.get(str(ref), "")
+            )
+        )
         for ref in excluded_refs
     ]
     if any(not value for value in host["excluded"]):
         raise PlatformError("one or more bootstrap excluded-host refs are unresolved")
     domain_ref = str(spec.get("domainRef", "PLATFORM_BASE_DOMAIN"))
-    resolved = domain or os.environ.get(domain_ref) or seed_values.get(domain_ref) or ""
+    selected_domain = str(selected_values.get(domain_ref, "")).strip().rstrip(".")
+    requested_domain = str(domain or "").strip().rstrip(".")
+    if (
+        requested_domain
+        and selected_path is not None
+        and requested_domain != selected_domain
+    ):
+        raise PlatformError("--domain conflicts with the selected operator env")
+    if selected_path is not None:
+        resolved = selected_domain
+    else:
+        resolved = (
+            domain or os.environ.get(domain_ref) or seed_values.get(domain_ref) or ""
+        )
     resolved = resolved.strip().rstrip(".")
     if resolved.startswith("http://") or resolved.startswith("https://"):
         raise PlatformError("domain must be a DNS name without scheme")
     spec["resolvedDomain"] = resolved
     values = dict(seed_values)
-    values.update(os.environ)
+    if selected_path is None:
+        values.update(os.environ)
+    values.update(selected_values)
     values[domain_ref] = resolved
-    for url_key, subdomain_ref in (
-        ("BASEROW_PUBLIC_URL", "BASEROW_SUBDOMAIN"),
-        ("WIKIJS_SITE_URL", "WIKIJS_SUBDOMAIN"),
-        ("POSTGREST_PUBLIC_URL", "POSTGREST_SUBDOMAIN"),
-        ("NOCODB_PUBLIC_URL", "NOCODB_SUBDOMAIN"),
-    ):
+    for url_key, subdomain_ref in (("POSTGREST_PUBLIC_URL", "POSTGREST_SUBDOMAIN"),):
         subdomain = values.get(subdomain_ref, "").strip().strip(".")
         if subdomain and resolved:
             values[url_key] = f"https://{subdomain}.{resolved}"
@@ -670,9 +820,13 @@ def ssh(
     capture_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     target = host_spec(cfg)["ssh"]
-    remote_command = (
+    # SSH invokes the account's login shell.  The platform's remote commands
+    # intentionally use Bash features (and must work even when root uses zsh),
+    # so select Bash explicitly instead of inheriting the account default.
+    remote_script = (
         f"export PYTHONDONTWRITEBYTECODE={shlex.quote('1')};\n{remote_command}"
     )
+    remote_command = f"bash -c {shlex.quote(remote_script)}"
     return run(
         [
             *ssh_transport_command(),
@@ -685,106 +839,106 @@ def ssh(
     )
 
 
-def pre_mutation_license_gate(cfg: dict[str, Any]) -> dict[str, str]:
-    """Reject an explicitly selected unlicensed legacy NocoDocs deploy.
+def host_bootstrap_env_command(cfg: dict[str, Any]) -> str:
+    """Build the fail-closed clean-host canonical seed merge command."""
 
-    Profiles without NocoDocs do not need a remote credential observer.  The
-    legacy-profile observer emits exactly the selected profile and a presence bit;
-    no credential value, hash, length, prefix, or exception text crosses SSH.
-    A missing canonical source is valid for a clean install, but it cannot prove
-    the Business license required by the NocoDocs profile.
-    """
-
-    selected_profile = str(resolved_data_content(cfg).get("profile") or "").strip()
-    if not selected_profile:
-        raise PlatformError("data_content_profile_unresolved")
-    if selected_profile != NOCODOCS_LICENSED_PROFILE:
-        return {"profile": selected_profile, "licenseKey": "not-required"}
-    canonical = str(host_spec(cfg)["secretsRoot"]).rstrip("/") + "/platform.env"
-    code = f"""set -u
+    secret_root = str(host_spec(cfg)["secretsRoot"]).rstrip("/")
+    if not secret_root.startswith("/") or secret_root == "/":
+        raise PlatformError("host secrets root must be an absolute non-root path")
+    keys = sorted(HOST_BOOTSTRAP_SEED_KEYS)
+    key_words = " ".join(shlex.quote(key) for key in keys)
+    return f"""set -eu
 umask 077
-canonical={shlex.quote(canonical)}
-expected={shlex.quote(selected_profile)}
-target={shlex.quote(NOCODOCS_LICENSED_PROFILE)}
-profile="$expected"
-presence=missing
-exit_code=0
-normalize() {{
-    awk '{{
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-        if (length($0) >= 2 && ((substr($0,1,1) == "\\\"" && substr($0,length($0),1) == "\\\"") || (substr($0,1,1) == "\\047" && substr($0,length($0),1) == "\\047"))) {{
-            $0 = substr($0, 2, length($0) - 2)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-        }}
-        print
-    }}'
-}}
+fail() {{ printf '%s\\n' "host-bootstrap-env: $*" >&2; exit 74; }}
+[ "$(id -u)" -eq 0 ] || fail 'root SSH target is required'
+secret_root={shlex.quote(secret_root)}
+canonical="$secret_root/platform.env"
+lock="$secret_root/.platform-env.lock"
+if [ -e "$secret_root" ]; then
+    [ ! -L "$secret_root" ] && [ -d "$secret_root" ] || fail 'secret root is unsafe'
+    [ "$(stat -c %u "$secret_root")" -eq 0 ] || fail 'secret root owner is unsafe'
+else
+    mkdir -p "$secret_root"
+fi
+chown root:root "$secret_root"
+chmod 0700 "$secret_root"
 if [ -e "$canonical" ]; then
-    if [ -L "$canonical" ] || [ ! -f "$canonical" ] || [ "$(stat -c %u "$canonical" 2>/dev/null || printf invalid)" != "$(id -u)" ] || [ "$(stat -c %a "$canonical" 2>/dev/null || printf invalid)" != 600 ]; then
-        exit_code=79
-    else
-        canonical_profile=$(awk 'index($0,"DATA_CONTENT_PROFILE=")==1 {{print substr($0,index($0,"=")+1); exit}}' "$canonical" | normalize)
-        if [ -n "$canonical_profile" ]; then
-            profile="$canonical_profile"
-        fi
-        license_value=$(awk 'index($0,"NOCODB_LICENSE_KEY=")==1 {{print substr($0,index($0,"=")+1); exit}}' "$canonical" | normalize)
-        if [ -n "$license_value" ]; then
-            presence=present
-        fi
-        unset license_value
-    fi
+    [ ! -L "$canonical" ] && [ -f "$canonical" ] || fail 'canonical env is unsafe'
+    [ "$(stat -c %u "$canonical")" -eq 0 ] || fail 'canonical env owner is unsafe'
+    [ "$(stat -c %a "$canonical")" = 600 ] || fail 'canonical env mode is unsafe'
 fi
-if ! printf '%s' "$profile" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'; then
-    profile="$expected"
-    presence=missing
-    exit_code=79
+if [ -e "$lock" ]; then
+    [ ! -L "$lock" ] && [ -f "$lock" ] || fail 'canonical lock is unsafe'
+    [ "$(stat -c %u "$lock")" -eq 0 ] || fail 'canonical lock owner is unsafe'
 fi
-if [ "$exit_code" -eq 0 ] && [ "$profile" != "$expected" ]; then
-    exit_code=80
-fi
-if [ "$exit_code" -eq 0 ] && [ "$profile" = "$target" ] && [ "$presence" = missing ]; then
-    exit_code=78
-fi
-printf '{{"licenseKey":"%s","profile":"%s"}}\n' "$presence" "$profile"
-exit "$exit_code"
+: >>"$lock"
+chown root:root "$lock"
+chmod 0600 "$lock"
+exec 9>"$lock"
+flock -x 9
+incoming=$(mktemp "$secret_root/.host-bootstrap-incoming.XXXXXX")
+merged=$(mktemp "$secret_root/.host-bootstrap-merged.XXXXXX")
+empty=$(mktemp "$secret_root/.host-bootstrap-empty.XXXXXX")
+cleanup() {{ rm -f "$incoming" "$merged" "$empty"; }}
+trap cleanup EXIT HUP INT TERM
+cat >"$incoming"
+chmod 0600 "$incoming" "$merged" "$empty"
+[ "$(wc -l <"$incoming" | tr -d ' ')" -eq {len(keys)} ] || fail 'seed count is invalid'
+awk -F= '
+    $0 !~ /^[A-Z][A-Z0-9_]*=.+$/ {{ exit 1 }}
+    {{ if (++seen[$1] != 1) exit 1 }}
+' "$incoming" || fail 'seed payload is invalid'
+for key in {key_words}; do
+    [ "$(awk -F= -v key="$key" '$1 == key {{ count++ }} END {{ print count + 0 }}' "$incoming")" -eq 1 ] \
+        || fail 'seed allowlist is incomplete'
+done
+existing=$empty
+if [ -e "$canonical" ]; then existing=$canonical; fi
+awk -F= '
+    NR == FNR {{
+        key = $1
+        incoming[key] = substr($0, index($0, "=") + 1)
+        order[++count] = key
+        next
+    }}
+    {{
+        key = $1
+        if (key in incoming) {{
+            if (++seen[key] != 1) exit 72
+            current = substr($0, index($0, "=") + 1)
+            if (current == "") print key "=" incoming[key]
+            else print $0
+            consumed[key] = 1
+            next
+        }}
+        print $0
+    }}
+    END {{
+        for (position = 1; position <= count; position++) {{
+            key = order[position]
+            if (!(key in consumed)) print key "=" incoming[key]
+        }}
+    }}
+' "$incoming" "$existing" >"$merged" || fail 'canonical env contains duplicate host keys'
+chown root:root "$merged"
+chmod 0600 "$merged"
+mv -f "$merged" "$canonical"
+chown root:root "$canonical"
+chmod 0600 "$canonical"
+[ "$(stat -c %a "$secret_root")" = 700 ] || fail 'secret root mode verification failed'
+[ "$(stat -c %u "$canonical")" -eq 0 ] || fail 'canonical env owner verification failed'
+[ "$(stat -c %a "$canonical")" = 600 ] || fail 'canonical env mode verification failed'
 """
-    observed = ssh(
-        cfg,
-        "sh -c " + shlex.quote(code),
-        check=False,
-        capture_output=True,
-    )
-    try:
-        result = json.loads(observed.stdout)
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise PlatformError("license_preflight_invalid_response") from exc
-    if (
-        not isinstance(result, dict)
-        or set(result) != {"profile", "licenseKey"}
-        or not isinstance(result["profile"], str)
-        or result["licenseKey"] not in {"present", "missing"}
-    ):
-        raise PlatformError("license_preflight_invalid_response")
-    safe_result = {
-        "profile": str(result["profile"]),
-        "licenseKey": str(result["licenseKey"]),
-    }
-    if observed.returncode == 78:
-        raise PreMutationGateError("business_license_required", safe_result)
-    if observed.returncode == 79:
-        raise PreMutationGateError("canonical_secret_source_unsafe", safe_result)
-    if observed.returncode == 80:
-        raise PreMutationGateError("data_content_profile_mismatch", safe_result)
-    if observed.returncode != 0:
-        raise PlatformError("license_preflight_remote_failure")
-    if safe_result["profile"] != selected_profile:
-        raise PlatformError("license_preflight_profile_mismatch")
-    if (
-        selected_profile == NOCODOCS_LICENSED_PROFILE
-        and safe_result["licenseKey"] != "present"
-    ):
-        raise PreMutationGateError("business_license_required", safe_result)
-    return safe_result
+
+
+def materialize_host_bootstrap_env(
+    cfg: dict[str, Any], *, contract_source: Path | None = None
+) -> None:
+    """Fill only missing clean-host inputs before the host installer runs."""
+
+    seeds = host_bootstrap_seeds(contract_source=contract_source)
+    payload = "".join(f"{key}={seeds[key]}\n" for key in sorted(seeds))
+    ssh(cfg, host_bootstrap_env_command(cfg), input_text=payload)
 
 
 def scp(cfg: dict[str, Any], source: Path, destination: str) -> None:
@@ -813,51 +967,27 @@ def remote_step(cfg: dict[str, Any], name: str) -> str:
     return f"{remote_root(cfg)}/steps/{name}"
 
 
-def remove_legacy_patch_projection(cfg: dict[str, Any]) -> None:
-    """Remove the pre-steps remote projection after a governed release exists."""
-
-    root = remote_root(cfg)
-    ssh(
-        cfg,
-        "set -eu; "
-        + f"test -d {shlex.quote(root + '/steps')}; "
-        + f"rm -rf {shlex.quote(root + '/patches')}",
-    )
-
-
-def deployment_transaction_contract():
-    path = TOOL_ROOT / "server-deploy-transaction.py"
-    spec = importlib.util.spec_from_file_location("mte_deploy_transaction", path)
-    if spec is None or spec.loader is None:
-        raise PlatformError("cannot load the governed release transaction helper")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def synchronized_core_scripts(cfg: dict[str, Any]) -> list[str]:
     names = [
         "server-secrets.py",
-        "server-dokploy.py",
-        "server-deploy-transaction.py",
         "server-verify.py",
         "server-provision.py",
         "server-hermes.py",
         "server-toolhive.py",
         "server-paperclip-experimental.py",
         "server-observability-canary.py",
-        "server-host-dokploy-acceptance.py",
         "server-integration-canaries.py",
         "server-notion-sync.py",
         "server-cloudflare-acceptance.py",
         "server-kestra-reconcile.py",
         "server-profile-reconcile.py",
-        "server-activepieces-provision-verify.py",
         "agent-plane-gateway.py",
         "profile_catalog.py",
         "server-config.py",
         "render-cloudflare.py",
         "cloudflare-preflight.py",
+        "server-cloudflare-dns.py",
+        "server-cloudflare-access.py",
         "server-cloudflare-runtime.py",
         "render-profiles.py",
         "data_content_plane.py",
@@ -870,504 +1000,9 @@ def synchronized_core_scripts(cfg: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _copy_release_tree(
-    source: Path, destination: Path, *, deploy: bool = False
-) -> None:
-    def ignored(_directory: str, names: list[str]) -> set[str]:
-        result = {
-            name
-            for name in names
-            if name == "__pycache__" or name.endswith((".pyc", ".orig"))
-        }
-        if deploy:
-            result.add("compose-seeds.lock.json")
-        return result
-
-    if not source.is_dir():
-        raise PlatformError(f"governed source directory is missing: {source}")
-    shutil.copytree(source, destination, ignore=ignored)
-
-
 def canonical_compose_sources() -> list[Path]:
     """Return one owner-scoped Compose manifest for every managed service."""
     return sorted(SERVICES_ROOT.glob("*/compose.yaml"))
-
-
-def compose_projection_name(source: Path) -> str:
-    """Keep the established flat remote name for an owner-scoped manifest."""
-    if source.name != "compose.yaml" or source.parent.parent != SERVICES_ROOT:
-        raise PlatformError(f"invalid canonical Compose source: {source}")
-    return f"{source.parent.name}.yaml"
-
-
-class ReleaseSnapshot:
-    def __init__(self, cfg: dict[str, Any], run_id: str):
-        self._temporary = tempfile.TemporaryDirectory(prefix="mte-release-")
-        self.root = Path(self._temporary.name)
-        self.source = self.root / "source"
-        for path in (
-            self.source / "bin",
-            self.source / "templates/deploy",
-            self.source / "templates/profiles",
-            self.source / "manifests/kestra/flows",
-            self.source / "manifests/hermes",
-            self.source / "manifests/cloudflare",
-            self.source / "runtime/paperclip/scripts",
-            self.source / "runtime/paperclip/profiles/instructions",
-            self.source / "steps",
-            self.source / "config",
-        ):
-            path.mkdir(parents=True, exist_ok=True)
-
-        for source, destination in (
-            (KESTRA_WORKFLOWS_ROOT, self.source / "manifests/kestra/flows"),
-            (PROFILES_ROOT, self.source / "templates/profiles"),
-            (
-                PROFILES_ROOT / "instructions",
-                self.source / "runtime/paperclip/profiles/instructions",
-            ),
-            (CLOUDFLARE_ROOT, self.source / "manifests/cloudflare"),
-            (ROOT / "deployment/steps", self.source / "steps"),
-        ):
-            destination.rmdir()
-            _copy_release_tree(source, destination)
-        deploy_destination = self.source / "templates/deploy"
-        for source in canonical_compose_sources():
-            shutil.copy2(source, deploy_destination / compose_projection_name(source))
-
-        # Keep the established remote runtime contract while the local source
-        # tree uses purpose-based names. Server consumers still read
-        # manifests/kestra/application.yaml and templates/profiles/profiles.yaml.
-        shutil.copy2(
-            KESTRA_SERVICE_ROOT / "application.yaml",
-            self.source / "manifests/kestra/application.yaml",
-        )
-        kestra_runtime_config = self.source / "config/services/kestra/application.yaml"
-        kestra_runtime_config.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(KESTRA_SERVICE_ROOT / "application.yaml", kestra_runtime_config)
-        searxng_runtime_config = self.source / "config/services/searxng/settings.yml"
-        searxng_runtime_config.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(SEARXNG_SERVICE_ROOT / "settings.yml", searxng_runtime_config)
-        profile_catalog = self.source / "templates/profiles/catalog.yaml"
-        profile_catalog.replace(self.source / "templates/profiles/profiles.yaml")
-
-        hermes_destination = self.source / "manifests/hermes"
-        shutil.copy2(
-            HERMES_SERVICE_ROOT / "config.yaml.template",
-            hermes_destination / "config.yaml.template",
-        )
-        shutil.copy2(
-            HERMES_SERVICE_ROOT / "soul.txt",
-            hermes_destination / "SOUL.md",
-        )
-        shutil.copy2(
-            HERMES_SERVICE_ROOT / "service.unit",
-            hermes_destination / "hermes.service",
-        )
-        for name in ("acceptance-canary.py", "bootstrap-mattermost.py"):
-            shutil.copy2(HERMES_SERVICE_ROOT / name, hermes_destination / name)
-        skill_destination = hermes_destination / "skills/mte-platform/SKILL.md"
-        skill_destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(HERMES_SERVICE_ROOT / "platform-skill.txt", skill_destination)
-
-        plane = optional_resolved_data_content(cfg)
-        adapters = (
-            sorted({str(row["script"]) for row in plane["adapters"].values()})
-            if plane is not None
-            else []
-        )
-        for name in [*synchronized_core_scripts(cfg), *adapters]:
-            source = TOOL_ROOT / name
-            if not source.is_file():
-                raise PlatformError(f"governed server script is missing: {source}")
-            shutil.copy2(source, self.source / "bin" / name)
-        shutil.copy2(
-            TOOL_ROOT / "bootstrap-paperclip.py",
-            self.source / "runtime/paperclip/scripts/bootstrap-paperclip.py",
-        )
-        shutil.copy2(
-            TOOL_ROOT / "profile_catalog.py",
-            self.source / "runtime/paperclip/scripts/profile_catalog.py",
-        )
-        # This deterministic process agent exists only as a live-acceptance
-        # fixture. It is synchronized beside Paperclip runtime scripts, but is
-        # not a platform application or long-lived service.
-        shutil.copy2(
-            ROOT / "tests/fixtures/agents/integration_canary.py",
-            self.source / "runtime/paperclip/scripts/integration_canary.py",
-        )
-
-        rendered = render_config(cfg)
-        shutil.copy2(rendered, self.source / "templates/platform.json")
-        for source, destination in (
-            (
-                COMPOSE_SEEDS_PATH,
-                self.source / "templates/compose-seeds.lock.json",
-            ),
-            (
-                LOCK_PATH,
-                self.source / "templates/platform.lock.yaml",
-            ),
-            (
-                CONNECTIONS_PATH,
-                self.source / "config/connections.yaml",
-            ),
-        ):
-            shutil.copy2(source, destination)
-
-        for path in self.source.rglob("*"):
-            if path.is_symlink():
-                raise PlatformError(f"governed source contains a symlink: {path}")
-            path.chmod(0o755 if path.is_dir() else 0o644)
-        for path in (self.source / "bin").iterdir():
-            if path.is_file():
-                path.chmod(0o700)
-        for path in (self.source / "steps").glob("*.sh"):
-            path.chmod(0o700)
-
-        contract = deployment_transaction_contract()
-        try:
-            self.manifest = contract.build_manifest(self.source, list(PROMOTION_PATHS))
-        except contract.TransactionError as exc:
-            raise PlatformError(str(exc)) from exc
-        self.source_sha256 = str(self.manifest["sourceSha256"])
-        self.release_id = f"{run_id}-{self.source_sha256[:16]}"
-        self.manifest_path = self.root / "source-manifest.json"
-        self.manifest_path.write_text(
-            json.dumps(self.manifest, indent=2, sort_keys=True) + "\n"
-        )
-        self.manifest_path.chmod(0o600)
-
-    def verify(self) -> None:
-        contract = deployment_transaction_contract()
-        try:
-            proof = contract.verify_tree(self.source, self.manifest)
-        except contract.TransactionError as exc:
-            raise PlatformError("immutable local release snapshot drift") from exc
-        if proof.get("sourceSha256") != self.source_sha256:
-            raise PlatformError("immutable local release snapshot hash mismatch")
-
-    def close(self) -> None:
-        self._temporary.cleanup()
-
-
-@contextmanager
-def remote_deploy_lock(cfg: dict[str, Any]):
-    root = remote_root(cfg)
-    target = host_spec(cfg)["ssh"]
-    command = (
-        "set -eu; umask 077; "
-        f"mkdir -p {shlex.quote(root + '/.deploy')}; "
-        f"exec 9>{shlex.quote(root + '/.deploy/deploy.lock')}; "
-        "if ! flock -n 9; then printf 'MTE_DEPLOY_BUSY\\n'; exit 73; fi; "
-        "printf 'MTE_DEPLOY_LOCKED\\n'; IFS= read -r _"
-    )
-    process = subprocess.Popen(
-        [
-            *ssh_transport_command(),
-            target,
-            command,
-        ],
-        text=True,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stdout is not None
-    ready = process.stdout.readline().strip()
-    if ready != "MTE_DEPLOY_LOCKED":
-        process.kill()
-        process.wait()
-        raise PlatformError("another full-platform deployment holds the remote lock")
-    try:
-        yield
-    finally:
-        if process.stdin is not None:
-            try:
-                process.stdin.write("release\n")
-                process.stdin.flush()
-                process.stdin.close()
-            except BrokenPipeError:
-                pass
-        try:
-            process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-
-
-class DeployTransaction:
-    def __init__(
-        self,
-        cfg: dict[str, Any],
-        snapshot: ReleaseSnapshot,
-        run_id: str,
-        *,
-        attempt: int,
-        release_id: str | None = None,
-    ):
-        self.cfg = cfg
-        self.snapshot = snapshot
-        self.run_id = run_id
-        self.attempt = attempt
-        self.release_id = release_id or snapshot.release_id
-        if release_id and release_id != snapshot.release_id:
-            raise PlatformError("resume release ID does not match frozen source")
-        self.activation_id = f"{run_id}-a{attempt}"
-        self.promoted = False
-        self.helper = f"/tmp/mte-deploy-transaction-{self.activation_id}.py"
-
-    def _helper_command(self, *arguments: str) -> str:
-        local = self.snapshot.source / "bin/server-deploy-transaction.py"
-        expected = hashlib.sha256(local.read_bytes()).hexdigest()
-        command = [
-            "python3",
-            self.helper,
-            "--root",
-            remote_root(self.cfg),
-            *arguments,
-        ]
-        return (
-            "set -eu; "
-            f"test $(sha256sum {shlex.quote(self.helper)} | cut -d' ' -f1) = {shlex.quote(expected)}; "
-            + " ".join(shlex.quote(item) for item in command)
-        )
-
-    def _helper_json(self, *arguments: str) -> dict[str, Any]:
-        observed = ssh(
-            self.cfg,
-            self._helper_command(*arguments),
-            capture_output=True,
-        )
-        lines = [line.strip() for line in (observed.stdout or "").splitlines()]
-        try:
-            payload = json.loads(next(line for line in reversed(lines) if line))
-        except (json.JSONDecodeError, StopIteration) as exc:
-            raise PlatformError(
-                "governed release helper returned invalid JSON"
-            ) from exc
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise PlatformError("governed release helper rejected the operation")
-        if payload.get("activationId") not in {None, self.activation_id}:
-            raise PlatformError("governed release helper activation mismatch")
-        return payload
-
-    def inspect_activation(self) -> dict[str, Any]:
-        payload = self._helper_json(
-            "inspect-activation", "--activation-id", self.activation_id
-        )
-        if payload.get("activationId") != self.activation_id or not isinstance(
-            payload.get("current"), bool
-        ):
-            raise PlatformError("invalid governed source activation inspection")
-        if payload["current"] and (
-            payload.get("releaseId") != self.release_id
-            or payload.get("sourceSha256") != self.snapshot.source_sha256
-        ):
-            raise PlatformError("current governed source activation identity mismatch")
-        return payload
-
-    def promote(self) -> dict[str, Any]:
-        promotion_error: Exception | None = None
-        try:
-            self._helper_json(
-                "promote",
-                "--release-id",
-                self.release_id,
-                "--run-id",
-                self.run_id,
-                "--activation-id",
-                self.activation_id,
-            )
-        except Exception as exc:
-            # SSH can lose the acknowledgement after the remote commit.  The
-            # durable remote activation pointer, not the client exception, is
-            # authoritative in that case.
-            promotion_error = exc
-        try:
-            inspected = self.inspect_activation()
-        except Exception:
-            if promotion_error is not None:
-                raise promotion_error
-            raise
-        if not inspected["current"]:
-            if promotion_error is not None:
-                raise promotion_error
-            raise PlatformError("governed source promotion is not current")
-        self.promoted = True
-        self.verify()
-        return inspected
-
-    def install_helper(self) -> None:
-        local = self.snapshot.source / "bin/server-deploy-transaction.py"
-        scp(self.cfg, local, self.helper)
-        expected = hashlib.sha256(local.read_bytes()).hexdigest()
-        ssh(
-            self.cfg,
-            "set -eu; "
-            f"chown root:root {shlex.quote(self.helper)}; "
-            f"chmod 0700 {shlex.quote(self.helper)}; "
-            f"test $(sha256sum {shlex.quote(self.helper)} | cut -d' ' -f1) = {shlex.quote(expected)}",
-        )
-
-    def ensure_synced(self) -> None:
-        self.snapshot.verify()
-        if self.promoted:
-            self.verify()
-            return
-        self.install_helper()
-        root = remote_root(self.cfg)
-        upload = f"{root}/.deploy/uploads/{self.activation_id}"
-        ssh(
-            self.cfg,
-            f"set -eu; umask 077; rm -rf {shlex.quote(upload)}; "
-            f"mkdir -p {shlex.quote(upload + '/source')}",
-        )
-        run(
-            remote_rsync_command(
-                "-rtz",
-                "--delete",
-                str(self.snapshot.source) + "/",
-                f"{host_spec(self.cfg)['ssh']}:{upload}/source/",
-            )
-        )
-        scp(self.cfg, self.snapshot.manifest_path, upload + "/source-manifest.json")
-        ssh(
-            self.cfg,
-            "set -eu; "
-            f"chown -R root:root {shlex.quote(upload)}; "
-            f"find {shlex.quote(upload + '/source')} -type d -exec chmod 0755 {{}} +; "
-            f"find {shlex.quote(upload + '/source')} -type f -exec chmod 0644 {{}} +; "
-            f"find {shlex.quote(upload + '/source/bin')} -type f -exec chmod 0700 {{}} +; "
-            f"find {shlex.quote(upload + '/source/steps')} -type f -name '*.sh' -exec chmod 0700 {{}} +; "
-            f"chmod 0600 {shlex.quote(upload + '/source-manifest.json')}",
-        )
-        ssh(
-            self.cfg,
-            self._helper_command(
-                "seal",
-                "--upload",
-                upload,
-                "--release-id",
-                self.release_id,
-            ),
-        )
-        self.promote()
-
-    def verify(self) -> None:
-        self.snapshot.verify()
-        if not self.promoted:
-            raise PlatformError("governed source release is not promoted")
-        payload = self._helper_json(
-            "verify-current",
-            "--release-id",
-            self.release_id,
-            "--activation-id",
-            self.activation_id,
-        )
-        if (
-            payload.get("status") != "active"
-            or payload.get("sourceSha256") != self.snapshot.source_sha256
-        ):
-            raise PlatformError("governed source verification identity mismatch")
-
-    def checkpoint(
-        self, status: str, *, completed_step: str = "", next_step: str = ""
-    ) -> None:
-        ssh(
-            self.cfg,
-            self._helper_command(
-                "checkpoint",
-                "--run-id",
-                self.run_id,
-                "--release-id",
-                self.release_id,
-                "--activation-id",
-                self.activation_id,
-                "--source-sha256",
-                self.snapshot.source_sha256,
-                "--status",
-                status,
-                "--step",
-                completed_step,
-                "--next-step",
-                next_step,
-                "--attempt",
-                str(self.attempt),
-            ),
-        )
-
-    def _validated_rollback(self, payload: dict[str, Any]) -> dict[str, Any]:
-        action = payload.get("action")
-        if payload.get("activationId") != self.activation_id:
-            raise PlatformError("governed source rollback activation mismatch")
-        if action in {"rolledBack", "alreadyRolledBack"}:
-            if (
-                payload.get("status") != "rolledBack"
-                or payload.get("sourceSha256") != self.snapshot.source_sha256
-            ):
-                raise PlatformError("governed source rollback proof mismatch")
-        elif action == "notCurrent":
-            if payload.get("current") is not False:
-                raise PlatformError("invalid non-current source rollback proof")
-        else:
-            raise PlatformError("invalid governed source rollback action")
-        self.promoted = False
-        return payload
-
-    def _rollback_result_from_inspection(
-        self, inspected: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        if inspected["current"]:
-            return None
-        journal_status = inspected.get("journalStatus")
-        if journal_status == "rolledBack":
-            return self._validated_rollback(
-                {
-                    "action": "alreadyRolledBack",
-                    "status": "rolledBack",
-                    "activationId": self.activation_id,
-                    "sourceSha256": inspected.get("sourceSha256"),
-                }
-            )
-        if journal_status in {"promoting", "committing", "rollingBack"}:
-            # The server must finish its write-ahead journal before the client
-            # can authoritatively call the activation non-current.
-            return None
-        return self._validated_rollback({"action": "notCurrent", **inspected})
-
-    def rollback(self) -> dict[str, Any]:
-        last_error: Exception | None = None
-        for _attempt in range(2):
-            try:
-                return self._validated_rollback(
-                    self._helper_json(
-                        "rollback-if-current",
-                        "--activation-id",
-                        self.activation_id,
-                    )
-                )
-            except Exception as exc:
-                last_error = exc
-                try:
-                    inspected = self.inspect_activation()
-                except Exception:
-                    continue
-                observed = self._rollback_result_from_inspection(inspected)
-                if observed is not None:
-                    return observed
-        try:
-            inspected = self.inspect_activation()
-            observed = self._rollback_result_from_inspection(inspected)
-            if observed is not None:
-                return observed
-        except Exception:
-            pass
-        assert last_error is not None
-        raise last_error
-
-    def cleanup(self) -> None:
-        ssh(self.cfg, f"rm -f {shlex.quote(self.helper)}", check=False)
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -1431,82 +1066,98 @@ def render_config(cfg: dict[str, Any]) -> Path:
     return path
 
 
-def sync(cfg: dict[str, Any], *, render_projections: bool = True) -> None:
-    if ACTIVE_DEPLOY_TRANSACTION is not None:
-        ACTIVE_DEPLOY_TRANSACTION.ensure_synced()
-        return
-    ensure_safe_target(cfg)
-    target = host_spec(cfg)["ssh"]
-    remote_root = host_spec(cfg)["root"]
-    staging_root = f"{remote_root}/.sync-staging"
-    rendered = render_config(cfg)
-    ssh(
-        cfg,
-        "set -eu; umask 077; rm -rf "
-        + shlex.quote(staging_root)
-        + "; mkdir -p "
-        + " ".join(
-            shlex.quote(path)
-            for path in [
-                f"{staging_root}/bin",
-                f"{staging_root}/config",
-                f"{staging_root}/config/services/kestra",
-                f"{staging_root}/config/services/searxng",
-                f"{staging_root}/templates/deploy",
-                f"{staging_root}/templates/profiles",
-                f"{staging_root}/manifests/kestra/flows",
-                f"{staging_root}/manifests/hermes/skills/mte-platform",
-                f"{staging_root}/manifests/cloudflare",
-                f"{staging_root}/runtime/paperclip/scripts",
-                f"{staging_root}/runtime/paperclip/profiles/instructions",
-                f"{staging_root}/steps",
-            ]
+SYNC_MANIFEST_NAME = ".sync-manifest.sha256"
+
+
+@contextmanager
+def local_sync_lock():
+    """Serialize the full local sync lifecycle for one operator checkout."""
+
+    path = local_evidence_root().parent / "sync.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        path.chmod(0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _copy_sync_source(source: Path, destination: Path) -> None:
+    """Copy one approved source into the bundle without following special files."""
+
+    mode = source.lstat().st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+        raise PlatformError(f"sync source must be a regular file: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source.read_bytes())
+
+
+def _copy_sync_tree(source: Path, destination: Path) -> None:
+    """Copy an approved tree, rejecting links and non-file filesystem entries."""
+
+    mode = source.lstat().st_mode
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        raise PlatformError(f"sync source must be a directory: {source}")
+    destination.mkdir(parents=True, exist_ok=True)
+    for item in sorted(source.iterdir(), key=lambda path: path.name):
+        if item.name == "__pycache__" or item.name.endswith((".orig", ".pyc")):
+            continue
+        item_mode = item.lstat().st_mode
+        target = destination / item.name
+        if stat.S_ISDIR(item_mode):
+            _copy_sync_tree(item, target)
+        elif stat.S_ISREG(item_mode):
+            _copy_sync_source(item, target)
+        else:
+            raise PlatformError(f"sync source contains a special file: {item}")
+
+
+def _write_sync_manifest(bundle: Path) -> None:
+    rows: list[str] = []
+    for path in sorted(
+        bundle.rglob("*"), key=lambda item: item.relative_to(bundle).as_posix()
+    ):
+        mode = path.lstat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise PlatformError(f"sync bundle contains a special file: {path}")
+        relative = path.relative_to(bundle).as_posix()
+        if "\n" in relative or "\r" in relative:
+            raise PlatformError(f"sync bundle path contains a newline: {relative!r}")
+        rows.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {relative}\n")
+    (bundle / SYNC_MANIFEST_NAME).write_text("".join(rows))
+
+
+def _materialize_sync_bundle(cfg: dict[str, Any], bundle: Path, rendered: Path) -> None:
+    tree_projections = (
+        (KESTRA_WORKFLOWS_ROOT, "manifests/kestra/flows"),
+        (PROFILES_ROOT, "templates/profiles"),
+        (PROFILES_ROOT / "instructions", "runtime/paperclip/profiles/instructions"),
+        (
+            VERIFICATION_PROFILE_SKILL_ROOT,
+            "runtime/paperclip/profiles/skills/verification-before-completion",
+        ),
+        (CLOUDFLARE_ROOT, "manifests/cloudflare"),
+        (ROOT / "deployment/steps", "steps"),
+        (AGENT_RUNTIME_ROOT, "deployment/agent-runtime"),
+        (SERVICES_ROOT, "deployment/services"),
+        (
+            SYSTEM_PLATFORM_SKILL_ROOT,
+            "manifests/hermes/skills/system-platform",
         ),
     )
-    transfers = [
-        (
-            str(KESTRA_WORKFLOWS_ROOT) + "/",
-            f"{target}:{staging_root}/manifests/kestra/flows/",
-        ),
-        (str(PROFILES_ROOT) + "/", f"{target}:{staging_root}/templates/profiles/"),
-        (
-            str(PROFILES_ROOT / "instructions") + "/",
-            f"{target}:{staging_root}/runtime/paperclip/profiles/instructions/",
-        ),
-        (
-            str(CLOUDFLARE_ROOT) + "/",
-            f"{target}:{staging_root}/manifests/cloudflare/",
-        ),
-        (
-            str(ROOT / "deployment/steps") + "/",
-            f"{target}:{staging_root}/steps/",
-        ),
-    ]
-    # Canonical Compose sources are grouped by owner, while the server keeps
-    # the established flat templates/deploy/<service>.yaml projection.
-    for source in canonical_compose_sources():
-        run(
-            remote_rsync_command(
-                "-rtz",
-                str(source),
-                f"{target}:{staging_root}/templates/deploy/"
-                f"{compose_projection_name(source)}",
-            )
-        )
-    for source, destination in transfers:
-        run(
-            remote_rsync_command(
-                "-rtz",
-                "--delete",
-                "--exclude=*.orig",
-                "--exclude=__pycache__",
-                "--exclude=*.pyc",
-                source,
-                destination,
-            )
-        )
-    static_files = {
+    for source, relative in tree_projections:
+        _copy_sync_tree(source, bundle / relative)
+
+    profile_catalog = bundle / "templates/profiles/catalog.yaml"
+    profile_catalog.rename(profile_catalog.with_name("profiles.yaml"))
+
+    file_projections = {
         "manifests/kestra/application.yaml": KESTRA_SERVICE_ROOT / "application.yaml",
+        "deployment/compose.yaml": ROOT / "deployment/compose.yaml",
         "config/services/kestra/application.yaml": KESTRA_SERVICE_ROOT
         / "application.yaml",
         "config/services/searxng/settings.yml": SEARXNG_SERVICE_ROOT / "settings.yml",
@@ -1518,17 +1169,21 @@ def sync(cfg: dict[str, Any], *, render_projections: bool = True) -> None:
         "manifests/hermes/config.yaml.template": HERMES_SERVICE_ROOT
         / "config.yaml.template",
         "manifests/hermes/SOUL.md": HERMES_SERVICE_ROOT / "soul.txt",
-        "manifests/hermes/skills/mte-platform/SKILL.md": HERMES_SERVICE_ROOT
-        / "platform-skill.txt",
+        "manifests/hermes/requirements-messaging.lock": HERMES_SERVICE_ROOT
+        / "requirements-messaging.lock",
+        "manifests/hermes/supply-chain.lock.json": HERMES_SERVICE_ROOT
+        / "supply-chain.lock.json",
+        "runtime/paperclip/scripts/bootstrap-paperclip.py": TOOL_ROOT
+        / "bootstrap-paperclip.py",
+        "runtime/paperclip/scripts/profile_catalog.py": TOOL_ROOT
+        / "profile_catalog.py",
+        "runtime/paperclip/scripts/integration_canary.py": ROOT
+        / "tests/fixtures/agents/integration_canary.py",
+        "templates/platform.json": rendered,
+        "templates/compose-seeds.lock.json": COMPOSE_SEEDS_PATH,
+        "templates/platform.lock.yaml": LOCK_PATH,
+        "config/acceptance-requirements.yaml": ACCEPTANCE_REQUIREMENTS_PATH,
     }
-    for destination, source in static_files.items():
-        run(
-            remote_rsync_command(
-                "-rtz",
-                str(source),
-                f"{target}:{staging_root}/{destination}",
-            )
-        )
     core_scripts = synchronized_core_scripts(cfg)
     plane = optional_resolved_data_content(cfg)
     adapter_scripts = (
@@ -1537,62 +1192,63 @@ def sync(cfg: dict[str, Any], *, render_projections: bool = True) -> None:
         else []
     )
     for name in [*core_scripts, *adapter_scripts]:
+        file_projections[f"bin/{name}"] = TOOL_ROOT / name
+    for relative, source in file_projections.items():
+        _copy_sync_source(source, bundle / relative)
+    _write_sync_manifest(bundle)
+
+
+def sync(cfg: dict[str, Any], *, render_projections: bool = True) -> None:
+    """Serialize one complete sync from local bundle through remote publish."""
+
+    with local_sync_lock():
+        _sync_unlocked(cfg, render_projections=render_projections)
+
+
+def _sync_unlocked(cfg: dict[str, Any], *, render_projections: bool = True) -> None:
+    ensure_safe_target(cfg)
+    target = host_spec(cfg)["ssh"]
+    remote_root = host_spec(cfg)["root"]
+    # A sync may be started again before an earlier upload has published.  Its
+    # staging tree must therefore belong to exactly one invocation: publishing
+    # the earlier bundle removes only its own stage, never an in-flight rsync.
+    staging_root = f"{remote_root}/.sync-staging-{uuid.uuid4().hex}"
+    rendered = render_config(cfg)
+    ssh(
+        cfg,
+        "set -eu; umask 077; mkdir -p " + shlex.quote(staging_root),
+    )
+    with tempfile.TemporaryDirectory() as temp:
+        bundle = Path(temp) / "bundle"
+        bundle.mkdir()
+        _materialize_sync_bundle(cfg, bundle, rendered)
         run(
             remote_rsync_command(
                 "-rtz",
-            str(TOOL_ROOT / name),
-                f"{target}:{staging_root}/bin/{name}",
+                "--delete",
+                str(bundle) + "/",
+                f"{target}:{staging_root}/",
             )
         )
-    runtime_scripts = {
-        "bootstrap-paperclip.py": TOOL_ROOT / "bootstrap-paperclip.py",
-        "profile_catalog.py": TOOL_ROOT / "profile_catalog.py",
-        "integration_canary.py": ROOT / "tests/fixtures/agents/integration_canary.py",
-    }
-    for name, source in runtime_scripts.items():
-        run(
-            remote_rsync_command(
-                "-rtz",
-                str(source),
-                f"{target}:{staging_root}/runtime/paperclip/scripts/{name}",
-            )
-        )
-    run(
-        remote_rsync_command(
-            "-rtz",
-            str(rendered),
-            f"{target}:{staging_root}/templates/platform.json",
-        )
-    )
-    run(
-        remote_rsync_command(
-            "-rtz",
-            str(COMPOSE_SEEDS_PATH),
-            f"{target}:{staging_root}/templates/compose-seeds.lock.json",
-        )
-    )
-    run(
-        remote_rsync_command(
-            "-rtz",
-            str(LOCK_PATH),
-            f"{target}:{staging_root}/templates/platform.lock.yaml",
-        )
-    )
-    run(
-        remote_rsync_command(
-            "-rtz",
-            str(CONNECTIONS_PATH),
-            f"{target}:{staging_root}/config/connections.yaml",
-        )
-    )
     ssh(
         cfg,
         "set -eu; umask 077; stage="
         + shlex.quote(staging_root)
         + "; root="
         + shlex.quote(remote_root)
-        + '; mv "$stage/templates/profiles/catalog.yaml" '
-        + '"$stage/templates/profiles/profiles.yaml"; '
+        + '; lock="$root/.sync.lock"; : > "$lock"; chown root:root "$lock"; '
+        + 'chmod 0600 "$lock"; exec 9>"$lock"; flock -x 9; '
+        + 'cd "$stage"; actual="$(find . -type f ! -path '
+        + shlex.quote(f"./{SYNC_MANIFEST_NAME}")
+        + " -printf '%P\\n' | LC_ALL=C sort)\"; expected=\"$(sed -n "
+        + shlex.quote(r"s/^[0-9a-f]\{64\}  //p")
+        + " "
+        + shlex.quote(SYNC_MANIFEST_NAME)
+        + ')"; test "$actual" = "$expected"; sha256sum -c '
+        + shlex.quote(SYNC_MANIFEST_NAME)
+        + "; rm -f "
+        + shlex.quote(SYNC_MANIFEST_NAME)
+        + "; "
         + 'chown -R root:root "$stage"; '
         + 'find "$stage" -type d -exec chmod 0755 {} +; '
         + 'find "$stage" -type f -exec chmod 0644 {} +; '
@@ -1603,30 +1259,34 @@ def sync(cfg: dict[str, Any], *, render_projections: bool = True) -> None:
         + 'test -z "$(find "$stage/bin" -type f ! -perm 0700 -print -quit)"; '
         + 'test -z "$(find "$stage/steps" -type f -name "*.sh" ! -perm 0700 -print -quit)"; '
         + 'test -z "$(find "$stage" -type f ! -path "$stage/bin/*" '
-        + '! -path "$stage/steps/*.sh" ! -perm 0644 -print -quit)"; '
+        + '! -path "$stage/steps/*.sh" '
+        + '! -perm 0644 -print -quit)"; '
         + 'mkdir -p "$root/config" "$root/runtime"; '
-        + "for rel in bin templates manifests runtime/paperclip steps config/services; do "
+        + "for rel in bin templates manifests runtime/paperclip deployment steps config/services; do "
         + 'mkdir -p "$root/$rel"; '
         + 'test -z "$(find "$root/$rel" -type l -print -quit)"; '
         + 'find "$root/$rel" -type d -exec chown root:root {} + '
         + "-exec chmod 0755 {} +; "
         + 'rsync -rtp --delete --ignore-times "$stage/$rel/" "$root/$rel/"; '
         + "done; "
-        + 'install -o root -g root -m 0644 "$stage/config/connections.yaml" '
-        + '"$root/config/.connections.yaml.tmp"; '
-        + 'mv -f "$root/config/.connections.yaml.tmp" "$root/config/connections.yaml"; '
+        + 'install -o root -g root -m 0644 "$stage/config/acceptance-requirements.yaml" '
+        + '"$root/config/.acceptance-requirements.yaml.tmp"; '
+        + 'mv -f "$root/config/.acceptance-requirements.yaml.tmp" '
+        + '"$root/config/acceptance-requirements.yaml"; '
         + 'set -- "$root/bin" "$root/templates" "$root/manifests" '
-        + '"$root/runtime/paperclip" "$root/steps" "$root/config/services"; '
+        + '"$root/runtime/paperclip" "$root/deployment" '
+        + '"$root/steps" "$root/config/services"; '
         + 'test -z "$(find "$@" -type l -print -quit)"; '
         + 'test -z "$(find "$@" \\( ! -user root -o ! -group root \\) -print -quit)"; '
         + 'test -z "$(find "$root/bin" -type f ! -perm 0700 -print -quit)"; '
         + 'test -z "$(find "$root/steps" -type f -name "*.sh" ! -perm 0700 -print -quit)"; '
         + 'test -z "$(find "$root/templates" "$root/manifests" '
-        + '"$root/runtime/paperclip" "$root/config/services" '
-        + '-type f ! -perm 0644 -print -quit)"; '
+        + '"$root/runtime/paperclip" "$root/deployment" '
+        + '"$root/config/services" '
+        + '! -perm 0644 -print -quit)"; '
         + 'test -z "$(find "$root/steps" -type f ! -name "*.sh" -print -quit)"; '
-        + 'rm -rf "$root/patches"; '
-        + 'test "$(stat -c \'%u:%g:%a:%F\' "$root/config/connections.yaml")" '
+        + "test \"$(stat -c '%u:%g:%a:%F' "
+        + '"$root/config/acceptance-requirements.yaml")" '
         + "= '0:0:644:regular file'; rm -rf \"$stage\"",
     )
     # Source synchronization is deliberately projection-blind.  Only the
@@ -1675,10 +1335,7 @@ def placeholder_env(cfg: dict[str, Any]) -> Path:
     os.chmod(handle.name, 0o600)
     for key in sorted(keys):
         handle.write(f"{key}=plan-placeholder-0123456789abcdef0123456789abcdef\n")
-    handle.write("BASEROW_PUBLIC_URL=http://127.0.0.1:18085\n")
-    handle.write("WIKIJS_SITE_URL=http://127.0.0.1:18086\n")
     handle.write("MATTERMOST_SITE_URL=http://127.0.0.1:18065\n")
-    handle.write("AP_FRONTEND_URL=http://127.0.0.1:18090\n")
     handle.write("SEARXNG_BASE_URL=http://127.0.0.1:18088/\n")
     handle.close()
     return Path(handle.name)
@@ -1687,9 +1344,7 @@ def placeholder_env(cfg: dict[str, Any]) -> Path:
 def cmd_plan(args: argparse.Namespace) -> None:
     cfg = config(args.domain)
     ensure_safe_target(cfg)
-    if args.all and args.components:
-        raise PlatformError("plan --all does not accept component names")
-    ordered = component_order(cfg, None if args.all else (args.components or None))
+    ordered = component_order(cfg, args.components or None)
     temp = placeholder_env(cfg)
     try:
         for row in ordered:
@@ -1714,7 +1369,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
             {
                 "id": row["id"],
                 "stage": row.get("stage"),
-                "management": "dokploy"
+                "management": "compose"
                 if row.get("compose")
                 else row.get("management"),
                 "dependsOn": row.get("dependsOn", []),
@@ -1735,15 +1390,15 @@ def cmd_plan(args: argparse.Namespace) -> None:
             "id": profile_id,
             **selection,
         }
-    if args.all:
-        result["fullDeploySteps"] = [
-            {"index": index, "id": step}
-            for index, step in enumerate(FULL_DEPLOY_STEPS, start=1)
-        ]
     print(json.dumps(result, indent=2))
 
 
 def cmd_preflight(args: argparse.Namespace) -> None:
+    # Keep this entirely local and before ``config``/SSH so the public default
+    # cannot reach a host, create files, or defer the consent failure to the
+    # Daytona stage.
+    values = operator_values(required=True)
+    validate_public_harness_enablement(values)
     cfg = config(args.domain)
     ensure_safe_target(cfg)
     result = ssh(
@@ -1753,7 +1408,36 @@ def cmd_preflight(args: argparse.Namespace) -> None:
         'printf \'{"ssh":"ready","os":"ubuntu"}\\n\'',
         capture_output=True,
     )
+    run_resource_preflight(cfg, "deploy", values=values)
     print(result.stdout, end="")
+
+
+def run_resource_preflight(
+    cfg: dict[str, Any],
+    mode: str,
+    *,
+    values: dict[str, str],
+    source: Path = RESOURCE_PREFLIGHT_STEP,
+) -> None:
+    """Stream the read-only admission check with its canonical policy."""
+
+    if mode not in {"deploy", "daytona-e2e"}:
+        raise PlatformError("unsupported resource preflight mode")
+    contract = server_config_contract()
+    try:
+        thresholds = contract.resource_preflight_values(
+            normalized_operator_values(values)
+        )
+    except contract.ConfigError as exc:
+        raise PlatformError(str(exc)) from exc
+    assignments = " ".join(
+        f"{key}={shlex.quote(value)}" for key, value in sorted(thresholds.items())
+    )
+    ssh(
+        cfg,
+        f"env {assignments} bash -s -- {shlex.quote(mode)}",
+        input_text=source.read_text(),
+    )
 
 
 def cmd_sync(args: argparse.Namespace) -> None:
@@ -1762,10 +1446,16 @@ def cmd_sync(args: argparse.Namespace) -> None:
     print(json.dumps({"synced": True, "target": host_spec(cfg)["ssh"]}))
 
 
-def run_host_bootstrap(cfg: dict[str, Any], *, source: Path | None = None) -> None:
+def run_host_bootstrap(
+    cfg: dict[str, Any],
+    *,
+    source: Path | None = None,
+    contract_source: Path | None = None,
+) -> None:
     ensure_safe_target(cfg)
-    source = source or ROOT / "deployment/steps/10-host.sh"
-    remote = "/tmp/mte-platform-10-host.sh"
+    source = source or ROOT / "deployment/steps/host.sh"
+    remote = "/tmp/mte-platform-host.sh"
+    materialize_host_bootstrap_env(cfg, contract_source=contract_source)
     scp(cfg, source, remote)
     ssh(
         cfg,
@@ -1784,16 +1474,6 @@ def finish_platform_bootstrap(cfg: dict[str, Any]) -> None:
         f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} init </dev/null && "
         f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} render && "
         f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} audit",
-    )
-    ssh(
-        cfg,
-        "set -eu; "
-        "for attempt in $(seq 1 90); do "
-        "if curl -sS -o /dev/null http://127.0.0.1:3000/api/settings.isCloud; then exit 0; fi; "
-        "sleep 2; done; exit 1",
-    )
-    ssh(
-        cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-dokploy.py'))} bootstrap"
     )
 
 
@@ -1814,7 +1494,7 @@ def cmd_bootstrap(args: argparse.Namespace) -> None:
                 "bootstrap": "complete",
                 "target": host_spec(cfg)["ssh"],
                 "platformRoot": remote_root(cfg),
-                "dokploy": "owner-and-api-ready",
+                "runtime": "docker-compose-ready",
             },
             indent=2,
         )
@@ -1841,7 +1521,8 @@ def run_config(cfg: dict[str, Any], action: str) -> None:
     script = remote_script(cfg, "server-config.py")
     if action == "init":
         # This is the only path allowed to import the explicit operator input
-        # carrier. Server-side init filters known keys and remains fill-only.
+        # carrier. Server-side init reconciles the reviewed operator set while
+        # keeping generated and provisioned values fill-only.
         contract = server_config_contract()
         imported = {
             key: value
@@ -1899,20 +1580,27 @@ def ensure_config_initialized(cfg: dict[str, Any]) -> None:
     if result.returncode != 0:
         run_config(cfg, "init")
         return
-    # Schema upgrades may add a new operator-owned key after the canonical
-    # source was first created. Re-import the reviewed operator contract plus
-    # managed Notion identifiers; server-config filters them again and applies
-    # them fill-only, so existing credentials and generated values always win.
+    # Re-import the reviewed operator contract from the same selected file on
+    # every post-install pass. Managed Notion identifiers cross this boundary
+    # only for fill-only upgrades; server-config reconciles operator-owned keys
+    # and preserves generated/provisioned values.
     contract = server_config_contract()
-    local_values = normalize_notion_token_import(operator_values())
+    local_values = normalize_notion_token_import(operator_values(required=True))
+    telegram_alias = "PRIN7R_HERMES_TELEGRAM_BOT_TOKEN"
+    if (
+        not str(local_values.get("HERMES_TELEGRAM_BOT_TOKEN", "")).strip()
+        and str(local_values.get(telegram_alias, "")).strip()
+    ):
+        local_values["HERMES_TELEGRAM_BOT_TOKEN"] = local_values[telegram_alias]
+    local_values.pop(telegram_alias, None)
     allowed_upgrade_imports = (
         set(contract.REQUIRED_OPERATOR_ENV_KEYS)
-        - set(contract.LOCAL_ONLY_OPERATOR_INPUT_KEYS)
-    ) | NOTION_UPGRADE_IMPORT_KEYS
+        | set(contract.OPTIONAL_OPERATOR_INPUT_KEYS)
+    ) - set(contract.LOCAL_ONLY_OPERATOR_INPUT_KEYS) | NOTION_UPGRADE_IMPORT_KEYS
     upgrade_imports = {
         key: value
         for key, value in local_values.items()
-        if key in allowed_upgrade_imports and value
+        if key in allowed_upgrade_imports
     }
     sync(cfg, render_projections=False)
     script = remote_script(cfg, "server-config.py")
@@ -1924,464 +1612,6 @@ def ensure_config_initialized(cfg: dict[str, Any]) -> None:
     ssh(cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-secrets.py'))} init")
     ssh(cfg, f"python3 {shlex.quote(script)} render")
     ssh(cfg, f"python3 {shlex.quote(script)} audit")
-
-
-def deploy_components(
-    cfg: dict[str, Any],
-    selected: list[str] | None,
-    *,
-    no_wait: bool = False,
-) -> None:
-    ordered = component_order(cfg, selected)
-    managed = [row["id"] for row in ordered if row.get("compose")]
-    if not managed:
-        raise PlatformError("no Dokploy-managed components selected")
-    sync(cfg)
-    ssh(cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-secrets.py'))} init")
-    ssh(cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} render")
-    ssh(cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} audit")
-    command = ["python3", remote_script(cfg, "server-dokploy.py"), "deploy", *managed]
-    if no_wait:
-        command.append("--no-wait")
-    ssh(cfg, " ".join(shlex.quote(item) for item in command))
-
-
-def write_index_evidence(payload: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.chmod(0o600)
-    temporary.replace(path)
-    path.chmod(0o600)
-
-
-def source_rollback_evidence(
-    status: str,
-    *,
-    error_type: str = "",
-    live_mutation_possible: bool,
-) -> dict[str, str]:
-    """Describe source restoration without overstating live-service recovery."""
-
-    result = {
-        "status": status,
-        "scope": "governed-source-tree",
-    }
-    if error_type:
-        result["errorType"] = error_type
-    if live_mutation_possible:
-        result.update(
-            {
-                "coverage": "source-only",
-                "serviceRollback": "not-performed",
-                "liveServiceState": "may-have-mutated",
-                "recovery": "roll-forward-required",
-            }
-        )
-    return result
-
-
-def authoritative_source_rollback_evidence(
-    result: dict[str, Any], *, live_mutation_possible: bool
-) -> dict[str, str]:
-    """Translate a validated remote result without overstating recovery."""
-
-    action = result.get("action")
-    if action in {"rolledBack", "alreadyRolledBack"}:
-        evidence = source_rollback_evidence(
-            "completed", live_mutation_possible=live_mutation_possible
-        )
-        evidence.update(
-            {
-                "authoritativeState": "rolled-back",
-                "remoteAction": str(action),
-            }
-        )
-        return evidence
-    if action == "notCurrent" and result.get("current") is False:
-        evidence = source_rollback_evidence(
-            "not-required", live_mutation_possible=live_mutation_possible
-        )
-        evidence.update(
-            {
-                "authoritativeState": "not-current",
-                "remoteAction": "notCurrent",
-            }
-        )
-        return evidence
-    raise PlatformError("remote rollback result is not authoritative")
-
-
-def best_effort_transaction_failure(
-    transaction: DeployTransaction,
-    *,
-    failed_step: str,
-    live_mutation_possible: bool,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Attempt the failure checkpoint and rollback as independent phases."""
-
-    try:
-        transaction.checkpoint("failed", completed_step="", next_step=failed_step)
-        checkpoint_evidence = {"status": "completed"}
-    except BaseException as exc:
-        checkpoint_evidence = {
-            "status": "failed",
-            "errorType": type(exc).__name__,
-        }
-
-    try:
-        rollback_result = transaction.rollback()
-        rollback_evidence = authoritative_source_rollback_evidence(
-            rollback_result,
-            live_mutation_possible=live_mutation_possible,
-        )
-    except BaseException as exc:
-        rollback_evidence = source_rollback_evidence(
-            "failed",
-            error_type=type(exc).__name__,
-            live_mutation_possible=live_mutation_possible,
-        )
-    return checkpoint_evidence, rollback_evidence
-
-
-def no_mutation_rollback_evidence() -> dict[str, str]:
-    return {
-        "status": "not-required",
-        "scope": "none",
-        "releaseMutation": "none",
-        "serviceMutation": "none",
-        "recovery": "safe-after-gate-remediation",
-    }
-
-
-def _resume_evidence(value: str) -> Path:
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = local_evidence_root() / f"deploy-all-{value}.json"
-    candidate = candidate.resolve()
-    allowed = local_evidence_root().resolve()
-    if allowed not in candidate.parents or not candidate.is_file():
-        raise PlatformError("resume evidence is missing or outside .runtime/evidence")
-    return candidate
-
-
-def deploy_all(args: argparse.Namespace) -> None:
-    global ACTIVE_DEPLOY_TRANSACTION
-    if args.components:
-        raise PlatformError("deploy --all does not accept component names")
-    if args.no_wait:
-        raise PlatformError(
-            "deploy --all requires health-gated waits between indexed steps"
-        )
-    cfg = config(args.domain)
-    ensure_safe_target(cfg)
-    started = datetime.now(timezone.utc)
-    preliminary_run_id = started.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
-    try:
-        license_gate = pre_mutation_license_gate(cfg)
-    except PreMutationGateError as exc:
-        # This is the only artifact permitted on a failed pre-mutation gate.
-        # No source normalization, release snapshot, lock, sync, promotion, or
-        # remote mutation has happened at this point.
-        evidence_path = local_evidence_root() / f"deploy-all-{preliminary_run_id}.json"
-        write_index_evidence(
-            {
-                "apiVersion": "micro-task-engine/v1alpha1",
-                "kind": "PlatformDeployRun",
-                "runId": preliminary_run_id,
-                "attempt": 1,
-                "target": host_spec(cfg)["ssh"],
-                "domain": cfg["spec"]["resolvedDomain"] or None,
-                "startedAt": started.isoformat(),
-                "finishedAt": datetime.now(timezone.utc).isoformat(),
-                "status": "failed",
-                "failedStep": "license-preflight",
-                "errorType": type(exc).__name__,
-                "failureCode": exc.code,
-                "licenseGate": exc.result,
-                "steps": [],
-                "rollback": no_mutation_rollback_evidence(),
-            },
-            evidence_path,
-        )
-        raise
-
-    resume_value = str(getattr(args, "resume", "") or "")
-    if resume_value:
-        evidence_path = _resume_evidence(resume_value)
-        evidence = json.loads(evidence_path.read_text())
-        if (
-            evidence.get("kind") != "PlatformDeployRun"
-            or evidence.get("status") not in {"failed", "interrupted"}
-            or evidence.get("target") != host_spec(cfg)["ssh"]
-            or evidence.get("domain") != (cfg["spec"]["resolvedDomain"] or None)
-            or not (
-                evidence.get("rollback", {}).get("status") == "completed"
-                or (
-                    evidence.get("rollback", {}).get("status") == "not-required"
-                    and evidence.get("rollback", {}).get("authoritativeState")
-                    == "not-current"
-                )
-            )
-        ):
-            raise PlatformError("deploy evidence is not safe to resume")
-        run_id = str(evidence.get("runId") or "")
-        attempt = int(evidence.get("attempt") or 1) + 1
-        evidence["steps"] = [
-            row for row in evidence.get("steps", []) if row.get("status") == "completed"
-        ]
-        evidence.update(
-            {
-                "attempt": attempt,
-                "resumedAt": started.isoformat(),
-                "status": "running",
-                "licenseGate": license_gate,
-            }
-        )
-        evidence.pop("failedStep", None)
-        evidence.pop("finishedAt", None)
-        evidence.pop("rollback", None)
-    else:
-        run_id = preliminary_run_id
-        attempt = 1
-        evidence_path = local_evidence_root() / f"deploy-all-{run_id}.json"
-        evidence = {
-            "apiVersion": "micro-task-engine/v1alpha1",
-            "kind": "PlatformDeployRun",
-            "runId": run_id,
-            "attempt": attempt,
-            "target": host_spec(cfg)["ssh"],
-            "domain": cfg["spec"]["resolvedDomain"] or None,
-            "startedAt": started.isoformat(),
-            "status": "running",
-            "licenseGate": license_gate,
-            "steps": [],
-        }
-
-    snapshot = ReleaseSnapshot(cfg, run_id)
-    transaction = DeployTransaction(
-        cfg,
-        snapshot,
-        run_id,
-        attempt=attempt,
-        release_id=str(evidence.get("releaseId") or "") or None,
-    )
-    if evidence.get("sourceSha256") not in {None, snapshot.source_sha256}:
-        snapshot.close()
-        raise PlatformError("resume source differs from the frozen release")
-    evidence.update(
-        {
-            "releaseId": transaction.release_id,
-            "activationId": transaction.activation_id,
-            "sourceSha256": snapshot.source_sha256,
-            "sourceManifestSha256": hashlib.sha256(
-                snapshot.manifest_path.read_bytes()
-            ).hexdigest(),
-            "remoteCheckpoint": f"{remote_root(cfg)}/.deploy/runs/{run_id}.json",
-            "rollbackScope": "governed-source-tree",
-        }
-    )
-    write_index_evidence(evidence, evidence_path)
-
-    def step_args(**values: Any) -> argparse.Namespace:
-        return argparse.Namespace(domain=args.domain, **values)
-
-    actions = {
-        "config-initialize": lambda: ensure_config_initialized(cfg),
-        "config-render": lambda: run_config(cfg, "render"),
-        "config-audit": lambda: run_config(cfg, "audit"),
-        "bootstrap": lambda: finish_platform_bootstrap(cfg),
-        "toolhive-binary": lambda: run_tools(cfg, "install"),
-        "dokploy-foundation": lambda: deploy_components(cfg, ["postgres"]),
-        "application-databases": lambda: run_application_databases(cfg),
-        "dokploy-components": lambda: deploy_components(cfg, None),
-        "paperclip-runtime-config": lambda: run_paperclip_runtime(
-            cfg, "config-migrate"
-        ),
-        "paperclip-runtime": lambda: run_paperclip_runtime(cfg, "install"),
-        "profiles": lambda: apply_profiles(cfg),
-        "paperclip-environments": lambda: run_paperclip_experimental(
-            cfg, "environments", "apply"
-        ),
-        "paperclip-secrets": lambda: run_paperclip_experimental(
-            cfg, "secrets", "apply"
-        ),
-        "provision": lambda: run_provision(cfg, "provision"),
-        "provision-idempotency": lambda: run_provision(cfg, "verify"),
-        "data-content-projections": lambda: run_data_content_projections(
-            cfg, "provision"
-        ),
-        "kestra-control": lambda: run_kestra_control(cfg, "provision"),
-        "tool-bundles": lambda: run_tools(cfg, "provision"),
-        "tool-bundles-idempotency": lambda: run_tools(cfg, "verify"),
-        "daytona": lambda: run_paperclip_experimental(cfg, "daytona", "apply"),
-        "harness-auth": lambda: run_harness_auth(cfg, "status"),
-        "hermes": lambda: run_hermes(cfg, "install"),
-        "kestra-e2e-canary": lambda: run_kestra_canary(cfg, "apply"),
-        "profile-acceptance": lambda: run_profile_acceptance(cfg),
-        "integration-canaries": lambda: run_integration_canaries(cfg, "run", []),
-        "hermes-acceptance": lambda: run_hermes_acceptance(cfg),
-        "host-dokploy-acceptance": lambda: run_host_dokploy_acceptance(cfg),
-        "observability-reconcile-pass-1": lambda: run_observability_producer(
-            cfg, "reconcile-pass-1"
-        ),
-        "observability-reconcile-pass-2": lambda: run_observability_producer(
-            cfg, "reconcile-pass-2"
-        ),
-        "observability-idempotency": lambda: run_observability_producer(
-            cfg, "idempotency"
-        ),
-        "observability-acceptance": lambda: run_observability_producer(
-            cfg, "acceptance"
-        ),
-        "cloudflare-plan": lambda: run_cloudflare(cfg, "plan"),
-        "cloudflare-apply": lambda: run_cloudflare(cfg, "apply"),
-        "cloudflare-origin-firewall": lambda: run_origin_firewall(cfg),
-        "post-cloudflare-evidence-rebind": lambda: run_final_evidence_rebind(cfg),
-        "cloudflare-acceptance": lambda: run_cloudflare(cfg, "acceptance"),
-        "connections": lambda: cmd_connections(step_args(action="check")),
-        "verify": lambda: cmd_verify(step_args(components=[])),
-    }
-    completed = {
-        str(row.get("id"))
-        for row in evidence["steps"]
-        if row.get("status") == "completed"
-    }
-    ACTIVE_DEPLOY_TRANSACTION = transaction
-    remote_mutation_started = False
-    try:
-        with remote_deploy_lock(cfg):
-            locked_license_gate = pre_mutation_license_gate(cfg)
-            if locked_license_gate != license_gate:
-                raise PreMutationGateError(
-                    "license_preflight_changed_during_lock", locked_license_gate
-                )
-            evidence["licenseGate"] = locked_license_gate
-            write_index_evidence(evidence, evidence_path)
-            remote_mutation_started = True
-            # The host step is the sole prerequisite for rsync, Python, and
-            # the immutable release helper on a clean Ubuntu server.
-            run_host_bootstrap(
-                cfg,
-                source=snapshot.source / "steps/10-host.sh",
-            )
-            transaction.ensure_synced()
-            remove_legacy_patch_projection(cfg)
-            pending = [step for step in FULL_DEPLOY_STEPS if step not in completed]
-            transaction.checkpoint("running", next_step=pending[0] if pending else "")
-            for index, step in enumerate(FULL_DEPLOY_STEPS, start=1):
-                if step in completed:
-                    continue
-                transaction.verify()
-                row: dict[str, Any] = {
-                    "index": index,
-                    "attempt": attempt,
-                    "id": step,
-                    "status": "running",
-                    "startedAt": datetime.now(timezone.utc).isoformat(),
-                }
-                evidence["steps"].append(row)
-                write_index_evidence(evidence, evidence_path)
-                tick = time.monotonic()
-                try:
-                    actions[step]()
-                    transaction.verify()
-                except BaseException as exc:
-                    row.update(
-                        {
-                            "status": "failed",
-                            "finishedAt": datetime.now(timezone.utc).isoformat(),
-                            "durationSeconds": round(time.monotonic() - tick, 3),
-                            "errorType": type(exc).__name__,
-                        }
-                    )
-                    evidence["status"] = "failed"
-                    evidence["failedStep"] = step
-                    evidence["finishedAt"] = datetime.now(timezone.utc).isoformat()
-                    (
-                        evidence["failureCheckpoint"],
-                        evidence["rollback"],
-                    ) = best_effort_transaction_failure(
-                        transaction,
-                        failed_step=step,
-                        live_mutation_possible=True,
-                    )
-                    write_index_evidence(evidence, evidence_path)
-                    raise
-                row.update(
-                    {
-                        "status": "completed",
-                        "finishedAt": datetime.now(timezone.utc).isoformat(),
-                        "durationSeconds": round(time.monotonic() - tick, 3),
-                    }
-                )
-                completed.add(step)
-                remaining = [
-                    item for item in FULL_DEPLOY_STEPS if item not in completed
-                ]
-                transaction.checkpoint(
-                    "running",
-                    completed_step=step,
-                    next_step=remaining[0] if remaining else "",
-                )
-                write_index_evidence(evidence, evidence_path)
-
-            transaction.checkpoint("completed", completed_step=FULL_DEPLOY_STEPS[-1])
-            evidence["status"] = "completed"
-            evidence["finishedAt"] = datetime.now(timezone.utc).isoformat()
-            evidence["rollback"] = {
-                "status": "not-required",
-                "scope": "governed-source-tree",
-            }
-            write_index_evidence(evidence, evidence_path)
-    except BaseException as exc:
-        if evidence.get("status") != "failed":
-            gate_failure = isinstance(exc, PreMutationGateError)
-            evidence.update(
-                {
-                    "status": "failed",
-                    "failedStep": (
-                        "license-preflight"
-                        if gate_failure
-                        else "transaction-preparation"
-                    ),
-                    "finishedAt": datetime.now(timezone.utc).isoformat(),
-                    "errorType": type(exc).__name__,
-                }
-            )
-            if gate_failure:
-                evidence["failureCode"] = exc.code
-                evidence["licenseGate"] = exc.result
-                evidence["rollback"] = no_mutation_rollback_evidence()
-            else:
-                (
-                    evidence["failureCheckpoint"],
-                    evidence["rollback"],
-                ) = best_effort_transaction_failure(
-                    transaction,
-                    failed_step=str(evidence["failedStep"]),
-                    live_mutation_possible=remote_mutation_started,
-                )
-            write_index_evidence(evidence, evidence_path)
-        raise
-    finally:
-        ACTIVE_DEPLOY_TRANSACTION = None
-        if remote_mutation_started:
-            transaction.cleanup()
-        snapshot.close()
-    print(
-        json.dumps({"deployAll": "completed", "evidence": str(evidence_path)}, indent=2)
-    )
-
-
-def cmd_deploy(args: argparse.Namespace) -> None:
-    if args.all:
-        deploy_all(args)
-        return
-    if getattr(args, "resume", None):
-        raise PlatformError("deploy --resume requires --all")
-    cfg = config(args.domain)
-    deploy_components(cfg, args.components or None, no_wait=args.no_wait)
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -2404,8 +1634,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     ssh(cfg, f"python3 {shlex.quote(remote_script(cfg, 'server-verify.py'))} status")
 
 
-def cmd_connections(args: argparse.Namespace) -> None:
-    registry = load_yaml(CONNECTIONS_PATH)
+def cmd_acceptance(args: argparse.Namespace) -> None:
+    registry = load_yaml(ACCEPTANCE_REQUIREMENTS_PATH)
     if args.action == "export":
         print(json.dumps(registry, indent=2))
         return
@@ -2413,13 +1643,13 @@ def cmd_connections(args: argparse.Namespace) -> None:
     sync(cfg)
     ssh(
         cfg,
-        f"python3 {shlex.quote(remote_script(cfg, 'server-verify.py'))} connections",
+        f"python3 {shlex.quote(remote_script(cfg, 'server-verify.py'))} acceptance",
     )
 
 
 def run_paperclip_runtime(cfg: dict[str, Any], action: str) -> None:
     sync(cfg)
-    step = remote_step(cfg, "50-paperclip.sh")
+    step = remote_step(cfg, "paperclip.sh")
     ssh(cfg, f"{shlex.quote(step)} {shlex.quote(action)}")
 
 
@@ -2520,7 +1750,7 @@ def run_paperclip_experimental(cfg: dict[str, Any], feature: str, action: str) -
         reconcile(action)
         return
 
-    step = remote_step(cfg, "60-daytona.sh")
+    step = remote_step(cfg, "daytona.sh")
     if action == "status":
         ssh(cfg, f"{shlex.quote(step)} status")
         merge_paperclip_experimental_inputs(cfg, feature)
@@ -2528,30 +1758,25 @@ def run_paperclip_experimental(cfg: dict[str, Any], feature: str, action: str) -
         return
 
     if action == "apply":
-        # The Daytona SDK used to build snapshots is installed by Paperclip's
-        # official Daytona plugin.  Establish the control plane and its key
-        # first, install/enable the plugin second, and only then build and
-        # exercise the custom snapshots.  This ordering is intentionally
-        # explicit: ``60-daytona.sh all`` is control-plane-only and cannot
-        # accidentally reintroduce the former bootstrap cycle.
-        for step_action in ("install", "provision-key", "set-target"):
+        # Paperclip's native plugin package (and Daytona SDK) is installed by
+        # the ordinary Paperclip deployment. Build the named snapshots before
+        # reconciling an environment that requires their readiness flags.
+        for step_action in ("install", "set-target"):
             ssh(cfg, f"{shlex.quote(step)} {step_action}")
         render_canonical_source()
-        merge_paperclip_experimental_inputs(cfg, feature)
+        ssh(cfg, f"{shlex.quote(step)} images")
 
-        # First apply installs/enables the native plugin and creates the
-        # environment with the pinned base image. Runtime probes are reserved
-        # for the explicit verify after the snapshot is available.
-        reconcile("apply")
-        ssh(cfg, f"{shlex.quote(step)} acceptance")
-
-        # Snapshot readiness is merged into canonical platform.env by the
-        # acceptance step. Re-render, bind Paperclip to that exact snapshot,
-        # then run the real per-harness environment probes.
+        # Snapshot creation atomically merges readiness into canonical config.
+        # Render before the first environment reconcile so it cannot observe a
+        # missing snapshot or stale projection.
         render_canonical_source()
+        merge_paperclip_experimental_inputs(cfg, feature)
         reconcile("apply")
+        ssh(cfg, f"{shlex.quote(step)} lifecycle")
+        ssh(cfg, f"{shlex.quote(step)} verify")
         reconcile("verify")
         require_daytona_dependencies(cfg)
+        run_paperclip_runtime(cfg, "verify")
         return
 
     if action == "verify":
@@ -2561,6 +1786,7 @@ def run_paperclip_experimental(cfg: dict[str, Any], feature: str, action: str) -
         render_canonical_source()
         reconcile("verify")
         require_daytona_dependencies(cfg)
+        run_paperclip_runtime(cfg, "verify")
         return
 
     raise PlatformError(f"unsupported Daytona action: {action}")
@@ -2577,15 +1803,18 @@ def run_kestra_canary(cfg: dict[str, Any], action: str) -> None:
     runner_name = str(e2e.get("runner", "server-e2e-canary.py"))
     if Path(runner_name).name != runner_name or not runner_name.endswith(".py"):
         raise PlatformError("e2eCanary.runner must be a Python basename")
-    runner = (
-        ACTIVE_DEPLOY_TRANSACTION.snapshot.source / "bin" / runner_name
-        if ACTIVE_DEPLOY_TRANSACTION is not None
-        else TOOL_ROOT / runner_name
-    )
+    runner = TOOL_ROOT / runner_name
     if not runner.is_file():
         raise PlatformError(
             f"E2E canary runner is not present yet: {runner}; "
             "the dedicated flow implementation must provide it"
+        )
+    if action == "apply":
+        # The canary creates a coding sandbox. Its admission is derived from
+        # the deploy policy, so E2E capacity cannot drift into six extra
+        # operator-configurable thresholds.
+        run_resource_preflight(
+            cfg, "daytona-e2e", values=operator_values(required=True)
         )
     sync(cfg)
     merge_paperclip_experimental_inputs(cfg, "e2e")
@@ -2612,6 +1841,12 @@ def run_kestra_canary(cfg: dict[str, Any], action: str) -> None:
         + " ".join(shlex.quote(item) for item in command)
     )
     ssh(cfg, verified_command)
+
+
+def run_kestra_canary_acceptance(cfg: dict[str, Any]) -> None:
+    """Produce E2E evidence, then independently verify that exact evidence."""
+    run_kestra_canary(cfg, "apply")
+    run_kestra_canary(cfg, "verify")
 
 
 def cmd_kestra_canary(args: argparse.Namespace) -> None:
@@ -2691,43 +1926,57 @@ def run_hermes_acceptance(cfg: dict[str, Any]) -> None:
     run_canonical_hash_bound(cfg, ["/opt/mte-hermes/bin/acceptance-canary"])
 
 
-def run_host_dokploy_acceptance(cfg: dict[str, Any]) -> None:
+def run_observability_acceptance(cfg: dict[str, Any]) -> None:
+    """Atomically produce fresh, hash-bound live observability evidence."""
+    sync(cfg)
     expected = canonical_source_sha256(cfg)
-    run_canonical_hash_bound(
-        cfg,
-        [
-            "python3",
-            remote_script(cfg, "server-host-dokploy-acceptance.py"),
-            "apply",
-            "--expected-source-hash",
-            expected,
-        ],
-    )
-
-
-def run_observability_producer(cfg: dict[str, Any], action: str) -> None:
-    expected = canonical_source_sha256(cfg)
+    producer = remote_script(cfg, "server-observability-canary.py")
+    lock = f"{remote_root(cfg)}/evidence/.observability-acceptance.lock"
     command = [
-        "python3",
-        remote_script(cfg, "server-observability-canary.py"),
+        "sh",
+        "-c",
+        "set -eu; umask 077; mkdir -p "
+        + shlex.quote(str(Path(lock).parent))
+        + "; lock="
+        + shlex.quote(lock)
+        + '; : > "$lock"; chmod 0600 "$lock"; exec 9>"$lock"; flock -x 9; '
+        + "; ".join(
+            " ".join(shlex.quote(item) for item in items)
+            for items in (
+                [
+                    "python3",
+                    producer,
+                    "reconcile-pass",
+                    "--pass-number",
+                    "1",
+                    "--expected-source-hash",
+                    expected,
+                ],
+                [
+                    "python3",
+                    producer,
+                    "reconcile-pass",
+                    "--pass-number",
+                    "2",
+                    "--expected-source-hash",
+                    expected,
+                ],
+                [
+                    "python3",
+                    producer,
+                    "finalize-idempotency",
+                    "--expected-source-hash",
+                    expected,
+                ],
+                ["python3", producer, "apply", "--expected-source-hash", expected],
+            )
+        ),
     ]
-    if action.startswith("reconcile-pass-"):
-        command.extend(
-            [
-                "reconcile-pass",
-                "--expected-source-hash",
-                expected,
-                "--pass-number",
-                action.rsplit("-", 1)[-1],
-            ]
-        )
-    elif action == "idempotency":
-        command.extend(["finalize-idempotency", "--expected-source-hash", expected])
-    elif action == "acceptance":
-        command.extend(["apply", "--expected-source-hash", expected])
-    else:
-        raise PlatformError(f"unknown observability producer action: {action}")
     run_canonical_hash_bound(cfg, command)
+
+
+def cmd_observability_acceptance(args: argparse.Namespace) -> None:
+    run_observability_acceptance(config(args.domain))
 
 
 def run_final_evidence_rebind(cfg: dict[str, Any]) -> None:
@@ -2741,18 +1990,18 @@ def run_final_evidence_rebind(cfg: dict[str, Any]) -> None:
     run_config(cfg, "audit")
     run_provision(cfg, "verify")
     run_tools(cfg, "verify")
-    run_kestra_canary(cfg, "apply")
+    run_kestra_canary_acceptance(cfg)
     run_profile_acceptance(cfg)
     run_integration_canaries(cfg, "run", [])
     run_hermes_acceptance(cfg)
-    run_host_dokploy_acceptance(cfg)
-    for action in (
-        "reconcile-pass-1",
-        "reconcile-pass-2",
-        "idempotency",
-        "acceptance",
-    ):
-        run_observability_producer(cfg, action)
+    run_observability_acceptance(cfg)
+    # Keep the create/update/archive proof adjacent to its final consumers. The
+    # verifier deliberately rejects evidence older than ten minutes.
+    run_notion_projection(cfg, "canary")
+
+
+def cmd_evidence_rebind(args: argparse.Namespace) -> None:
+    run_final_evidence_rebind(config(args.domain))
 
 
 def run_integration_canaries(
@@ -2761,16 +2010,12 @@ def run_integration_canaries(
     """Run only the exact integration-canary producer synchronized by this source."""
     if action == "status" and canary_ids:
         raise PlatformError("integration-canaries status does not accept canary IDs")
-    supported = {"C013", "C023", "C024", "C027", "C028", "C029", "C030"}
+    supported = {"C023", "C024", "C027", "C029", "C030"}
     unknown = sorted(set(canary_ids) - supported)
     if unknown:
         raise PlatformError(f"unknown integration canary IDs: {', '.join(unknown)}")
     sync(cfg)
-    local = (
-        ACTIVE_DEPLOY_TRANSACTION.snapshot.source / "bin/server-integration-canaries.py"
-        if ACTIVE_DEPLOY_TRANSACTION is not None
-        else TOOL_ROOT / "server-integration-canaries.py"
-    )
+    local = TOOL_ROOT / "server-integration-canaries.py"
     expected = hashlib.sha256(local.read_bytes()).hexdigest()
     remote = remote_script(cfg, local.name)
     command = (
@@ -2841,20 +2086,6 @@ def run_provision(cfg: dict[str, Any], action: str) -> None:
                 command_text(
                     ["python3", remote_script(cfg, "server-provision.py"), action]
                 ),
-                command_text(
-                    [
-                        "python3",
-                        remote_script(cfg, "server-activepieces-provision-verify.py"),
-                        "provision",
-                    ]
-                ),
-                command_text(
-                    [
-                        "python3",
-                        remote_script(cfg, "server-activepieces-provision-verify.py"),
-                        "provision",
-                    ]
-                ),
             ]
         )
     else:
@@ -2869,13 +2100,6 @@ def run_provision(cfg: dict[str, Any], action: str) -> None:
             [
                 command_text(
                     ["python3", remote_script(cfg, "server-provision.py"), action]
-                ),
-                command_text(
-                    [
-                        "python3",
-                        remote_script(cfg, "server-activepieces-provision-verify.py"),
-                        action,
-                    ]
                 ),
             ]
         )
@@ -2919,6 +2143,19 @@ def run_data_content_projections(cfg: dict[str, Any], action: str) -> None:
             resolved_data_content(cfg), action
         )
     ]
+    # Provisioning is a deploy reconciliation gate, not merely an installer.
+    # Run the consumer's own verification immediately after convergence so a
+    # successful deployment step always leaves fresh evidence bound to both
+    # the canonical environment and the synchronized producer source.  The
+    # final platform verification still repeats this check after all later
+    # deployment steps.
+    if action == "provision":
+        commands.extend(
+            ["python3", remote_script(cfg, script), projection_action]
+            for script, projection_action in contract.projection_consumer_commands(
+                resolved_data_content(cfg), "verify"
+            )
+        )
     if not commands:
         return
     ssh(
@@ -2931,7 +2168,7 @@ def run_data_content_projections(cfg: dict[str, Any], action: str) -> None:
 
 
 def run_notion_projection(cfg: dict[str, Any], action: str) -> None:
-    if action not in {"provision", "drain", "status", "verify"}:
+    if action not in {"provision", "drain", "status", "verify", "canary"}:
         raise PlatformError("unsupported Notion projection action")
     sync(cfg)
     command = [
@@ -2939,7 +2176,10 @@ def run_notion_projection(cfg: dict[str, Any], action: str) -> None:
         remote_script(cfg, "server-notion-sync.py"),
         action,
     ]
-    ssh(cfg, " ".join(shlex.quote(item) for item in command))
+    if action == "canary":
+        run_canonical_hash_bound(cfg, command)
+    else:
+        ssh(cfg, " ".join(shlex.quote(item) for item in command))
 
 
 def cmd_notion_projection(args: argparse.Namespace) -> None:
@@ -3031,12 +2271,18 @@ print(json.dumps({'ok': True, 'canonicalRefsChecked': len(required)}))
     )
 
 
-def run_hermes(cfg: dict[str, Any], action: str, *, purge_data: bool = False) -> None:
+def run_hermes(
+    cfg: dict[str, Any],
+    action: str,
+    *,
+    purge_data: bool = False,
+    grant_platform_admin: bool = False,
+) -> None:
     sync(cfg)
     if action in {"preflight", "install", "health"}:
         merge_hermes_inputs(cfg)
     command = ["python3", remote_script(cfg, "server-hermes.py"), action]
-    if action == "install":
+    if action == "install" and grant_platform_admin:
         command.append("--grant-platform-admin")
     if action == "remove" and purge_data:
         command.append("--purge-data")
@@ -3045,7 +2291,17 @@ def run_hermes(cfg: dict[str, Any], action: str, *, purge_data: bool = False) ->
 
 def cmd_hermes(args: argparse.Namespace) -> None:
     cfg = config(args.domain)
-    run_hermes(cfg, args.action, purge_data=args.purge_data)
+    if args.grant_platform_admin and args.action != "install":
+        raise SystemExit("--grant-platform-admin is valid only with hermes install")
+    if args.action == "acceptance":
+        run_hermes_acceptance(cfg)
+        return
+    run_hermes(
+        cfg,
+        args.action,
+        purge_data=args.purge_data,
+        grant_platform_admin=args.grant_platform_admin,
+    )
 
 
 def render_cloudflare_remote(cfg: dict[str, Any], output: str) -> None:
@@ -3172,18 +2428,93 @@ def tofu_command(iac_root: str, api_env: str, *arguments: str) -> str:
     return " ".join(shlex.quote(item) for item in command)
 
 
+def cloudflare_dns_command(
+    cfg: dict[str, Any], iac_root: str, api_env: str, action: str
+) -> str:
+    if action not in {"apply", "verify"}:
+        raise PlatformError(f"unsupported Cloudflare DNS action: {action}")
+    secret_root = str(host_spec(cfg)["secretsRoot"])
+    tunnel_id = tofu_command(iac_root, api_env, "output", "-raw", "tunnel_id")
+    arguments = [
+        "python3",
+        remote_script(cfg, "server-cloudflare-dns.py"),
+        action,
+        "--env-file",
+        f"{secret_root}/platform.env",
+        "--tfvars",
+        f"{iac_root}/terraform.tfvars.json",
+        "--tunnel-id",
+        '"$tunnel_id"',
+        "--output",
+        f"{remote_root(cfg)}/evidence/cloudflare-dns-reconcile.json",
+    ]
+    reconcile = " ".join(
+        item if item == '"$tunnel_id"' else shlex.quote(item) for item in arguments
+    )
+    return f'tunnel_id=$({tunnel_id}); test -n "$tunnel_id"; {reconcile}'
+
+
+def cloudflare_access_command(
+    cfg: dict[str, Any], iac_root: str, api_env: str, action: str
+) -> str:
+    if action not in {"apply", "verify"}:
+        raise PlatformError(f"unsupported Cloudflare Access action: {action}")
+    secret_root = str(host_spec(cfg)["secretsRoot"])
+    human_policy_id_json = tofu_command(
+        iac_root, api_env, "output", "-json", "human_access_policy_id"
+    )
+    service_policy_ids_json = tofu_command(
+        iac_root, api_env, "output", "-json", "service_access_policy_ids"
+    )
+    arguments = [
+        "python3",
+        remote_script(cfg, "server-cloudflare-access.py"),
+        action,
+        "--env-file",
+        f"{secret_root}/platform.env",
+        "--tfvars",
+        f"{iac_root}/terraform.tfvars.json",
+        "--human-policy-id-json",
+        '"$human_policy_id_json"',
+        "--service-policy-ids-json",
+        '"$service_policy_ids_json"',
+        "--output",
+        f"{remote_root(cfg)}/evidence/cloudflare-access-reconcile.json",
+    ]
+    reconcile = " ".join(
+        item
+        if item in {'"$human_policy_id_json"', '"$service_policy_ids_json"'}
+        else shlex.quote(item)
+        for item in arguments
+    )
+    return (
+        f"human_policy_id_json=$({human_policy_id_json}); "
+        'test -n "$human_policy_id_json"; '
+        f"service_policy_ids_json=$({service_policy_ids_json}); "
+        'test -n "$service_policy_ids_json"; ' + reconcile
+    )
+
+
+def cloudflare_edge_command(
+    cfg: dict[str, Any], iac_root: str, api_env: str, action: str
+) -> str:
+    """Apply or verify Access before publishing the matching DNS records."""
+
+    return "; ".join(
+        [
+            cloudflare_access_command(cfg, iac_root, api_env, action),
+            cloudflare_dns_command(cfg, iac_root, api_env, action),
+        ]
+    )
+
+
 def run_cloudflare(cfg: dict[str, Any], action: str) -> None:
     if action == "origin-firewall":
         run_origin_firewall(cfg)
         return
     if action == "acceptance":
         sync(cfg)
-        local = (
-            ACTIVE_DEPLOY_TRANSACTION.snapshot.source
-            / "bin/server-cloudflare-acceptance.py"
-            if ACTIVE_DEPLOY_TRANSACTION is not None
-            else TOOL_ROOT / "server-cloudflare-acceptance.py"
-        )
+        local = TOOL_ROOT / "server-cloudflare-acceptance.py"
         remote = remote_script(cfg, local.name)
         expected = hashlib.sha256(local.read_bytes()).hexdigest()
         target_host = host_spec(cfg)["ssh"].rsplit("@", 1)[-1]
@@ -3252,7 +2583,7 @@ def run_cloudflare(cfg: dict[str, Any], action: str) -> None:
         return
     if action in {"status", "verify"}:
         sync(cfg)
-        step = remote_step(cfg, "90-cloudflare-tunnel.sh")
+        step = remote_step(cfg, "cloudflare-tunnel.sh")
         ssh(cfg, f"{shlex.quote(step)} {shlex.quote(action)}")
         if action == "status":
             return
@@ -3268,7 +2599,8 @@ def run_cloudflare(cfg: dict[str, Any], action: str) -> None:
             "-no-color",
             "-detailed-exitcode",
         )
-        ssh(cfg, f"test -s {shlex.quote(api_env)}; {plan}")
+        edge_verify = cloudflare_edge_command(cfg, iac_root, api_env, "verify")
+        ssh(cfg, f"set -eu; test -s {shlex.quote(api_env)}; {plan}; {edge_verify}")
         return
 
     cloudflare_preflight(cfg, require_ready=True)
@@ -3301,22 +2633,28 @@ def run_cloudflare(cfg: dict[str, Any], action: str) -> None:
         "/workspace/platform.tfplan",
     )
     tunnel_output = tofu_command(iac_root, api_env, "output", "-raw", "tunnel_token")
-    service_output = tofu_command(iac_root, api_env, "output", "-json", "service_token")
+    service_output = tofu_command(
+        iac_root, api_env, "output", "-json", "service_tokens"
+    )
+    edge_apply = cloudflare_edge_command(cfg, iac_root, api_env, "apply")
     ssh(
         cfg,
         "set -eu; umask 077; "
         + f"{apply}; "
+        + f"{edge_apply}; "
         + f"token_tmp=$(mktemp {shlex.quote(cloudflare_root + '/.tunnel-token.XXXXXX')}); "
         + f"service_tmp=$(mktemp {shlex.quote(cloudflare_root + '/.service-token.XXXXXX')}); "
         + 'trap \'rm -f "$token_tmp" "$service_tmp"\' EXIT; '
         + f'{tunnel_output} >"$token_tmp"; test -s "$token_tmp"; '
         + f'{service_output} >"$service_tmp"; test -s "$service_tmp"; '
         + f"python3 {shlex.quote(remote_script(cfg, 'server-cloudflare-runtime.py'))} upsert "
-        + '--tunnel-file "$token_tmp" --service-file "$service_tmp"; '
+        + '--tunnel-file "$token_tmp" --service-file "$service_tmp" '
+        + f"--tfvars {shlex.quote(iac_root + '/terraform.tfvars.json')}; "
         + f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} render; "
         + f"python3 {shlex.quote(remote_script(cfg, 'server-config.py'))} audit; "
-        + f"python3 {shlex.quote(remote_script(cfg, 'server-cloudflare-runtime.py'))} status; "
-        + f"{shlex.quote(remote_step(cfg, '90-cloudflare-tunnel.sh'))} install",
+        + f"python3 {shlex.quote(remote_script(cfg, 'server-cloudflare-runtime.py'))} status "
+        + f"--tfvars {shlex.quote(iac_root + '/terraform.tfvars.json')}; "
+        + f"{shlex.quote(remote_step(cfg, 'cloudflare-tunnel.sh'))} install",
     )
 
 
@@ -3324,6 +2662,8 @@ ORIGIN_FIREWALL_EVIDENCE_FIELDS = {
     "firewallPolicyVersion",
     "firewallServiceActive",
     "firewallServiceEnabled",
+    "firewallRecoveryTimerActive",
+    "firewallRecoveryTimerEnabled",
     "publicInterface",
     "publicInterfaceV4",
     "publicInterfaceV6",
@@ -3365,6 +2705,8 @@ def validate_origin_firewall_evidence(payload: Any) -> dict[str, Any]:
         in {
             "firewallServiceActive",
             "firewallServiceEnabled",
+            "firewallRecoveryTimerActive",
+            "firewallRecoveryTimerEnabled",
             "firewallSshCidrsEnforced",
             "udp443Blocked",
             "publicTcpDefaultDenied",
@@ -3399,7 +2741,7 @@ def run_origin_firewall(cfg: dict[str, Any]) -> None:
     """Install the origin default-deny policy and retain its redacted status."""
 
     sync(cfg)
-    step = remote_step(cfg, "91-origin-firewall.sh")
+    step = remote_step(cfg, "origin-firewall.sh")
     remote_evidence = f"{remote_root(cfg)}/evidence/cloudflare-origin-firewall.json"
     ssh(
         cfg,
@@ -3452,9 +2794,13 @@ def apply_profiles(cfg: dict[str, Any]) -> None:
     render_profiles()
     sync(cfg)
     bootstrap = f"{remote_root(cfg)}/evidence/paperclip-bootstrap.json"
+    config_script = remote_script(cfg, "server-config.py")
     remote = (
+        f"python3 {shlex.quote(config_script)} render >/dev/null && "
+        f"python3 {shlex.quote(config_script)} audit >/dev/null && "
         f"python3 {shlex.quote(remote_root(cfg) + '/runtime/paperclip/scripts/bootstrap-paperclip.py')} "
-        "--mode native --workspace-root /home/daytona/workspaces --instructions-root /prototype/profiles "
+        "--mode native --workspace-root /home/daytona/paperclip-workspace "
+        "--instructions-root /prototype/profiles "
         f"--output {shlex.quote(bootstrap)} && "
         f"docker cp {shlex.quote(bootstrap)} mte-paperclip:/data/bootstrap.json"
     )
@@ -3481,9 +2827,6 @@ def parser() -> argparse.ArgumentParser:
 
     plan = subs.add_parser("plan")
     plan.add_argument("components", nargs="*")
-    plan.add_argument(
-        "--all", action="store_true", help="show the indexed full-platform sequence"
-    )
     plan.set_defaults(func=cmd_plan)
 
     preflight = subs.add_parser("preflight")
@@ -3505,19 +2848,6 @@ def parser() -> argparse.ArgumentParser:
     )
     platform_config.set_defaults(func=cmd_config)
 
-    deploy = subs.add_parser("deploy")
-    deploy.add_argument("components", nargs="*")
-    deploy.add_argument("--no-wait", action="store_true")
-    deploy.add_argument(
-        "--all", action="store_true", help="run the indexed full-platform sequence"
-    )
-    deploy.add_argument(
-        "--resume",
-        metavar="RUN_ID_OR_EVIDENCE",
-        help="resume a failed, source-rolled-back full deployment",
-    )
-    deploy.set_defaults(func=cmd_deploy)
-
     verify = subs.add_parser("verify")
     verify.add_argument("components", nargs="*")
     verify.add_argument(
@@ -3528,9 +2858,9 @@ def parser() -> argparse.ArgumentParser:
     status = subs.add_parser("status")
     status.set_defaults(func=cmd_status)
 
-    connections = subs.add_parser("connections")
-    connections.add_argument("action", choices=["export", "check"])
-    connections.set_defaults(func=cmd_connections)
+    acceptance = subs.add_parser("acceptance")
+    acceptance.add_argument("action", choices=["export", "check"])
+    acceptance.set_defaults(func=cmd_acceptance)
 
     profiles = subs.add_parser("profiles")
     profiles.add_argument("action", choices=["render", "apply"])
@@ -3542,6 +2872,7 @@ def parser() -> argparse.ArgumentParser:
     paperclip.add_argument(
         "action",
         choices=[
+            "preflight",
             "config-migrate",
             "install",
             "status",
@@ -3572,6 +2903,12 @@ def parser() -> argparse.ArgumentParser:
     profile_acceptance.add_argument("action", choices=["verify"])
     profile_acceptance.set_defaults(func=cmd_profile_acceptance)
 
+    observability_acceptance = subs.add_parser("observability-acceptance")
+    observability_acceptance.set_defaults(func=cmd_observability_acceptance)
+
+    evidence_rebind = subs.add_parser("evidence-rebind")
+    evidence_rebind.set_defaults(func=cmd_evidence_rebind)
+
     integration_canaries = subs.add_parser("integration-canaries")
     integration_canaries.add_argument("action", choices=["run", "status"])
     integration_canaries.add_argument("canary_ids", nargs="*")
@@ -3583,7 +2920,7 @@ def parser() -> argparse.ArgumentParser:
 
     notion_projection = subs.add_parser("notion-projection")
     notion_projection.add_argument(
-        "action", choices=["apply", "drain", "status", "verify"]
+        "action", choices=["apply", "drain", "status", "verify", "canary"]
     )
     notion_projection.set_defaults(func=cmd_notion_projection)
 
@@ -3597,9 +2934,15 @@ def parser() -> argparse.ArgumentParser:
 
     hermes = subs.add_parser("hermes")
     hermes.add_argument(
-        "action", choices=["preflight", "install", "status", "health", "remove"]
+        "action",
+        choices=["preflight", "install", "status", "health", "acceptance", "remove"],
     )
     hermes.add_argument("--purge-data", action="store_true")
+    hermes.add_argument(
+        "--grant-platform-admin",
+        action="store_true",
+        help="explicitly enable unrestricted Hermes host repair during install",
+    )
     hermes.set_defaults(func=cmd_hermes)
 
     cloudflare = subs.add_parser("cloudflare")

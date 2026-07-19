@@ -9,6 +9,9 @@ release-check = [
   "ruff==0.12.4",
 ]
 
+[tool.uv]
+package = false
+
 [tool.pytest.ini_options]
 testpaths = ["../../tests"]
 addopts = "--strict-config --strict-markers"

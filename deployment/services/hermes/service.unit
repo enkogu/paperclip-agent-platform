@@ -3,19 +3,18 @@ Description=Hermes Agent
 Documentation=https://github.com/NousResearch/hermes-agent
 Wants=network-online.target
 After=network-online.target docker.service
-ConditionPathExists=/root/.config/mte-secrets/hermes-runtime.env
-ConditionPathExists=/root/.config/mte-secrets/hermes-runtime.env.sha256
+ConditionPathExists=/root/.config/mte-secrets/services/hermes.env
 
 [Service]
 Type=simple
 User=mte-hermes
 Group=mte-hermes
-WorkingDirectory=/opt/mte-platform
+WorkingDirectory=/var/lib/mte-hermes
 Environment=HOME=/var/lib/mte-hermes
 Environment=HERMES_HOME=/var/lib/mte-hermes/.hermes
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/mte-hermes/current/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-EnvironmentFile=/root/.config/mte-secrets/hermes-runtime.env
+EnvironmentFile=/root/.config/mte-secrets/services/hermes.env
 ExecStart=/opt/mte-hermes/current/venv/bin/hermes gateway run --replace
 Restart=on-failure
 RestartSec=5s

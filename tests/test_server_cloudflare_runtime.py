@@ -28,10 +28,10 @@ class CloudflareRuntimeTests(unittest.TestCase):
     def runtime_values(self):
         return {
             "CLOUDFLARE_TUNNEL_TOKEN": "t" * 64,
-            "CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID": "service-token-id-1234",
-            "CLOUDFLARE_ACCESS_CLIENT_ID": "client-id-1234567890",
-            "CLOUDFLARE_ACCESS_CLIENT_SECRET": "s" * 48,
-            "CLOUDFLARE_ACCESS_EXPIRES_AT": (
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_ID": "service-token-id-1234",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_ID": "client-id-1234567890",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_SECRET": "s" * 48,
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_EXPIRES_AT": (
                 datetime.now(timezone.utc) + timedelta(days=30)
             ).isoformat(timespec="microseconds"),
         }
@@ -43,7 +43,9 @@ class CloudflareRuntimeTests(unittest.TestCase):
         self.assertTrue(result["serviceTokenExpiryVerified"])
         encoded = json.dumps(result, sort_keys=True)
         self.assertTrue(all(value not in encoded for value in values.values()))
-        values["CLOUDFLARE_ACCESS_EXPIRES_AT"] = "2000-01-01T00:00:00+00:00"
+        values["CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_EXPIRES_AT"] = (
+            "2000-01-01T00:00:00+00:00"
+        )
         with self.assertRaises(self.module.RuntimeErrorSafe):
             self.module.runtime_contract(values)
 
@@ -59,10 +61,18 @@ class CloudflareRuntimeTests(unittest.TestCase):
             service.write_text(
                 json.dumps(
                     {
-                        "id": values["CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID"],
-                        "client_id": values["CLOUDFLARE_ACCESS_CLIENT_ID"],
-                        "client_secret": values["CLOUDFLARE_ACCESS_CLIENT_SECRET"],
-                        "expires_at": values["CLOUDFLARE_ACCESS_EXPIRES_AT"],
+                        "firecrawl": {
+                            "id": values["CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_ID"],
+                            "client_id": values[
+                                "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_ID"
+                            ],
+                            "client_secret": values[
+                                "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_SECRET"
+                            ],
+                            "expires_at": values[
+                                "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_EXPIRES_AT"
+                            ],
+                        }
                     }
                 )
             )
@@ -92,6 +102,39 @@ class CloudflareRuntimeTests(unittest.TestCase):
             self.assertRegex(reconciled["generatedAt"], r"\.\d{6}\+00:00$")
             encoded = json.dumps([reconciled, observed], sort_keys=True)
             self.assertTrue(all(value not in encoded for value in values.values()))
+
+    def test_empty_service_map_supports_all_human_platform(self):
+        values = {"CLOUDFLARE_TUNNEL_TOKEN": "t" * 64}
+        self.assertEqual(
+            self.module.runtime_contract(values)["serviceRouteCredentialCount"], 0
+        )
+
+    def test_partial_service_route_fails_preflight(self):
+        values = self.runtime_values()
+        values.pop("CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_SECRET")
+        with self.assertRaises(self.module.RuntimeErrorSafe):
+            self.module.runtime_contract(values)
+
+    def test_required_route_missing_from_terraform_output_fails_before_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tfvars = base / "terraform.tfvars.json"
+            tfvars.write_text(
+                json.dumps(
+                    {
+                        "apps": {
+                            "firecrawl": {"access_class": "service"},
+                            "toolhive": {"access_class": "service"},
+                        }
+                    }
+                )
+            )
+            tfvars.chmod(0o600)
+            with mock.patch.object(self.module, "secure_root_file"):
+                required = self.module.required_routes(tfvars)
+            values = self.runtime_values()
+            with self.assertRaises(self.module.RuntimeErrorSafe):
+                self.module.runtime_contract(values, required)
 
     def test_secure_root_file_rejects_wrong_owner_mode_and_symlink(self):
         path = mock.Mock()

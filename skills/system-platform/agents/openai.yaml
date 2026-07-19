@@ -1,0 +1,13 @@
+interface:
+  display_name: "System Platform"
+  short_description: "Install, operate, and repair the agent platform"
+  default_prompt: "Use $system-platform to install, operate, diagnose, or repair the platform safely."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "context7"
+      description: "Current upstream component and API documentation"
+      transport: "streamable_http"
+      url: "https://mcp.context7.com/mcp"
+policy:
+  allow_implicit_invocation: true

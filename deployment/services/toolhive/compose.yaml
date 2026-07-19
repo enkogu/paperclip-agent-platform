@@ -6,31 +6,33 @@ services:
     environment:
       DOCKER_TLS_CERTDIR: ''
     command:
-    - --host=tcp://0.0.0.0:2375
     - --host=unix:///var/run/docker.sock
     volumes:
     - toolhive-docker:/var/lib/docker
     - toolhive-docker-run:/var/run
     - /opt/mte-platform/toolhive/tmp:/opt/mte-platform/toolhive/tmp
     networks:
-      tool-runtime:
-        aliases:
-        - tool-runtime
+      tool-control: {}
     healthcheck:
       test:
       - CMD
       - docker
       - -H
-      - tcp://127.0.0.1:2375
+      - unix:///var/run/docker.sock
       - info
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
+      interval: ${MTE_HEALTHCHECK_FAST_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_FAST_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_FAST_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_FAST_START_PERIOD:?required}
     restart: unless-stopped
     cpus: ${TOOLHIVE_DOCKER_CPU_LIMIT:?required}
     mem_limit: ${TOOLHIVE_DOCKER_MEMORY_LIMIT:?required}
-    pids_limit: 512
+    pids_limit: ${MTE_PIDS_DOCKER_LIMIT:?required}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+        max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
     ports: []
   toolhive:
     image: ${MTE_TOOLHIVE_TOOLHIVE_IMAGE:?required}
@@ -58,6 +60,7 @@ services:
     - toolhive-data:/root/.local/share/toolhive
     - toolhive-docker-run:/var/run:ro
     networks:
+      tool-control: {}
       tool-runtime: {}
       tool-plane:
         aliases:
@@ -72,20 +75,20 @@ services:
       test:
       - CMD-SHELL
       - bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'
-      interval: 30s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
+      interval: ${MTE_HEALTHCHECK_STANDARD_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_STANDARD_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_STANDARD_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_STANDARD_START_PERIOD:?required}
     restart: unless-stopped
     stop_grace_period: 60s
     cpus: ${TOOLHIVE_CPU_LIMIT:?required}
     mem_limit: ${TOOLHIVE_MEMORY_LIMIT:?required}
-    pids_limit: 256
+    pids_limit: ${MTE_PIDS_SERVICE_LIMIT:?required}
     logging:
       driver: json-file
       options:
-        max-size: 10m
-        max-file: '5'
+        max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+        max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
 volumes:
   toolhive-docker:
     name: mte-toolhive-docker
@@ -96,8 +99,10 @@ volumes:
   toolhive-data:
     name: mte-toolhive-data
 networks:
+  tool-control:
+    name: ${MTE_TOOLHIVE_CONTROL_NETWORK:?required}
   tool-runtime:
-    name: mte-tool-runtime
+    name: ${MTE_TOOL_RUNTIME_NETWORK:?required}
   tool-plane:
     name: mte-tool-plane
   agent-plane:

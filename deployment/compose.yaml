@@ -1,0 +1,218 @@
+name: mte-platform
+
+# Compose `include` cannot aggregate the owner-scoped manifests below: several
+# fragments intentionally use the same logical network key with opposite
+# internal/external ownership, and some use the same service key. `extends`
+# keeps each component manifest canonical while this project owns the shared
+# runtime resources exactly once.
+services:
+  postgres:
+    extends:
+      file: services/postgres/compose.yaml
+      service: postgres
+  postgrest:
+    extends:
+      file: services/postgrest/compose.yaml
+      service: postgrest
+
+  kestra-postgres:
+    extends:
+      file: services/kestra-data/compose.yaml
+      service: postgres
+  kestra-storage-init:
+    extends:
+      file: services/kestra/compose.yaml
+      service: kestra-storage-init
+  kestra:
+    extends:
+      file: services/kestra/compose.yaml
+      service: kestra
+
+  mattermost-postgres:
+    extends:
+      file: services/mattermost-db/compose.yaml
+      service: postgres
+  mattermost:
+    extends:
+      file: services/mattermost/compose.yaml
+      service: mattermost
+
+  searxng-config-init:
+    extends:
+      file: services/searxng/compose.yaml
+      service: searxng-config-init
+  searxng:
+    extends:
+      file: services/searxng/compose.yaml
+      service: searxng
+  valkey:
+    extends:
+      file: services/searxng/compose.yaml
+      service: valkey
+
+  api:
+    extends:
+      file: services/firecrawl/compose.yaml
+      service: api
+  playwright-service:
+    extends:
+      file: services/firecrawl/compose.yaml
+      service: playwright-service
+  redis:
+    extends:
+      file: services/firecrawl/compose.yaml
+      service: redis
+  rabbitmq:
+    extends:
+      file: services/firecrawl/compose.yaml
+      service: rabbitmq
+  nuq-postgres:
+    extends:
+      file: services/firecrawl/compose.yaml
+      service: nuq-postgres
+
+  9router:
+    extends:
+      file: services/9router/compose.yaml
+      service: 9router
+
+  tool-runtime:
+    extends:
+      file: services/toolhive/compose.yaml
+      service: tool-runtime
+  toolhive:
+    extends:
+      file: services/toolhive/compose.yaml
+      service: toolhive
+
+  config-init:
+    extends:
+      file: services/observability/compose.yaml
+      service: config-init
+  victoriametrics:
+    extends:
+      file: services/observability/compose.yaml
+      service: victoriametrics
+  victorialogs:
+    extends:
+      file: services/observability/compose.yaml
+      service: victorialogs
+  victoriatraces:
+    extends:
+      file: services/observability/compose.yaml
+      service: victoriatraces
+  blackbox-exporter:
+    extends:
+      file: services/observability/compose.yaml
+      service: blackbox-exporter
+  node-exporter:
+    extends:
+      file: services/observability/compose.yaml
+      service: node-exporter
+  cadvisor:
+    extends:
+      file: services/observability/compose.yaml
+      service: cadvisor
+  otel-collector:
+    extends:
+      file: services/observability/compose.yaml
+      service: otel-collector
+  alertmanager:
+    extends:
+      file: services/observability/compose.yaml
+      service: alertmanager
+  vmalert:
+    extends:
+      file: services/observability/compose.yaml
+      service: vmalert
+  grafana:
+    extends:
+      file: services/observability/compose.yaml
+      service: grafana
+
+volumes:
+  postgres-data:
+    name: mte-postgres-data
+  kestra-postgres:
+    name: mte-kestra-postgres
+  kestra-storage:
+    name: mte-kestra-storage
+  mattermost-db-data:
+    name: mte-mattermost-db-data
+  mattermost-config:
+    name: mte-mattermost-config
+  mattermost-data:
+    name: mte-mattermost-data-volume
+  mattermost-logs:
+    name: mte-mattermost-logs
+  mattermost-plugins:
+    name: mte-mattermost-plugins
+  mattermost-client-plugins:
+    name: mte-mattermost-client-plugins
+  mattermost-bleve:
+    name: mte-mattermost-bleve
+  searxng-config:
+    name: mte-searxng-config
+  searxng-cache:
+    name: mte-searxng-cache
+  searxng-valkey:
+    name: mte-searxng-valkey
+  firecrawl-valkey:
+    name: mte-firecrawl-valkey
+  firecrawl-rabbitmq:
+    name: mte-firecrawl-rabbitmq
+  firecrawl-postgres:
+    name: mte-firecrawl-postgres
+  ninerouter-data:
+    name: mte-9router-data
+  toolhive-docker:
+    name: mte-toolhive-docker
+  toolhive-docker-run:
+    name: mte-toolhive-docker-run
+  toolhive-config:
+    name: mte-toolhive-config
+  toolhive-data:
+    name: mte-toolhive-data
+  observability-config:
+    name: mte-observability-config
+  victoriametrics-data:
+    name: mte-victoriametrics-data
+  victorialogs-data:
+    name: mte-victorialogs-data
+  victoriatraces-data:
+    name: mte-victoriatraces-data
+  alertmanager-data:
+    name: mte-alertmanager-data
+  grafana-data:
+    name: mte-grafana-data
+
+networks:
+  data-plane:
+    name: mte-data-plane
+    external: true
+  kestra-data:
+    name: mte-kestra-data
+  control:
+    name: mte-control
+    external: true
+  llm:
+    name: mte-llm
+  mattermost-data:
+    name: mte-mattermost-data
+  search:
+    name: mte-search
+  firecrawl:
+    name: mte-firecrawl
+  tool-control:
+    name: ${MTE_TOOLHIVE_CONTROL_NETWORK:?required}
+  tool-runtime:
+    name: ${MTE_TOOL_RUNTIME_NETWORK:?required}
+    external: true
+  tool-plane:
+    name: mte-tool-plane
+    external: true
+  observability:
+    name: mte-observability
+  agent-plane:
+    name: ${MTE_AGENT_PLANE_NETWORK:?required}
+    external: true

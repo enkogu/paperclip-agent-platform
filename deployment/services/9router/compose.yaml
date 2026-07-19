@@ -2,8 +2,8 @@ name: mte-9router
 x-logging: &id001
   driver: json-file
   options:
-    max-size: 10m
-    max-file: '5'
+    max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+    max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
 services:
   9router:
     image: ${MTE_9ROUTER_9ROUTER_IMAGE:?required}
@@ -33,15 +33,15 @@ services:
       - CMD
       - node
       - -e
-      - fetch('http://127.0.0.1:20128/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 45s
+      - fetch('http://127.0.0.1:' + process.env.PORT + '/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: ${MTE_HEALTHCHECK_STANDARD_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_STANDARD_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_STANDARD_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_STANDARD_START_PERIOD:?required}
     restart: unless-stopped
     cpus: ${NINEROUTER_CPU_LIMIT:?required}
     mem_limit: ${NINEROUTER_MEMORY_LIMIT:?required}
-    pids_limit: 768
+    pids_limit: ${MTE_PIDS_APP_LIMIT:?required}
     logging: *id001
 volumes:
   ninerouter-data:

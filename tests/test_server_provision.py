@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -22,6 +23,183 @@ def load_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def canonical_endpoint_values():
+    return {
+        "POSTGREST_HEALTH_URL": "http://127.0.0.23:28103/ready",
+        "POSTGREST_ORIGIN_PORT": "28113",
+        "MATTERMOST_HEALTH_URL": "http://127.0.0.25:28105/api/v4/system/ping",
+        "MATTERMOST_ORIGIN_PORT": "28115",
+        "KESTRA_HEALTH_URL": "http://127.0.0.27:28107/health",
+        "KESTRA_ORIGIN_PORT": "28117",
+        "NINEROUTER_HEALTH_URL": "http://127.0.0.28:28108/api/health",
+        "NINEROUTER_ORIGIN_PORT": "28118",
+        "PAPERCLIP_HEALTH_URL": "http://127.0.0.29:28109/api/health",
+        "PAPERCLIP_ORIGIN_PORT": "28119",
+    }
+
+
+class CanonicalServiceEndpointTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+
+    def context(self, config=None, **overrides):
+        values = {**canonical_endpoint_values(), **overrides}
+        return self.module.Context(
+            config=config or {"spec": {"components": []}},
+            platform_env=values,
+            mutate=False,
+            strict=True,
+        )
+
+    def test_all_host_service_origins_come_from_canonical_refs(self):
+        expected = {
+            "postgrest": "http://127.0.0.23:28113",
+            "mattermost": "http://127.0.0.25:28115",
+            "kestra": "http://127.0.0.27:28117",
+            "9router": "http://127.0.0.28:28118",
+            "paperclip": "http://127.0.0.29:28119",
+        }
+        ctx = self.context()
+        self.assertEqual(
+            {component: ctx.url(component) for component in expected}, expected
+        )
+
+    def test_rendered_config_selects_health_host_and_origin_port_ref(self):
+        ctx = self.context(
+            config={
+                "spec": {
+                    "components": [
+                        {
+                            "id": "kestra",
+                            "health": {"url": "http://127.0.0.77:29001/health"},
+                            "exposure": {"originPortRef": "UNIT_KESTRA_API_PORT"},
+                        }
+                    ]
+                }
+            },
+            UNIT_KESTRA_API_PORT="29002",
+        )
+        self.assertEqual(ctx.url("kestra"), "http://127.0.0.77:29002")
+
+    def test_explicit_config_origin_is_validated_and_wins(self):
+        ctx = self.context(
+            config={
+                "spec": {
+                    "components": [
+                        {
+                            "id": "paperclip",
+                            "exposure": {"origin": "http://paperclip.internal:30100"},
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertEqual(ctx.url("paperclip"), "http://paperclip.internal:30100")
+
+        ctx.config["spec"]["components"][0]["exposure"]["origin"] = (
+            "http://operator:credential@paperclip.internal:30100"
+        )
+        with self.assertRaisesRegex(RuntimeError, "service_origin_invalid:paperclip"):
+            ctx.url("paperclip")
+
+    def test_missing_or_invalid_canonical_ref_fails_closed(self):
+        ctx = self.context(PAPERCLIP_ORIGIN_PORT="")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "service_origin_port_invalid:paperclip:PAPERCLIP_ORIGIN_PORT",
+        ):
+            ctx.url("paperclip")
+
+        ctx = self.context(PAPERCLIP_HEALTH_URL="not-a-url")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "service_health_url_invalid:paperclip:PAPERCLIP_HEALTH_URL",
+        ):
+            ctx.url("paperclip")
+
+    def test_provisioner_contains_no_operator_endpoint_defaults(self):
+        source = (ROOT / "tools/platform-cli/server-provision.py").read_text()
+        for literal in (
+            "http://127.0.0.1:18085",
+            "http://127.0.0.1:18086",
+            "http://127.0.0.1:18093",
+            "http://127.0.0.1:18096",
+            "http://127.0.0.1:18065",
+            "http://127.0.0.1:18090",
+            "http://127.0.0.1:18082",
+            "http://127.0.0.1:20128",
+            "http://127.0.0.1:3100",
+        ):
+            self.assertNotIn(literal, source)
+
+    def test_paperclip_restart_wait_uses_canonical_host_endpoint(self):
+        initial = {
+            "configExists": True,
+            "provider": "legacy",
+            "strictMode": False,
+            "keyFilePath": "/data/secrets/master.key",
+            "key": {"exists": False, "valid": False, "mode": None},
+            "configMode": "600",
+            "port": 65500,
+            "llmApiKeyConfigured": False,
+        }
+        ready = {
+            **initial,
+            "provider": "local_encrypted",
+            "strictMode": True,
+            "key": {"exists": True, "valid": True, "mode": "600"},
+        }
+        completed = mock.Mock(returncode=0)
+        ctx = self.context()
+        ctx.mutate = True
+        with (
+            mock.patch.object(self.module, "paperclip_container_env", return_value={}),
+            mock.patch.object(
+                self.module,
+                "paperclip_runtime_snapshot",
+                side_effect=[initial, ready],
+            ),
+            mock.patch.object(self.module, "configure_paperclip_runtime"),
+            mock.patch.object(self.module.subprocess, "run", return_value=completed),
+            mock.patch.object(self.module, "wait_json_endpoint") as wait,
+        ):
+            value = self.module.paperclip_runtime_security(ctx)
+
+        self.assertEqual(value["status"], "ready")
+        wait.assert_called_once_with("http://127.0.0.29:28119/api/health")
+
+    def test_hermes_gateway_agent_uses_private_bridge_and_secret_ref(self):
+        ctx = self.context(
+            HERMES_API_SERVER_HOST="172.30.0.1",
+            HERMES_API_SERVER_PORT="8642",
+        )
+        payload = self.module.hermes_gateway_agent_payload(
+            ctx,
+            gateway_secret_id="00000000-0000-4000-8000-000000000123",
+        )
+
+        self.assertEqual(payload["adapterType"], "hermes_gateway")
+        self.assertEqual(payload["role"], "devops")
+        self.assertEqual(payload["metadata"]["systemRef"], "hermes-operator")
+        self.assertEqual(
+            payload["adapterConfig"],
+            {
+                "apiBaseUrl": "http://172.30.0.1:8642",
+                "apiKey": {
+                    "type": "secret_ref",
+                    "secretId": "00000000-0000-4000-8000-000000000123",
+                    "version": "latest",
+                },
+                "paperclipApiUrl": "http://127.0.0.29:28119",
+                "sessionKeyStrategy": "issue",
+                "timeoutSec": 1800,
+                "dangerouslyAllowInsecureRemoteHttp": True,
+            },
+        )
+        self.assertNotIn("HERMES_API_SERVER_KEY", json.dumps(payload))
 
 
 class HarnessRouterAuthTests(unittest.TestCase):
@@ -185,6 +363,14 @@ class ManagedIntegrationCredentialTests(unittest.TestCase):
         create = next(row for row in calls if row[0] == "POST")
         self.assertEqual(create[2]["display_name"], "MTE Alertmanager")
 
+    def test_bot_account_creation_is_enabled_before_bot_api_call(self):
+        source = (ROOT / "tools/platform-cli/server-provision.py").read_text()
+        enable = source.index(
+            'mmctl_config_set(container, "ServiceSettings.EnableBotAccountCreation", "true")'
+        )
+        create = source.index('f"{ctx.url(component)}/api/v4/bots"')
+        self.assertLess(enable, create)
+
 
 class CanonicalMutationGuardTests(unittest.TestCase):
     @classmethod
@@ -233,6 +419,38 @@ class CanonicalMutationGuardTests(unittest.TestCase):
             self.assertEqual(ctx.canonical_mutations, {"NEW_KEY"})
             self.assertIn("NEW_KEY=generated", source.read_text())
 
+    def test_paperclip_snapshot_cannot_revert_secret_rotation_marker(self):
+        marker_key = (
+            "PAPERCLIP_SECRET_MTE_NOTION_CONNECTOR_SOURCE_FINGERPRINT"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "platform.env"
+            source.write_text(
+                "PAPERCLIP_COMPANY_ID=company-unit\n"
+                f"{marker_key}=stale-marker\n"
+            )
+            source.chmod(0o600)
+            ctx = self.context(
+                {
+                    "PAPERCLIP_COMPANY_ID": "company-unit",
+                    marker_key: "stale-marker",
+                },
+                authorized={marker_key},
+            )
+            with (
+                mock.patch.object(self.module, "PLATFORM_ENV", source),
+                mock.patch.object(self.module, "PLATFORM_LOCK", root / ".lock"),
+            ):
+                _, snapshot = ctx.integration("paperclip")
+                self.assertNotIn(marker_key, snapshot)
+                ctx.persist_canonical({marker_key: "fresh-marker"})
+                ctx.save_integration("paperclip", snapshot)
+
+            current = self.module.dotenv(source)
+            self.assertEqual(current[marker_key], "fresh-marker")
+            self.assertEqual(current["PAPERCLIP_COMPANY_ID"], "company-unit")
+
     def test_read_only_context_rejects_even_pre_authorized_write(self):
         ctx = self.context({}, mutate=False, authorized={"NEW_KEY"})
         with self.assertRaisesRegex(RuntimeError, "canonical_write_in_read_only_mode"):
@@ -243,6 +461,7 @@ class CanonicalMutationGuardTests(unittest.TestCase):
             "MATTERMOST_BOT_TOKEN": "unit-only-token",
             "NINEROUTER_PROFILE_CODING_DAYTONA_CODEX_API_KEY": "unit-only-key",
             "TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN": "unit-tool-token",
+            "CONTEXT7_API_KEY": "unit-context7-key",
         }
         plan = self.module.canonical_mutation_plan(values)
         self.assertIn("PAPERCLIP_SECRET_MTE_MATTERMOST_BOT_ID", plan)
@@ -250,6 +469,20 @@ class CanonicalMutationGuardTests(unittest.TestCase):
         self.assertIn(
             "PAPERCLIP_SECRET_MTE_TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_ID",
             plan,
+        )
+        self.assertIn("PAPERCLIP_SECRET_MTE_CONTEXT7_API_KEY_ID", plan)
+        self.assertIn("PAPERCLIP_SECRET_MTE_CONTEXT7_API_KEY_SOURCE_FINGERPRINT", plan)
+        self.assertTrue(
+            {
+                "PAPERCLIP_BOARD_EMAIL",
+                "PAPERCLIP_BOARD_PASSWORD",
+                "PAPERCLIP_BOARD_API_KEY",
+            }
+            <= plan
+        )
+        self.assertNotIn(
+            "PAPERCLIP_SECRET_MTE_CONTEXT7_API_KEY_ID",
+            self.module.canonical_mutation_plan({"CONTEXT7_API_KEY": ""}),
         )
         self.assertNotIn("UNRELATED_KEY", plan)
 
@@ -263,6 +496,11 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
         return self.module.Context(
             config={
                 "spec": {
+                    "e2e": {
+                        "githubOwnerRef": "E2E_GITHUB_OWNER",
+                        "githubRepositoryRef": "E2E_GITHUB_REPOSITORY",
+                        "baseBranchRef": "E2E_GITHUB_BASE_BRANCH",
+                    },
                     "components": [
                         {
                             "id": "9router",
@@ -285,9 +523,415 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
                 "MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL": "http://172.20.0.1:22081/mcp",
                 "MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL": "http://172.20.0.1:22082/mcp",
                 "MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL": "http://172.20.0.1:22083/mcp",
+                "E2E_GITHUB_OWNER": "enkogu",
+                "E2E_GITHUB_REPOSITORY": "aesthetic-diagrams",
+                "E2E_GITHUB_BASE_BRANCH": "main",
+                "MTE_DAYTONA_ENVIRONMENT_NAME": "MTE Daytona Coding",
             },
             mutate=False,
             strict=True,
+        )
+
+    def test_e2e_project_workspace_is_created_and_policy_is_bound_to_it(self):
+        ctx = self.context()
+        ctx.mutate = True
+        project = {"id": "project-unit", "executionWorkspacePolicy": None}
+        desired = self.module.paperclip_e2e_workspace_contract(ctx)
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs.get("body")))
+            if method == "GET":
+                return []
+            if method == "POST":
+                return {"id": "workspace-unit", **desired}
+            policy = kwargs["body"]["executionWorkspacePolicy"]
+            return {"id": "project-unit", "executionWorkspacePolicy": policy}
+
+        with mock.patch.object(self.module, "request_json", side_effect=request):
+            observed = self.module.reconcile_paperclip_e2e_project_workspace(
+                ctx, "http://paperclip.internal", {}, project
+            )
+
+        self.assertEqual(observed["status"], "ready")
+        self.assertEqual(observed["workspaceId"], "workspace-unit")
+        self.assertEqual(
+            observed["repoUrl"],
+            "https://github.com/enkogu/aesthetic-diagrams.git",
+        )
+        self.assertEqual(observed["defaultRef"], "main")
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "GET",
+                    "http://paperclip.internal/api/projects/project-unit/workspaces",
+                    None,
+                ),
+                (
+                    "POST",
+                    "http://paperclip.internal/api/projects/project-unit/workspaces",
+                    desired,
+                ),
+                (
+                    "PATCH",
+                    "http://paperclip.internal/api/projects/project-unit",
+                    {
+                        "executionWorkspacePolicy": {
+                            "enabled": True,
+                            "defaultMode": "isolated_workspace",
+                            "allowIssueOverride": True,
+                            "defaultProjectWorkspaceId": "workspace-unit",
+                            "workspaceStrategy": {
+                                "type": "cloud_sandbox",
+                                "baseRef": "main",
+                            },
+                        }
+                    },
+                ),
+            ],
+        )
+
+    def test_e2e_project_workspace_reconcile_is_read_before_write_idempotent(self):
+        ctx = self.context()
+        ctx.mutate = True
+        desired = self.module.paperclip_e2e_workspace_contract(ctx)
+        workspace = {"id": "workspace-unit", **desired}
+        policy = {
+            "enabled": True,
+            "defaultMode": "isolated_workspace",
+            "allowIssueOverride": True,
+            "defaultProjectWorkspaceId": "workspace-unit",
+            "workspaceStrategy": {"type": "cloud_sandbox", "baseRef": "main"},
+        }
+        project = {"id": "project-unit", "executionWorkspacePolicy": policy}
+        with mock.patch.object(
+            self.module, "request_json", return_value=[workspace]
+        ) as request:
+            observed = self.module.reconcile_paperclip_e2e_project_workspace(
+                ctx, "http://paperclip.internal", {}, project
+            )
+
+        self.assertEqual(observed["status"], "ready")
+        request.assert_called_once_with(
+            "GET",
+            "http://paperclip.internal/api/projects/project-unit/workspaces",
+            headers={},
+        )
+
+    def test_e2e_project_workspace_reconcile_repairs_workspace_and_policy_drift(self):
+        ctx = self.context()
+        ctx.mutate = True
+        desired = self.module.paperclip_e2e_workspace_contract(ctx)
+        stale_workspace = {
+            "id": "workspace-unit",
+            **desired,
+            "repoRef": "legacy",
+            "defaultRef": "legacy",
+            "isPrimary": False,
+        }
+        project = {
+            "id": "project-unit",
+            "executionWorkspacePolicy": {
+                "enabled": False,
+                "defaultMode": "project_workspace",
+            },
+        }
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append((method, url, kwargs.get("body")))
+            if method == "GET":
+                return [stale_workspace]
+            if "/workspaces/" in url:
+                return {"id": "workspace-unit", **desired}
+            policy = kwargs["body"]["executionWorkspacePolicy"]
+            return {"id": "project-unit", "executionWorkspacePolicy": policy}
+
+        with mock.patch.object(self.module, "request_json", side_effect=request):
+            observed = self.module.reconcile_paperclip_e2e_project_workspace(
+                ctx, "http://paperclip.internal", {}, project
+            )
+
+        self.assertEqual(observed["status"], "ready")
+        self.assertEqual(
+            [method for method, _, _ in calls],
+            ["GET", "PATCH", "PATCH"],
+        )
+        self.assertEqual(calls[1][2], desired)
+        self.assertEqual(
+            calls[2][2]["executionWorkspacePolicy"]["defaultProjectWorkspaceId"],
+            "workspace-unit",
+        )
+
+    def test_e2e_project_workspace_invalid_target_fails_closed(self):
+        ctx = self.context()
+        ctx.platform_env["E2E_GITHUB_OWNER"] = "operator@example.com"
+        with self.assertRaisesRegex(
+            RuntimeError, "paperclip_e2e_workspace_repository_invalid"
+        ):
+            self.module.paperclip_e2e_workspace_contract(ctx)
+
+    def test_e2e_project_workspace_does_not_adopt_unmanaged_collision(self):
+        ctx = self.context()
+        ctx.mutate = True
+        unmanaged = {
+            "id": "operator-workspace",
+            "name": self.module.PAPERCLIP_E2E_WORKSPACE_NAME,
+            "repoUrl": "https://github.com/enkogu/aesthetic-diagrams.git",
+            "metadata": {"managedBy": "operator"},
+        }
+        with mock.patch.object(
+            self.module, "request_json", return_value=[unmanaged]
+        ) as request:
+            observed = self.module.reconcile_paperclip_e2e_project_workspace(
+                ctx,
+                "http://paperclip.internal",
+                {},
+                {"id": "project-unit", "executionWorkspacePolicy": None},
+            )
+
+        self.assertEqual(observed["status"], "needs_configuration")
+        self.assertEqual(observed["reason"], "unmanaged_project_workspace_collision")
+        request.assert_called_once_with(
+            "GET",
+            "http://paperclip.internal/api/projects/project-unit/workspaces",
+            headers={},
+        )
+
+    def test_native_agent_is_bound_to_owned_daytona_environment(self):
+        ctx = self.context()
+        ctx.mutate = True
+        environment = {
+            "id": "environment-unit",
+            "name": "MTE Daytona Coding",
+            "driver": "sandbox",
+            "status": "active",
+            "config": {"provider": "daytona"},
+            "metadata": {
+                "managedBy": "mte-platform",
+                "purpose": "coding-daytona",
+            },
+        }
+
+        def request(method, url, **kwargs):
+            if method == "GET":
+                return {"environments": [environment]}
+            self.assertEqual(
+                kwargs["body"], {"defaultEnvironmentId": "environment-unit"}
+            )
+            return {
+                "agent": {
+                    "id": "agent-unit",
+                    "defaultEnvironmentId": "environment-unit",
+                }
+            }
+
+        with mock.patch.object(self.module, "request_json", side_effect=request):
+            observed_environment = self.module.paperclip_daytona_environment(
+                ctx, "http://paperclip.internal", {}, "company-unit"
+            )
+            agent, binding = self.module.reconcile_paperclip_agent_environment(
+                ctx,
+                "http://paperclip.internal",
+                {},
+                {"id": "agent-unit", "defaultEnvironmentId": None},
+                observed_environment,
+            )
+
+        self.assertEqual(observed_environment["status"], "ready")
+        self.assertEqual(agent["defaultEnvironmentId"], "environment-unit")
+        self.assertEqual(binding["status"], "ready")
+        self.assertEqual(binding["environmentId"], "environment-unit")
+
+    @staticmethod
+    def profile(harness: str) -> dict[str, Any]:
+        return {
+            "nativeAdapterConfig": {
+                "cwd": "/home/daytona/paperclip-workspace",
+                "model": "unit-model",
+            },
+            "mcpPolicy": {"allow": []},
+            "toolRouting": {
+                "mcpUrlRef": f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_URL",
+                "bearerTokenRef": (
+                    f"TOOLHIVE_PROFILE_CODING_DAYTONA_{harness}_BEARER_TOKEN"
+                ),
+            },
+            "toolAccess": {
+                "bundleId": f"mte-profile-{harness.lower()}",
+                "workloadId": f"mte-profile-{harness.lower()}",
+                "endpointRef": f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_URL",
+                "credentialRef": (
+                    f"TOOLHIVE_PROFILE_CODING_DAYTONA_{harness}_BEARER_TOKEN"
+                ),
+                "canaryTool": "echo",
+            },
+        }
+
+    def test_context7_optional_company_secret_ref_for_all_native_profiles(self):
+        for harness, adapter_type in (
+            ("CODEX", "codex_local"),
+            ("CLAUDE", "claude_local"),
+            ("PI", "pi_local"),
+        ):
+            with self.subTest(harness=harness):
+                ctx = self.context()
+                ctx.platform_env["CONTEXT7_API_KEY"] = "unit-context7-raw-key"
+                desired = self.module.paperclip_desired_adapter_config(
+                    ctx,
+                    company_id="company-unit",
+                    agent_id="agent-unit",
+                    profile=self.profile(harness),
+                    adapter_type=adapter_type,
+                    router_secret_id="router-secret",
+                    toolhive_secret_id="toolhive-secret",
+                    context7_secret_id="context7-secret-id",
+                    existing={"env": {"CONTEXT7_API_KEY": "stale-raw-context7-key"}},
+                )
+                self.assertEqual(
+                    desired["env"]["CONTEXT7_API_KEY"],
+                    self.module.paperclip_ref("context7-secret-id"),
+                )
+                serialized = json.dumps(desired)
+                self.assertNotIn("unit-context7-raw-key", serialized)
+                self.assertNotIn("stale-raw-context7-key", serialized)
+                if adapter_type == "codex_local":
+                    self.assertEqual(
+                        desired["extraArgs"][-2:],
+                        [
+                            "-c",
+                            'mcp_servers.context7.bearer_token_env_var="CONTEXT7_API_KEY"',
+                        ],
+                    )
+                else:
+                    self.assertNotIn("extraArgs", desired)
+
+    def test_context7_empty_canonical_value_removes_stale_binding(self):
+        desired = self.module.paperclip_desired_adapter_config(
+            self.context(),
+            company_id="company-unit",
+            agent_id="agent-unit",
+            profile=self.profile("CODEX"),
+            adapter_type="codex_local",
+            router_secret_id="router-secret",
+            toolhive_secret_id="toolhive-secret",
+            existing={
+                "extraArgs": [
+                    "--unit-flag",
+                    "-c",
+                    'mcp_servers.context7.bearer_token_env_var="CONTEXT7_API_KEY"',
+                ],
+                "env": {
+                    "CONTEXT7_API_KEY": {
+                        "type": "secret_ref",
+                        "secretId": "stale-context7-secret",
+                    }
+                },
+            },
+        )
+        self.assertNotIn("CONTEXT7_API_KEY", desired["env"])
+        self.assertEqual(desired["extraArgs"], ["--unit-flag"])
+
+    def test_context7_required_binding_participates_in_readiness(self):
+        desired = self.module.paperclip_desired_adapter_config(
+            self.context(),
+            company_id="company-unit",
+            agent_id="agent-unit",
+            profile=self.profile("CODEX"),
+            adapter_type="codex_local",
+            router_secret_id="router-secret",
+            toolhive_secret_id="toolhive-secret",
+            context7_secret_id="context7-secret",
+            existing={},
+        )
+        self.assertTrue(
+            self.module.paperclip_adapter_binding_ready(
+                desired,
+                desired,
+                router_secret_id="router-secret",
+                toolhive_secret_id="toolhive-secret",
+                context7_required=True,
+                context7_secret_id="context7-secret",
+            )
+        )
+        self.assertFalse(
+            self.module.paperclip_adapter_binding_ready(
+                desired,
+                desired,
+                router_secret_id="router-secret",
+                toolhive_secret_id="toolhive-secret",
+                context7_required=True,
+                context7_secret_id="",
+            )
+        )
+
+    def test_context7_company_secret_evidence_is_boolean_ref_only(self):
+        ctx = self.context()
+        raw = "unit-context7-raw-key"
+        marker = self.module.fingerprint(raw)
+        ctx.platform_env.update(
+            {
+                "CONTEXT7_API_KEY": raw,
+                "PAPERCLIP_SECRET_MTE_CONTEXT7_API_KEY_SOURCE_FINGERPRINT": marker,
+            }
+        )
+        spec = next(
+            row
+            for row in self.module.paperclip_secret_specs(ctx)
+            if row["sourceKey"] == "CONTEXT7_API_KEY"
+        )
+        evidence = self.module.ensure_paperclip_company_secret(
+            ctx,
+            "http://paperclip.internal",
+            {},
+            "company-unit",
+            [
+                {
+                    "id": "context7-secret-id",
+                    "key": "mte.context7.api-key",
+                    "provider": "local_encrypted",
+                    "managedMode": "paperclip_managed",
+                }
+            ],
+            spec,
+        )
+        self.assertEqual(evidence["id"], "context7-secret-id")
+        self.assertEqual(evidence["status"], "ready")
+        self.assertNotIn("fingerprint", evidence)
+        serialized = json.dumps(evidence)
+        self.assertNotIn(raw, serialized)
+        self.assertNotIn(marker, serialized)
+
+        binding = self.module.context7_binding_evidence(ctx, "context7-secret-id")
+        self.assertEqual(
+            binding,
+            {
+                "configured": True,
+                "authMode": "paperclip_company_secret_ref",
+                "bindingRef": "CONTEXT7_API_KEY",
+                "secretId": "context7-secret-id",
+                "nativeConfigBinding": "company_secret_ref",
+            },
+        )
+        self.assertNotIn(raw, json.dumps(binding))
+
+        anonymous_ctx = self.context()
+        self.assertEqual(
+            self.module.context7_binding_evidence(anonymous_ctx, ""),
+            {
+                "configured": False,
+                "authMode": "anonymous",
+                "bindingRef": None,
+                "secretId": None,
+                "nativeConfigBinding": "none",
+            },
+        )
+        self.assertEqual(
+            self.module.context7_binding_evidence(
+                ctx, "context7-secret-id", "codex_local"
+            )["nativeConfigBinding"],
+            "codex_bearer_token_env_var",
         )
 
     def test_exact_secret_ref_env_and_writable_cwd_for_three_native_profiles(self):
@@ -356,7 +1000,7 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
                     agent_id="agent-unit",
                     profile={
                         "nativeAdapterConfig": {
-                            "cwd": f"/home/daytona/workspaces/{ref}",
+                            "cwd": "/home/daytona/paperclip-workspace",
                             "model": "unit-model",
                         },
                         "mcpPolicy": {"allow": ["github"]},
@@ -382,7 +1026,7 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
                 )
                 env = desired["env"]
                 self.assertEqual(set(env), expected_keys)
-                self.assertEqual(desired["cwd"], f"/home/daytona/workspaces/{ref}")
+                self.assertEqual(desired["cwd"], "/home/daytona/paperclip-workspace")
                 runtime_key = (
                     "ANTHROPIC_API_KEY"
                     if adapter_type == "claude_local"
@@ -448,7 +1092,7 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
 
     def test_codex_preserves_only_paperclip_managed_isolated_home(self):
         profile = {
-            "nativeAdapterConfig": {"cwd": "/home/daytona/workspaces/codex"},
+            "nativeAdapterConfig": {"cwd": "/home/daytona/paperclip-workspace"},
             "mcpPolicy": {"allow": []},
             "toolRouting": {
                 "mcpUrlRef": "MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL",
@@ -495,7 +1139,7 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
 
     def test_codex_binding_readiness_uses_post_patch_managed_home(self):
         profile = {
-            "nativeAdapterConfig": {"cwd": "/home/daytona/workspaces/codex"},
+            "nativeAdapterConfig": {"cwd": "/home/daytona/paperclip-workspace"},
             "mcpPolicy": {"allow": []},
             "toolRouting": {
                 "mcpUrlRef": "MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL",
@@ -519,7 +1163,7 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
             router_secret_id="router-secret",
             toolhive_secret_id="tool-secret",
             existing={
-                "cwd": "/home/daytona/workspaces/codex",
+                "cwd": "/home/daytona/paperclip-workspace",
                 "env": {"CODEX_HOME": {"type": "plain", "value": managed_home}},
             },
         )
@@ -586,6 +1230,15 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
                             "configMode": "600",
                             "llmApiKeyConfigured": False,
                         },
+                        "projectWorkspace": {
+                            "status": "ready",
+                            "workspaceId": "workspace-unit",
+                            "policy": {"defaultProjectWorkspaceId": "workspace-unit"},
+                        },
+                        "daytonaEnvironment": {
+                            "status": "ready",
+                            "environmentId": "environment-unit",
+                        },
                         "companySecrets": [
                             {
                                 "id": "secret-id",
@@ -594,6 +1247,15 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
                             }
                         ],
                         "agentBindings": [],
+                        "agentEnvironmentBindings": [
+                            {
+                                "profileRef": "coding-daytona-codex",
+                                "agentId": "agent-unit",
+                                "environmentId": "environment-unit",
+                                "defaultEnvironmentId": "environment-unit",
+                                "status": "ready",
+                            }
+                        ],
                         "unsafeInlineBindings": [],
                     }
                 ],
@@ -607,6 +1269,16 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
             payload = json.loads(evidence.read_text())
             self.assertEqual(result["mode"], "0o600")
             self.assertEqual(payload["status"], "passed")
+            self.assertEqual(
+                payload["paperclip"]["projectWorkspace"]["workspaceId"],
+                "workspace-unit",
+            )
+            self.assertEqual(
+                payload["paperclip"]["agentEnvironmentBindings"][0][
+                    "defaultEnvironmentId"
+                ],
+                "environment-unit",
+            )
             self.assertNotIn("unit-only-secret", evidence.read_text())
 
     def test_generated_runtime_catalog_precedes_stale_paperclip_copy(self):
@@ -643,6 +1315,7 @@ class PostgresNotionProvisioningTests(unittest.TestCase):
 
     def context(self, **extra):
         values = {
+            **canonical_endpoint_values(),
             "DATA_CONTENT_PROFILE": "postgres-notion",
             "POSTGREST_PAPERCLIP_TOKEN": "unit-postgrest-token",
             "NOTION_TOKEN": "unit-notion-token",
@@ -746,22 +1419,6 @@ class PostgresNotionProvisioningTests(unittest.TestCase):
             notion["capabilities"]["documents"]["id"],
         )
         self.assertNotIn("unit-notion-token", json.dumps(refs))
-
-    def test_legacy_optional_profiles_remain_available(self):
-        baserow = self.context(DATA_CONTENT_PROFILE="baserow-wikijs")
-        legacy_nocodb = self.context(
-            DATA_CONTENT_PROFILE="postgres-postgrest-nocodb-nocodocs"
-        )
-        self.assertEqual(
-            self.module.data_content_paperclip_bindings(baserow),
-            (("BASEROW_PAPERCLIP_TOKEN", "BASEROW_API_TOKEN"),),
-        )
-        self.assertEqual(
-            self.module.data_content_paperclip_bindings(legacy_nocodb),
-            (("POSTGREST_PAPERCLIP_TOKEN", "POSTGREST_API_TOKEN"),),
-        )
-        self.assertIn("baserow", self.module.build_refs(baserow, [])["services"])
-        self.assertIn("nocodb", self.module.build_refs(legacy_nocodb, [])["services"])
 
 
 class NinerouterCustomModelTests(unittest.TestCase):

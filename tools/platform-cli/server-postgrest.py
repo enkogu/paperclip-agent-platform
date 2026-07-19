@@ -36,26 +36,19 @@ SECRET_ROOT = Path(
 )
 CANONICAL = SECRET_ROOT / "platform.env"
 CANONICAL_LOCK = SECRET_ROOT / ".platform-env.lock"
-DOKPLOY_IDS = SECRET_ROOT / "dokploy-mte-ids.json"
 LOCK = ROOT / "templates/platform.lock.yaml"
 EVIDENCE = ROOT / "evidence/postgrest-verify.json"
 DEFAULT_PROFILE = "postgres-notion"
-LEGACY_PROFILE = "postgres-postgrest-nocodb-nocodocs"
-SUPPORTED_PROFILES = frozenset((DEFAULT_PROFILE, LEGACY_PROFILE))
+SUPPORTED_PROFILES = frozenset((DEFAULT_PROFILE,))
 # Compatibility for callers that use the module-level default profile.
 PROFILE = DEFAULT_PROFILE
 IMAGE = "postgrest/postgrest:v14.15@sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326"
 LICENSE = "MIT"
 GENERATED_REFS = {
     "POSTGREST_PAPERCLIP_TOKEN",
-    "POSTGREST_ACTIVEPIECES_TOKEN",
 }
 SCOPED_TOKEN_SPECS = {
     "POSTGREST_PAPERCLIP_TOKEN": ("mte-paperclip", "POSTGREST_PAPERCLIP_ROLE"),
-    "POSTGREST_ACTIVEPIECES_TOKEN": (
-        "mte-activepieces",
-        "POSTGREST_ACTIVEPIECES_ROLE",
-    ),
 }
 REQUIRED_REFS = {
     "DATA_CONTENT_PROFILE",
@@ -73,13 +66,17 @@ REQUIRED_REFS = {
     "POSTGREST_READER_ROLE",
     "POSTGREST_WRITER_ROLE",
     "POSTGREST_PAPERCLIP_ROLE",
-    "POSTGREST_ACTIVEPIECES_ROLE",
     "POSTGREST_JWT_SECRET",
     "POSTGREST_API_AUDIENCE",
     "POSTGREST_HEALTH_URL",
     "POSTGREST_ORIGIN_PORT",
 }
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+COMPOSE_PROJECT = "mte-platform"
+DIRECT_COMPOSE_SERVICES = {
+    "postgres": "postgres",
+    "postgrest": "postgrest",
+}
 
 
 class PostgrestError(RuntimeError):
@@ -124,7 +121,6 @@ def require_values(values: dict[str, str]) -> None:
         "POSTGREST_READER_ROLE",
         "POSTGREST_WRITER_ROLE",
         "POSTGREST_PAPERCLIP_ROLE",
-        "POSTGREST_ACTIVEPIECES_ROLE",
     )
     for key in (
         "POSTGRES_ADMIN_DB",
@@ -174,8 +170,6 @@ def release_contract(profile: str = PROFILE) -> dict[str, Any]:
 def projection_provider(profile: str) -> str:
     if profile == DEFAULT_PROFILE:
         return "notion"
-    if profile == LEGACY_PROFILE:
-        return "nocodb"
     raise PostgrestError("provider_profile_not_selected")
 
 
@@ -195,61 +189,17 @@ def run(
     return result
 
 
-def dokploy_app_name(component: str) -> str:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", component):
-        raise PostgrestError("dokploy_component_id_invalid")
-    try:
-        registry = json.loads(DOKPLOY_IDS.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise PostgrestError("dokploy_component_registry_invalid") from exc
-    compose_id = registry.get(component) if isinstance(registry, dict) else None
-    if not isinstance(compose_id, str) or not compose_id or len(compose_id) > 256:
-        raise PostgrestError(f"dokploy_component_identity_missing:{component}")
-
-    values = dotenv()
-    base_url = values.get("DOKPLOY_BASE_URL", "").rstrip("/")
-    api_token = values.get("DOKPLOY_API_TOKEN", "")
-    parsed = urllib.parse.urlsplit(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not api_token:
-        raise PostgrestError("dokploy_read_identity_config_invalid")
-    request = urllib.request.Request(
-        base_url + "/compose.one?" + urllib.parse.urlencode({"composeId": compose_id}),
-        headers={"Accept": "application/json", "x-api-key": api_token},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read(1_000_001)
-        if len(raw) > 1_000_000:
-            raise PostgrestError("dokploy_component_identity_invalid")
-        item = json.loads(raw)
-    except PostgrestError:
-        raise
-    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise PostgrestError("dokploy_component_identity_unavailable") from exc
-    app_name = item.get("appName") if isinstance(item, dict) else None
-    if (
-        not isinstance(item, dict)
-        or item.get("composeId") != compose_id
-        or item.get("composeType") != "docker-compose"
-        or item.get("sourceType") != "raw"
-        or not isinstance(app_name, str)
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,62}", app_name)
-    ):
-        raise PostgrestError("dokploy_component_identity_invalid")
-    return app_name
-
-
 def unique_container(component: str, service: str) -> str:
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", service):
-        raise PostgrestError("docker_service_identity_invalid")
-    project = dokploy_app_name(component)
+    expected_service = DIRECT_COMPOSE_SERVICES.get(component)
+    if expected_service is None or service != expected_service:
+        raise PostgrestError(f"direct_compose_identity_invalid:{component}:{service}")
     result = run(
         [
             "docker",
             "ps",
             "-q",
             "--filter",
-            f"label=com.docker.compose.project={project}",
+            f"label=com.docker.compose.project={COMPOSE_PROJECT}",
             "--filter",
             f"label=com.docker.compose.service={service}",
             "--filter",
@@ -351,7 +301,6 @@ def database() -> dict[str, Any]:
         ("POSTGREST_READER_ROLE", None),
         ("POSTGREST_WRITER_ROLE", None),
         ("POSTGREST_PAPERCLIP_ROLE", None),
-        ("POSTGREST_ACTIVEPIECES_ROLE", None),
     )
     for role_key, password_key in roles:
         converge_role(
@@ -367,15 +316,14 @@ def database() -> dict[str, Any]:
     reader = sql_identifier(values["POSTGREST_READER_ROLE"])
     writer = sql_identifier(values["POSTGREST_WRITER_ROLE"])
     paperclip = sql_identifier(values["POSTGREST_PAPERCLIP_ROLE"])
-    activepieces = sql_identifier(values["POSTGREST_ACTIVEPIECES_ROLE"])
     owner_id = sql_identifier(owner)
     psql(
         values,
         values["POSTGRES_ADMIN_DB"],
         f"""
 REVOKE CONNECT ON DATABASE {sql_identifier(database_name)} FROM PUBLIC;
-GRANT {anon}, {reader}, {writer}, {paperclip}, {activepieces} TO {auth};
-GRANT CONNECT ON DATABASE {sql_identifier(database_name)} TO {owner_id}, {auth}, {paperclip}, {activepieces};
+GRANT {anon}, {reader}, {writer}, {paperclip} TO {auth};
+GRANT CONNECT ON DATABASE {sql_identifier(database_name)} TO {owner_id}, {auth}, {paperclip};
 """,
     )
     psql(
@@ -385,7 +333,7 @@ GRANT CONNECT ON DATABASE {sql_identifier(database_name)} TO {owner_id}, {auth},
 CREATE SCHEMA IF NOT EXISTS api AUTHORIZATION {owner_id};
 ALTER SCHEMA api OWNER TO {owner_id};
 REVOKE ALL ON SCHEMA api FROM PUBLIC;
-GRANT USAGE ON SCHEMA api TO {reader}, {writer}, {paperclip}, {activepieces};
+GRANT USAGE ON SCHEMA api TO {reader}, {writer}, {paperclip};
 CREATE TABLE IF NOT EXISTS api.prototype_items (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   title text NOT NULL,
@@ -595,17 +543,17 @@ CREATE TRIGGER mte_documents_projection_outbox
   FOR EACH ROW EXECUTE FUNCTION api.mte_enqueue_provider_projection('document');
 REVOKE ALL ON ALL TABLES IN SCHEMA api FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA api FROM PUBLIC;
-REVOKE ALL ON ALL TABLES IN SCHEMA api FROM {anon}, {reader}, {writer}, {paperclip}, {activepieces};
-REVOKE ALL ON ALL SEQUENCES IN SCHEMA api FROM {anon}, {reader}, {writer}, {paperclip}, {activepieces};
+REVOKE ALL ON ALL TABLES IN SCHEMA api FROM {anon}, {reader}, {writer}, {paperclip};
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA api FROM {anon}, {reader}, {writer}, {paperclip};
 GRANT SELECT ON ALL TABLES IN SCHEMA api TO {reader};
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA api TO {writer};
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA api TO {writer};
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
   api.prototype_items, api.canonical_entities, api.canonical_documents
-  TO {paperclip}, {activepieces};
+  TO {paperclip};
 GRANT SELECT ON TABLE api.provider_sync_state, api.provider_outbox
-  TO {paperclip}, {activepieces};
-GRANT USAGE, SELECT ON SEQUENCE api.prototype_items_id_seq TO {paperclip}, {activepieces};
+  TO {paperclip};
+GRANT USAGE, SELECT ON SEQUENCE api.prototype_items_id_seq TO {paperclip};
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_id} IN SCHEMA api GRANT SELECT ON TABLES TO {reader};
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_id} IN SCHEMA api GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {writer};
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_id} IN SCHEMA api GRANT USAGE, SELECT ON SEQUENCES TO {writer};
@@ -631,7 +579,6 @@ BEGIN
     EXECUTE format('DROP POLICY IF EXISTS mte_writer_all ON api.%I', table_name);
     EXECUTE format('DROP POLICY IF EXISTS mte_owner_all ON api.%I', table_name);
     EXECUTE format('DROP POLICY IF EXISTS mte_paperclip_canary_rows ON api.%I', table_name);
-    EXECUTE format('DROP POLICY IF EXISTS mte_activepieces_canary_rows ON api.%I', table_name);
     EXECUTE format('CREATE POLICY mte_reader_all ON api.%I FOR SELECT TO %I USING (true)', table_name, {sql_literal(values["POSTGREST_READER_ROLE"])});
     EXECUTE format('CREATE POLICY mte_writer_all ON api.%I FOR ALL TO %I USING (true) WITH CHECK (true)', table_name, {sql_literal(values["POSTGREST_WRITER_ROLE"])});
     EXECUTE format('CREATE POLICY mte_owner_all ON api.%I FOR ALL TO %I USING (true) WITH CHECK (true)', table_name, {sql_literal(owner)});
@@ -640,24 +587,14 @@ END
 $policies$;
 CREATE POLICY mte_paperclip_canary_rows ON api.prototype_items FOR ALL TO {paperclip}
   USING (title LIKE 'MTE-C027-%') WITH CHECK (title LIKE 'MTE-C027-%');
-CREATE POLICY mte_activepieces_canary_rows ON api.prototype_items FOR ALL TO {activepieces}
-  USING (title LIKE 'mte-ap-postgrest-%') WITH CHECK (title LIKE 'mte-ap-postgrest-%');
 CREATE POLICY mte_paperclip_canary_rows ON api.canonical_entities FOR ALL TO {paperclip}
   USING (external_object_id LIKE 'MTE-C027-%') WITH CHECK (external_object_id LIKE 'MTE-C027-%');
-CREATE POLICY mte_activepieces_canary_rows ON api.canonical_entities FOR ALL TO {activepieces}
-  USING (external_object_id LIKE 'mte-ap-postgrest-%') WITH CHECK (external_object_id LIKE 'mte-ap-postgrest-%');
 CREATE POLICY mte_paperclip_canary_rows ON api.canonical_documents FOR ALL TO {paperclip}
   USING (external_object_id LIKE 'MTE-C027-%') WITH CHECK (external_object_id LIKE 'MTE-C027-%');
-CREATE POLICY mte_activepieces_canary_rows ON api.canonical_documents FOR ALL TO {activepieces}
-  USING (external_object_id LIKE 'mte-ap-postgrest-%') WITH CHECK (external_object_id LIKE 'mte-ap-postgrest-%');
 CREATE POLICY mte_paperclip_canary_rows ON api.provider_sync_state FOR SELECT TO {paperclip}
   USING (external_object_id LIKE 'MTE-C027-%');
-CREATE POLICY mte_activepieces_canary_rows ON api.provider_sync_state FOR SELECT TO {activepieces}
-  USING (external_object_id LIKE 'mte-ap-postgrest-%');
 CREATE POLICY mte_paperclip_canary_rows ON api.provider_outbox FOR SELECT TO {paperclip}
   USING (external_object_id LIKE 'MTE-C027-%');
-CREATE POLICY mte_activepieces_canary_rows ON api.provider_outbox FOR SELECT TO {activepieces}
-  USING (external_object_id LIKE 'mte-ap-postgrest-%');
 NOTIFY pgrst, 'reload schema';
 """,
     )
@@ -673,7 +610,6 @@ NOTIFY pgrst, 'reload schema';
 def verify_database_authorization(values: dict[str, str]) -> dict[str, Any]:
     database_name = values["POSTGREST_DATA_DB_NAME"]
     paperclip = values["POSTGREST_PAPERCLIP_ROLE"]
-    activepieces = values["POSTGREST_ACTIVEPIECES_ROLE"]
     reader = values["POSTGREST_READER_ROLE"]
     writer = values["POSTGREST_WRITER_ROLE"]
     anon = values["POSTGREST_ANON_ROLE"]
@@ -689,12 +625,11 @@ SELECT concat_ws('|',
     WHERE n.nspname='api' AND c.relname=ANY(ARRAY['prototype_items','canonical_entities','canonical_documents','provider_sync_state','provider_outbox'])),
   (SELECT count(*) FROM pg_policies WHERE schemaname='api' AND policyname='mte_reader_all'),
   (SELECT count(*) FROM pg_policies WHERE schemaname='api' AND policyname='mte_writer_all'),
-  (SELECT count(*) FROM pg_policies WHERE schemaname='api' AND policyname='mte_paperclip_canary_rows' AND {sql_literal(paperclip)}=ANY(roles) AND qual LIKE '%MTE-C027-%'),
-  (SELECT count(*) FROM pg_policies WHERE schemaname='api' AND policyname='mte_activepieces_canary_rows' AND {sql_literal(activepieces)}=ANY(roles) AND qual LIKE '%mte-ap-postgrest-%')
+  (SELECT count(*) FROM pg_policies WHERE schemaname='api' AND policyname='mte_paperclip_canary_rows' AND {sql_literal(paperclip)}=ANY(roles) AND qual LIKE '%MTE-C027-%')
 );
 """,
     )
-    if policy_state != "t|5|5|5|5|5":
+    if policy_state != "t|5|5|5|5":
         raise PostgrestError("postgrest_rls_policy_contract_invalid")
     privilege_state = psql(
         values,
@@ -708,20 +643,14 @@ SELECT concat_ws('|',
   has_table_privilege({sql_literal(paperclip)}, 'api.provider_sync_state', 'INSERT'),
   has_table_privilege({sql_literal(paperclip)}, 'api.provider_outbox', 'SELECT'),
   has_table_privilege({sql_literal(paperclip)}, 'api.provider_outbox', 'INSERT'),
-  has_table_privilege({sql_literal(activepieces)}, 'api.prototype_items', 'SELECT,INSERT,UPDATE,DELETE'),
-  has_table_privilege({sql_literal(activepieces)}, 'api.canonical_entities', 'SELECT,INSERT,UPDATE,DELETE'),
-  has_table_privilege({sql_literal(activepieces)}, 'api.canonical_documents', 'SELECT,INSERT,UPDATE,DELETE'),
-  has_table_privilege({sql_literal(activepieces)}, 'api.provider_sync_state', 'SELECT'),
-  has_table_privilege({sql_literal(activepieces)}, 'api.provider_outbox', 'SELECT'),
   has_table_privilege({sql_literal(reader)}, 'api.canonical_entities', 'SELECT'),
   has_table_privilege({sql_literal(writer)}, 'api.canonical_documents', 'SELECT,INSERT,UPDATE,DELETE'),
   has_schema_privilege({sql_literal(paperclip)}, 'api', 'USAGE'),
-  has_schema_privilege({sql_literal(activepieces)}, 'api', 'USAGE'),
   has_table_privilege({sql_literal(anon)}, 'api.canonical_entities', 'SELECT')
 );
 """,
     )
-    if privilege_state != "t|t|t|t|f|t|f|t|t|t|t|t|t|t|t|t|f":
+    if privilege_state != "t|t|t|t|f|t|f|t|t|t|f":
         raise PostgrestError("postgrest_role_privilege_contract_invalid")
     ownership_state = psql(
         values,
@@ -743,8 +672,7 @@ SELECT concat_ws('|',
     return {
         "rlsEnabled": True,
         "paperclipRole": paperclip,
-        "activepiecesRole": activepieces,
-        "rolesDistinct": paperclip != activepieces,
+        "paperclipRoleScoped": True,
         "anonymousDenied": True,
         "canonicalTables": ["canonical_entities", "canonical_documents"],
         "projectionStateTables": ["provider_sync_state", "provider_outbox"],
@@ -894,7 +822,7 @@ def provision_scoped_tokens(values: dict[str, str]) -> dict[str, Any]:
     )
     current = dotenv()
     tokens = [current.get(key, "") for key in SCOPED_TOKEN_SPECS]
-    if len(set(tokens)) != 2 or not all(
+    if len(set(tokens)) != len(SCOPED_TOKEN_SPECS) or not all(tokens) or not all(
         scoped_token_valid(values, current.get(key, ""), token_id, values[role_ref])
         for key, (token_id, role_ref) in SCOPED_TOKEN_SPECS.items()
     ):
@@ -964,9 +892,7 @@ def provision() -> dict[str, Any]:
         "canonical": provision_scoped_tokens(values),
         "roleBindings": {
             "paperclip": values["POSTGREST_PAPERCLIP_ROLE"],
-            "activepieces": values["POSTGREST_ACTIVEPIECES_ROLE"],
-            "distinct": values["POSTGREST_PAPERCLIP_ROLE"]
-            != values["POSTGREST_ACTIVEPIECES_ROLE"],
+            "scoped": True,
         },
     }
 
@@ -975,76 +901,62 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     atomic_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def rls_role_isolation_canary(values: dict[str, str], base: str) -> dict[str, Any]:
-    scoped = (
-        (
-            "paperclip",
-            values.get("POSTGREST_PAPERCLIP_TOKEN", ""),
-            "MTE-C027-postgrest-verifier-" + secrets.token_hex(8),
-        ),
-        (
-            "activepieces",
-            values.get("POSTGREST_ACTIVEPIECES_TOKEN", ""),
-            "mte-ap-postgrest-verifier-" + secrets.token_hex(8),
-        ),
-    )
-    if not all(token for _name, token, _marker in scoped):
+def paperclip_scope_canary(values: dict[str, str], base: str) -> dict[str, Any]:
+    token = values.get("POSTGREST_PAPERCLIP_TOKEN", "")
+    if not token:
         raise PostgrestError("postgrest_scoped_token_missing")
-    created: list[tuple[int, str]] = []
+    marker = "MTE-C027-postgrest-verifier-" + secrets.token_hex(8)
+    row_id: int | None = None
     try:
-        for index, (name, token, marker) in enumerate(scoped):
-            other_name, other_token, _other_marker = scoped[1 - index]
-            _, value = request(
-                "POST",
-                base,
-                token=token,
-                body={"title": marker, "status": "created"},
-                expected={201},
-                prefer="return=representation",
-            )
-            if (
-                not isinstance(value, list)
-                or len(value) != 1
-                or not isinstance(value[0].get("id"), int)
-            ):
-                raise PostgrestError("postgrest_rls_create_contract_invalid")
-            row_id = value[0]["id"]
-            created.append((row_id, token))
-            item = base + f"?id=eq.{row_id}"
-            _, own_rows = request("GET", item, token=token)
-            if (
-                not isinstance(own_rows, list)
-                or len(own_rows) != 1
-                or own_rows[0].get("title") != marker
-            ):
-                raise PostgrestError(f"postgrest_{name}_rls_visibility_invalid")
-            _, cross_rows = request("GET", item, token=other_token)
-            if cross_rows != []:
-                raise PostgrestError(
-                    f"postgrest_{other_name}_cross_role_visibility_invalid"
-                )
-            request("DELETE", item, token=other_token, expected={200, 204})
-            _, after_cross_delete = request("GET", item, token=token)
-            if not isinstance(after_cross_delete, list) or len(after_cross_delete) != 1:
-                raise PostgrestError("postgrest_cross_role_delete_not_isolated")
-            request("DELETE", item, token=token, expected={200, 204})
-            created.pop()
+        _, value = request(
+            "POST",
+            base,
+            token=token,
+            body={"title": marker, "status": "created"},
+            expected={201},
+            prefer="return=representation",
+        )
+        if (
+            not isinstance(value, list)
+            or len(value) != 1
+            or not isinstance(value[0].get("id"), int)
+        ):
+            raise PostgrestError("postgrest_rls_create_contract_invalid")
+        row_id = value[0]["id"]
+        item = base + f"?id=eq.{row_id}"
+        _, own_rows = request("GET", item, token=token)
+        if (
+            not isinstance(own_rows, list)
+            or len(own_rows) != 1
+            or own_rows[0].get("title") != marker
+        ):
+            raise PostgrestError("postgrest_paperclip_rls_visibility_invalid")
+        denied_status, _ = request(
+            "POST",
+            base,
+            token=token,
+            body={
+                "title": "outside-paperclip-scope-" + secrets.token_hex(8),
+                "status": "created",
+            },
+            expected={403},
+            prefer="return=representation",
+        )
+        request("DELETE", item, token=token, expected={200, 204})
+        row_id = None
         return {
-            "paperclipRoleIsolated": True,
-            "activepiecesRoleIsolated": True,
-            "crossRoleReadDenied": True,
-            "crossRoleDeleteDenied": True,
+            "paperclipRoleScoped": True,
+            "outOfScopeWriteDenied": denied_status == 403,
             "cleanupCompleted": True,
         }
     finally:
-        for row_id, token in created:
+        if row_id is not None:
             request(
                 "DELETE",
                 base + f"?id=eq.{row_id}",
                 token=token,
                 expected={200, 204},
             )
-
 
 def canonical_ssot_canary(
     values: dict[str, str], api_root: str, reader: str, writer: str
@@ -1257,9 +1169,10 @@ def verify() -> dict[str, Any]:
     active_profile = values["DATA_CONTENT_PROFILE"]
     release = release_contract(active_profile)
     wait_ready(values["POSTGREST_HEALTH_URL"])
+    database_authorization = verify_database_authorization(values)
     api_root = f"http://127.0.0.1:{int(values['POSTGREST_ORIGIN_PORT'])}"
     base = api_root + "/prototype_items"
-    role_isolation = rls_role_isolation_canary(values, base)
+    role_isolation = paperclip_scope_canary(values, base)
     reader = jwt(values, values["POSTGREST_READER_ROLE"])
     writer = jwt(values, values["POSTGREST_WRITER_ROLE"])
     canonical_ownership = canonical_ssot_canary(values, api_root, reader, writer)
@@ -1331,6 +1244,7 @@ def verify() -> dict[str, Any]:
         "producerSha256": sha256_path(Path(__file__).resolve()),
         "release": release,
         "authorization": {
+            **database_authorization,
             "anonymousDenied": True,
             "readerWriteDenied": True,
             **role_isolation,

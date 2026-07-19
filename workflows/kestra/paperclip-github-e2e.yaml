@@ -1,8 +1,9 @@
 id: paperclip-github-e2e
 namespace: micro_task_engine.e2e
 description: >-
-  Native Paperclip E2E: Kestra reconciles one durable issue, Paperclip runs the
-  selected harness in Daytona, and GitHub independently proves the result.
+  R1 native Paperclip E2E: Kestra reconciles one durable issue, Paperclip runs
+  the selected Codex, Claude Code, or Pi profile in Daytona through its
+  configured MiniMax route in 9router, and GitHub independently proves the result.
 
 concurrency:
   limit: 1
@@ -19,6 +20,13 @@ inputs:
     type: STRING
     required: true
   - id: profile
+    type: SELECT
+    required: true
+    values:
+      - coding-daytona-codex
+      - coding-daytona-claude
+      - coding-daytona-pi
+  - id: controller_correlation_id
     type: STRING
     required: true
   - id: github_owner
@@ -32,10 +40,18 @@ inputs:
     required: true
 
 tasks:
+  - id: assert_r1_profile
+    type: io.kestra.plugin.core.execution.Assert
+    conditions:
+      - "{{ inputs.profile isIn ['coding-daytona-codex', 'coding-daytona-claude', 'coding-daytona-pi'] }}"
+    errorMessage: "Each R1 execution requires an explicit Codex, Claude Code, or Pi MiniMax-backed 9router profile."
+
   - id: paperclip_ready
     type: io.kestra.plugin.core.http.Request
     uri: "{{ inputs.paperclip_base_url }}/api/health"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
     retry:
       type: exponential
@@ -49,6 +65,8 @@ tasks:
     type: io.kestra.plugin.core.http.Request
     uri: "{{ inputs.paperclip_base_url }}/api/companies/{{ inputs.paperclip_company_id }}/agents"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
 
   - id: assert_profile_ready
@@ -64,6 +82,8 @@ tasks:
     type: io.kestra.plugin.core.http.Request
     uri: "{{ inputs.paperclip_base_url }}/api/companies/{{ inputs.paperclip_company_id }}/issues?projectId={{ inputs.paperclip_project_id }}"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
 
   - id: submit
@@ -72,22 +92,24 @@ tasks:
       {{ (outputs.issues_before.body | jq('[(if type == "array" then . else .data end)[] | select((.title // "") | contains("[kestra:' ~ execution.id ~ ']"))] | length') | first) == 0 }}
     uri: "{{ inputs.paperclip_base_url }}/api/companies/{{ inputs.paperclip_company_id }}/issues"
     method: POST
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     contentType: application/json
     body: |
       {
         "title": "[kestra:{{ execution.id }}] Paperclip GitHub E2E {{ inputs.profile }}",
         "description": {{ (
-          "Durable marker: kestra:" ~ execution.id ~ ". This marker is the idempotency and reconciliation key; never create a second issue for it. " ~
-          "Perform this bounded task in the assigned isolated Daytona workspace. Repository: https://github.com/" ~ inputs.github_owner ~ "/" ~ inputs.github_repository ~ ".git. " ~
-          "Start from origin/" ~ inputs.base_branch ~ " and create branch agent/paperclip-e2e-" ~ execution.id ~ ". " ~
-          "Do not modify pre-existing project files. Add only paperclip-e2e/marker.py, paperclip-e2e/test_marker.py, and .github/workflows/paperclip-e2e.yml. " ~
-          "marker() must return exactly PAPERCLIP_DAYTONA_E2E. The workflow name, job id, and explicit job name must each be exactly paperclip-e2e and run the unittest. " ~
-          "Create exactly one commit whose sole parent is the current origin/" ~ inputs.base_branch ~ " commit, push it, and open a DRAFT pull request titled Paperclip Daytona E2E " ~ execution.id ~ ". Never merge it. " ~
-          "Use the installed GitHub CLI for GitHub operations: gh repo clone, git push over the normal HTTPS remote, and gh pr create --draft. GH_TOKEN is injected by Paperclip for this run; never put a token into a URL, command argument, config file, or remote. " ~
-          "Before setting this issue done, create or update the keyed issue document harness-evidence. Its body must be raw JSON with schemaVersion paperclip-agent-platform/harness-evidence/v3; profileRef; repository; branch; commitSha; pullRequest; localTest; daytona; harness; timestamps; and toolhive. " ~
-          "Set harness.name to codex, claude, or pi according to the selected profile. Paperclip must invoke that officially installed CLI directly. Do not add nativeInvocation, runnerAttestation, paperclipAuth, authProof, llm, or ninerouter: the platform verifies Paperclip lifecycle, the direct Daytona executable and 9router LLM traffic independently. " ~
-          "toolhive must use the current profile endpoint and bearer, prove unauthorized and wrong-profile rejection, and call the harmless echo tool. The marker and runId must use the exact native Paperclip issue ID. " ~
-          "Never include credentials, authorization headers, environment dumps, JWTs, prompts, or completions. Success is impossible until the local test, push, draft PR, and keyed evidence document all succeed."
+          "EXECUTE NOW. This is a real-change canary, not a planning task: use the harness shell or tool interface before emitting any narrative. A plan, explanation, proposed command, checklist, acceptance restatement, or future-work promise without observed command output is plan-only and rejected. Completion is eligible only after this run has produced and recorded the exact three changed paths, local test exit 0, one commit SHA, one draft PR number and URL, a successful paperclip-e2e check, and ToolHive audit evidence. Do not answer with a plan, repeat these instructions, or end a heartbeat with 'let me', 'next I will', or another future-work promise. Perform every checkpoint in order in this heartbeat; after a command failure inspect once and repair immediately. Stop only on a concrete external denial with the failed checkpoint and sanitized error. " ~
+          "Durable marker: kestra:" ~ execution.id ~ ". Controller correlation: " ~ inputs.controller_correlation_id ~ ". These are recovery keys; never create a second issue. Work only in the assigned isolated disposable Daytona workspace for https://github.com/" ~ inputs.github_owner ~ "/" ~ inputs.github_repository ~ ".git. " ~
+          "CHECKPOINT 1 - adopt or resume git. Never use gh repo clone and never clone into this nonempty directory. If .git is absent, preserve any of the exact three allowed harness files already present, then run in place: git init; grep -qxF '/.paperclip-runtime/' .git/info/exclude || printf '/.paperclip-runtime/\\n' >> .git/info/exclude; git remote add origin https://github.com/" ~ inputs.github_owner ~ "/" ~ inputs.github_repository ~ ".git; git fetch --no-tags origin " ~ inputs.base_branch ~ "; git reset --hard FETCH_HEAD; git checkout -B agent/paperclip-e2e-" ~ execution.id ~ " FETCH_HEAD; test \"$(git rev-parse HEAD)\" = \"$(git rev-parse FETCH_HEAD)\"; test -z \"$(git status --porcelain --untracked-files=all -- . ':(exclude)paperclip-e2e/marker.py' ':(exclude)paperclip-e2e/test_marker.py' ':(exclude).github/workflows/paperclip-e2e.yml')\". This reset is permitted only for first bootstrap here. If .git exists, run git remote get-url origin and git branch --show-current, require the credential-free HTTPS remote and branch agent/paperclip-e2e-" ~ execution.id ~ ", and continue without init, clone, reset, checkout, cleanup, or discarding changes. " ~
+          "CHECKPOINT 2 - create or correct only paperclip-e2e/marker.py, paperclip-e2e/test_marker.py, and .github/workflows/paperclip-e2e.yml; preserve correct earlier work. Never create paperclip-e2e/__init__.py, another __init__.py, or a fourth file. marker.py has only def marker(): returning \"PAPERCLIP_DAYTONA_E2E\". test_marker.py has only import unittest, from marker import marker, and class TestMarker(unittest.TestCase) with exactly def test_marker(self): calling self.assertEqual(marker(), \"PAPERCLIP_DAYTONA_E2E\"); no __main__ block. The workflow top-level keys are only name, on, jobs; name is exactly paperclip-e2e; on is only pull_request; jobs has only job ID paperclip-e2e whose name is exactly paperclip-e2e and runs-on is ubuntu-latest; its only two steps are actions/checkout@v4 then run: cd paperclip-e2e && python -m unittest test_marker.py. " ~
+          "CHECKPOINT 3 - run exactly: cd paperclip-e2e && python -m unittest test_marker.py. Return to the repository root, verify no path except the exact three is changed, and stage only those exact three paths. " ~
+          "CHECKPOINT 4 - run git fetch --no-tags origin " ~ inputs.base_branch ~ " and prove the one E2E commit has sole parent origin/" ~ inputs.base_branch ~ ". Create it if absent or amend it if it already exists; never create a second commit. Push branch agent/paperclip-e2e-" ~ execution.id ~ " through the credential-free HTTPS remote. Use the installed GitHub CLI only for gh pr create --draft and GitHub API/check operations; open or reuse exactly one DRAFT PR titled Paperclip Daytona E2E " ~ execution.id ~ ", never merge it, then run gh pr checks --watch --fail-fast and require the paperclip-e2e check to succeed. GH_TOKEN is injected; never put a token in a URL, command argument, config file, or remote. " ~
+          "CHECKPOINT 5 - execute the ToolHive audit here; no controller synthesis. In set +x, resolve endpoint_ref=$MTE_TOOLHIVE_ENDPOINT_REF with printenv, and use $MTE_TOOLHIVE_WRONG_PROFILE_MCP_URL, $MTE_TOOLHIVE_BEARER_TOKEN, and marker mte-c010:" ~ inputs.profile ~ ":${PAPERCLIP_TASK_ID}. With curl temp header/body files, umask 077, and cleanup trap, POST JSON-RPC 2.0 using Accept: application/json, text/event-stream, Content-Type: application/json, and bearer only through printf 'Authorization: Bearer %s\\n' ... | curl --header @-. Send initialize id 1 with protocolVersion 2025-03-26, empty capabilities, clientInfo paperclip-e2e/1; extract its nonempty mcp-session-id response header; send that exact mcp-session-id request header on notifications/initialized, tools/list id 2, and tools/call id 3 with name $MTE_TOOLHIVE_CANARY_TOOL and arguments {\"message\":marker}. Require statuses exactly 200 for initialize, 202 for notifications/initialized, 200 for tools/list, and 200 for tools/call; require echo listed and exact marker returned. Require 401 for initialize without Authorization at $endpoint and 401 with current bearer at the wrong endpoint. Hash exact endpoint and marker UTF-8 bytes, exact tools/list body bytes, and exact tools/call body bytes; do not normalize JSON. Emit no bodies or bearer. toolhive uses profileRef=" ~ inputs.profile ~ "; runId=$PAPERCLIP_TASK_ID; bundleId=$MTE_TOOLHIVE_BUNDLE_ID; workloadId=$MTE_TOOLHIVE_WORKLOAD_ID; endpointRef/runtimeEndpointEnv=$MTE_TOOLHIVE_ENDPOINT_REF; endpointSha256; credentialRef=$MTE_TOOLHIVE_BINDING_REF; bearerRuntimeEnv=MTE_TOOLHIVE_BEARER_TOKEN; canaryTool/toolName=$MTE_TOOLHIVE_CANARY_TOOL; runnerOrigin=daytona; initialize/toolsList/canaryCall=true; httpStatus=the tools/call HTTP status 200; unauthorizedStatus=401; wrongProfileEndpointRef mapping codex->MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL, claude->MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL, pi->MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL; wrongProfileDenied=true; wrongProfileStatus=401; gatewayReachableHost/Port parsed from endpoint; credentialLeak=false; markerSha256=echoedMarkerSha256; toolsListSha256; resultSha256. " ~
+          "CHECKPOINT 6 - after test, push, draft PR, check, and ToolHive audit, build raw harness-evidence JSON: schemaVersion=\"paperclip-agent-platform/harness-evidence/v3\"; profileRef=" ~ inputs.profile ~ "; repository=" ~ inputs.github_owner ~ "/" ~ inputs.github_repository ~ "; branch=agent/paperclip-e2e-" ~ execution.id ~ "; commitSha is the draft PR head SHA; pullRequest={number:integer,url:nonempty string,draft:true}; changedFiles is exactly [\".github/workflows/paperclip-e2e.yml\",\"paperclip-e2e/marker.py\",\"paperclip-e2e/test_marker.py\"] sorted; githubCheck={name:\"paperclip-e2e\",conclusion:\"success\"}; localTest={command:\"cd paperclip-e2e && python -m unittest test_marker.py\",exitCode:0}; daytona={provider:\"daytona\",sandboxId:nonempty string}; harness={name:codex/claude/pi matching profile}; timestamps={startedAt/finishedAt timezone-aware ISO-8601 strings, finishedAt not earlier}; toolhive as checkpoint 5. These are observed action evidence, never planned values. Obtain daytona.sandboxId without guessing: authenticated GET ${PAPERCLIP_API_URL%/}/api/issues/${PAPERCLIP_TASK_ID}/runs, select the row whose .id or .runId equals injected $PAPERCLIP_RUN_ID, require provider daytona, then use .environmentLease.metadata.sandboxId // .environmentLease.providerLeaseId and require a nonempty string. Forbid nativeInvocation, runnerAttestation, paperclipAuth, authProof, llm, ninerouter. " ~
+          "The sandbox has no paperclipai CLI. Write raw JSON only to /tmp/harness-evidence.json, then run this fail-closed contract unchanged: set +x; set -euo pipefail; umask 077; trap 'rm -f /tmp/harness-evidence.json /tmp/harness-evidence-envelope.json' EXIT; jq -e . /tmp/harness-evidence.json >/dev/null; jq -n --rawfile body /tmp/harness-evidence.json '{title:\"Harness evidence\",format:\"markdown\",body:$body,changeSummary:\"R1 harness evidence\"}' > /tmp/harness-evidence-envelope.json; printf 'Authorization: Bearer %s\\n' \"$PAPERCLIP_API_KEY\" | curl --fail-with-body --silent --show-error --request PUT --url \"${PAPERCLIP_API_URL%/}/api/issues/${PAPERCLIP_TASK_ID}/documents/harness-evidence\" --header @- --header \"Content-Type: application/json\" --data-binary @/tmp/harness-evidence-envelope.json >/dev/null; printf 'Authorization: Bearer %s\\n' \"$PAPERCLIP_API_KEY\" | curl --fail-with-body --silent --show-error --request PATCH --url \"${PAPERCLIP_API_URL%/}/api/issues/${PAPERCLIP_TASK_ID}\" --header @- --header \"Content-Type: application/json\" --data-binary '{\"status\":\"done\"}' >/dev/null. Because set -e is active, PATCH done runs only after PUT succeeds. Never split the pipeline; bearer stays out of arguments; temporary files are removed on exit; print no PAPERCLIP value. " ~
+          "This R1 run must use the officially installed harness selected for this issue (Codex, Claude Code, or Pi) through its configured MiniMax route in 9router. Do not require or attempt a Codex or Claude subscription, login, or OAuth flow; use only the profile-scoped runtime key supplied by Paperclip. Do not add nativeInvocation, runnerAttestation, paperclipAuth, authProof, llm, or ninerouter: the platform verifies Paperclip lifecycle, the direct Daytona executable and 9router LLM traffic independently. " ~
+          "Never include credentials, authorization headers, environment dumps, JWTs, prompts, completions, or raw ToolHive results. Mark done only after all six checkpoints succeed; otherwise report the failed checkpoint, not a plan."
         ) | json }},
         "status": "todo",
         "priority": "medium",
@@ -106,6 +128,8 @@ tasks:
     type: io.kestra.plugin.core.http.Request
     uri: "{{ inputs.paperclip_base_url }}/api/companies/{{ inputs.paperclip_company_id }}/issues?projectId={{ inputs.paperclip_project_id }}"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
     retry:
       type: constant
@@ -125,7 +149,7 @@ tasks:
   - id: wait_for_agent
     type: io.kestra.plugin.core.flow.LoopUntil
     condition: >-
-      {{ (outputs.poll_issue.body | jq('.status') | first) isIn ['done', 'blocked', 'cancelled'] or (outputs.poll_runs.body | jq('if length == 0 then "" else (sort_by(.createdAt) | last | .status) end') | first) isIn ['succeeded', 'failed', 'cancelled', 'timed_out'] }}
+      {{ (outputs.poll_issue.body | jq('.status') | first) isIn ['blocked', 'cancelled'] or ((outputs.poll_issue.body | jq('.status') | first) == 'done' and (outputs.poll_runs.body | jq('if length == 0 then "" else (sort_by(.createdAt) | last | .status) end') | first) isIn ['succeeded', 'failed', 'cancelled', 'timed_out']) }}
     checkFrequency:
       interval: PT10S
       maxDuration: PT35M
@@ -136,44 +160,79 @@ tasks:
         type: io.kestra.plugin.core.http.Request
         uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.issues_after.body | jq('[(if type == \"array\" then . else .data end)[] | select((.title // \"\") | contains(\"[kestra:' ~ execution.id ~ ']\"))][0].id') | first }}"
         method: GET
+        headers:
+          Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
         timeout: PT10S
       - id: poll_runs
         type: io.kestra.plugin.core.http.Request
         uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.issues_after.body | jq('[(if type == \"array\" then . else .data end)[] | select((.title // \"\") | contains(\"[kestra:' ~ execution.id ~ ']\"))][0].id') | first }}/runs"
         method: GET
+        headers:
+          Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
         timeout: PT10S
 
   - id: assert_agent_succeeded
     type: io.kestra.plugin.core.execution.Assert
     conditions:
       - "{{ (outputs.poll_issue.body | jq('.status') | first) == 'done' }}"
-      - "{{ (outputs.poll_runs.body | jq('length == 1') | first) == true }}"
+      - "{{ (outputs.poll_runs.body | jq('length >= 1 and length <= 32') | first) == true }}"
+      - >-
+        {{ (outputs.poll_runs.body | jq('all(.[]; .agentId == "' ~ (outputs.profile_agents.body | jq('[(if type == "array" then . else .data end)[] | select(.metadata.profileRef == "' ~ inputs.profile ~ '")][0].id') | first) ~ '" and .adapterType == "' ~ (outputs.profile_agents.body | jq('[(if type == "array" then . else .data end)[] | select(.metadata.profileRef == "' ~ inputs.profile ~ '")][0].adapterType') | first) ~ '" and (.status == "succeeded" or .status == "failed"))') | first) == true }}
       - "{{ (outputs.poll_runs.body | jq('(sort_by(.createdAt) | last | .status) == \"succeeded\"') | first) == true }}"
-    errorMessage: "Native Paperclip issue or heartbeat run did not succeed exactly once."
+    errorMessage: "Native Paperclip issue did not finish within the bounded 35-minute, at-most-32-run identity-stable heartbeat chain."
 
   - id: native_heartbeat
     type: io.kestra.plugin.core.http.Request
-    uri: "{{ inputs.paperclip_base_url }}/api/heartbeat-runs/{{ outputs.poll_runs.body | jq('sort_by(.createdAt) | last | .id') | first }}"
+    uri: "{{ inputs.paperclip_base_url }}/api/heartbeat-runs/{{ outputs.poll_runs.body | jq('sort_by(.createdAt) | last | (.id // .runId)') | first }}"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
 
   - id: heartbeat_events
     type: io.kestra.plugin.core.http.Request
-    uri: "{{ inputs.paperclip_base_url }}/api/heartbeat-runs/{{ outputs.poll_runs.body | jq('sort_by(.createdAt) | last | .id') | first }}/events"
+    uri: "{{ inputs.paperclip_base_url }}/api/heartbeat-runs/{{ outputs.poll_runs.body | jq('sort_by(.createdAt) | last | (.id // .runId)') | first }}/events"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
 
   - id: wake_events
     type: io.kestra.plugin.core.http.Request
     uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.poll_issue.body | jq('.id') | first }}/diagnostics/wakes"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
 
   - id: environment_lease
     type: io.kestra.plugin.core.http.Request
-    uri: "{{ inputs.paperclip_base_url }}/api/environment-leases/{{ outputs.poll_runs.body | jq('sort_by(.createdAt) | last | .environmentLease.id') | first }}"
+    uri: >-
+      {{ inputs.paperclip_base_url }}/api/environment-leases/{{ outputs.poll_runs.body | jq('[.[] | select(.environmentLease.provider == "daytona" and .environmentLease.providerLeaseId != null and .environmentLease.status == "expired" and .environmentLease.cleanupStatus == "success") | {createdAt: .createdAt, leaseId: .environmentLease.id}] | sort_by(.createdAt) | last | .leaseId') | first }}
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT10S
+
+  - id: verify_environment_lease_groups
+    type: io.kestra.plugin.core.flow.ForEach
+    values: >-
+      {{ outputs.poll_runs.body | jq('[.[] | .environmentLease | select(.provider == "daytona" and .providerLeaseId != null and .id != null) | .providerLeaseId] | unique') | first }}
+    concurrencyLimit: 1
+    tasks:
+      - id: provider_environment_lease
+        type: io.kestra.plugin.core.http.Request
+        uri: >-
+          {{ inputs.paperclip_base_url }}/api/environment-leases/{{ outputs.poll_runs.body | jq('[.[] | .environmentLease | select(.providerLeaseId == "' ~ taskrun.value ~ '" and .status == "expired" and .cleanupStatus == "success") | .id] | first // ""') | first }}
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
+        timeout: PT10S
+      - id: assert_provider_environment_lease_deleted
+        type: io.kestra.plugin.core.execution.Assert
+        conditions:
+          - "{{ (outputs.provider_environment_lease[taskrun.value].body | jq('.provider == \"daytona\" and .providerLeaseId == \"' ~ taskrun.value ~ '\" and .issueId == \"' ~ (outputs.poll_issue.body | jq('.id') | first) ~ '\" and .status == \"expired\" and .cleanupStatus == \"success\"') | first) == true }}"
+        errorMessage: "Paperclip did not prove one successful expired lease for every unique Daytona provider resource in the heartbeat chain."
 
   - id: assert_native_identity
     type: io.kestra.plugin.core.execution.Assert
@@ -182,23 +241,28 @@ tasks:
       - "{{ (outputs.heartbeat_events.body | jq('length >= 3') | first) == true }}"
       - "{{ (outputs.wake_events.body | jq('(.events // []) | map(select(.runId == \"' ~ (outputs.native_heartbeat.body | jq('.id') | first) ~ '\")) | length == 1') | first) == true }}"
       - "{{ (outputs.environment_lease.body | jq('.provider == \"daytona\" and .id != null and .providerLeaseId != null and .executionWorkspaceId != null and .workspacePath != null') | first) == true }}"
+      - "{{ (outputs.environment_lease.body | jq('.status == \"expired\" and .cleanupStatus == \"success\"') | first) == true }}"
     errorMessage: "Paperclip native heartbeat, unique wake, or Daytona lease identity is incomplete."
 
   - id: harness_document
     type: io.kestra.plugin.core.http.Request
     uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.poll_issue.body | jq('.id') | first }}/documents/harness-evidence"
     method: GET
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     timeout: PT15S
 
   - id: assert_harness_evidence
     type: io.kestra.plugin.core.execution.Assert
     conditions:
       - >-
-        {{ (outputs.harness_document.body | jq('(.body | fromjson) | .schemaVersion == "paperclip-agent-platform/harness-evidence/v3" and .profileRef == "' ~ inputs.profile ~ '" and .branch == "agent/paperclip-e2e-' ~ execution.id ~ '" and .daytona.provider == "daytona" and (.daytona.sandboxId | type == "string" and length > 0) and .localTest.exitCode == 0') | first) == true }}
+        {{ (outputs.harness_document.body | jq('(.body | fromjson) | .schemaVersion == "paperclip-agent-platform/harness-evidence/v3" and .profileRef == "' ~ inputs.profile ~ '" and .branch == "agent/paperclip-e2e-' ~ execution.id ~ '" and .daytona.provider == "daytona" and (.daytona.sandboxId | type == "string" and length > 0) and .localTest.exitCode == 0 and (.commitSha | type == "string" and test("^[0-9a-f]{40}$")) and (.pullRequest.number | type == "number") and (.pullRequest.url | type == "string" and length > 0) and .pullRequest.draft == true and .changedFiles == [".github/workflows/paperclip-e2e.yml", "paperclip-e2e/marker.py", "paperclip-e2e/test_marker.py"] and .githubCheck.name == "paperclip-e2e" and .githubCheck.conclusion == "success"') | first) == true }}
       - >-
-        {{ (outputs.harness_document.body | jq('(.body | fromjson) | .harness.name == (if .profileRef == "coding-daytona-codex" then "codex" elif .profileRef == "coding-daytona-claude" then "claude" elif .profileRef == "coding-daytona-pi" then "pi" else "" end) and .timestamps.startedAt != null and .timestamps.finishedAt != null') | first) == true }}
+        {{ (outputs.harness_document.body | jq('(.body | fromjson) | .harness.name == ({"coding-daytona-codex":"codex","coding-daytona-claude":"claude","coding-daytona-pi":"pi"}["' ~ inputs.profile ~ '"]) and .timestamps.startedAt != null and .timestamps.finishedAt != null') | first) == true }}
       - >-
         {{ (outputs.harness_document.body | jq('(.body | fromjson) as $doc | (["nativeInvocation", "runnerAttestation", "paperclipAuth", "authProof", "llm", "ninerouter"] | all(. as $key | ($doc | has($key) | not)))') | first) == true }}
+      - >-
+        {{ (outputs.harness_document.body | jq('(.body | fromjson).toolhive as $t | ({"coding-daytona-codex":"mte-profile-coding-daytona-codex","coding-daytona-claude":"mte-profile-coding-daytona-claude","coding-daytona-pi":"mte-profile-coding-daytona-pi"}["' ~ inputs.profile ~ '"]) as $bundle | ({"coding-daytona-codex":"mte-profile-codex","coding-daytona-claude":"mte-profile-claude","coding-daytona-pi":"mte-profile-pi"}["' ~ inputs.profile ~ '"]) as $workload | ({"coding-daytona-codex":"MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL","coding-daytona-claude":"MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL","coding-daytona-pi":"MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL"}["' ~ inputs.profile ~ '"]) as $endpoint | ({"coding-daytona-codex":"TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN","coding-daytona-claude":"TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN","coding-daytona-pi":"TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN"}["' ~ inputs.profile ~ '"]) as $credential | ({"coding-daytona-codex":"MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL","coding-daytona-claude":"MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL","coding-daytona-pi":"MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL"}["' ~ inputs.profile ~ '"]) as $wrong | $t.profileRef == "' ~ inputs.profile ~ '" and $t.runId == "' ~ (outputs.poll_issue.body | jq('.id') | first) ~ '" and $t.bundleId == $bundle and $t.workloadId == $workload and $t.endpointRef == $endpoint and $t.runtimeEndpointEnv == $endpoint and $t.credentialRef == $credential and $t.bearerRuntimeEnv == "MTE_TOOLHIVE_BEARER_TOKEN" and $t.canaryTool == "echo" and $t.runnerOrigin == "daytona" and $t.toolName == "echo" and $t.initialize == true and $t.toolsList == true and $t.canaryCall == true and $t.httpStatus == 200 and $t.unauthorizedStatus == 401 and $t.wrongProfileEndpointRef == $wrong and $t.wrongProfileDenied == true and $t.wrongProfileStatus == 401 and $t.gatewayReachableHost == "172.20.0.1" and ($t.gatewayReachablePort | type) == "number" and $t.gatewayReachablePort == ($t.gatewayReachablePort | floor) and $t.gatewayReachablePort > 0 and $t.gatewayReachablePort < 65536 and $t.credentialLeak == false and $t.markerSha256 == $t.echoedMarkerSha256 and (["endpointSha256","markerSha256","echoedMarkerSha256","toolsListSha256","resultSha256"] | all(. as $key | ($t[$key] | type == "string" and test("^[0-9a-f]{64}$"))))') | first) == true }}
     errorMessage: "Keyed direct-harness evidence is absent, malformed, or contains deprecated wrapper attestation."
 
   - id: wait_for_draft_pr
@@ -206,8 +270,8 @@ tasks:
     condition: "{{ (outputs.github_pr.body | jq('length') | first) > 0 }}"
     checkFrequency:
       interval: PT10S
-      maxDuration: PT30S
-      maxIterations: 3
+      maxDuration: PT3M
+      maxIterations: 18
     failOnMaxReached: true
     tasks:
       - id: github_pr
@@ -224,9 +288,12 @@ tasks:
   - id: assert_draft_pr
     type: io.kestra.plugin.core.execution.Assert
     conditions:
+      - "{{ (outputs.github_pr.body | jq('length == 1') | first) == true }}"
       - "{{ (outputs.github_pr.body | jq('.[0].draft') | first) == true }}"
       - "{{ (outputs.github_pr.body | jq('.[0].head.ref') | first) == 'agent/paperclip-e2e-' ~ execution.id }}"
       - "{{ (outputs.github_pr.body | jq('.[0].base.ref') | first) == inputs.base_branch }}"
+      - "{{ (outputs.harness_document.body | jq('(.body | fromjson).pullRequest.number') | first) == (outputs.github_pr.body | jq('.[0].number') | first) }}"
+      - "{{ (outputs.harness_document.body | jq('(.body | fromjson).pullRequest.url') | first) == (outputs.github_pr.body | jq('.[0].html_url') | first) }}"
     errorMessage: "GitHub PR is missing, not draft, or points to the wrong refs."
 
   - id: github_pr_files
@@ -254,6 +321,8 @@ tasks:
     conditions:
       - "{{ (outputs.github_head_commit.body | jq('.parents | length == 1') | first) == true }}"
       - "{{ (outputs.github_head_commit.body | jq('.parents[0].sha') | first) == (outputs.github_pr.body | jq('.[0].base.sha') | first) }}"
+      - "{{ (outputs.harness_document.body | jq('(.body | fromjson).commitSha') | first) == (outputs.github_pr.body | jq('.[0].head.sha') | first) }}"
+      - "{{ (outputs.harness_document.body | jq('(.body | fromjson).changedFiles') | first) == [\".github/workflows/paperclip-e2e.yml\", \"paperclip-e2e/marker.py\", \"paperclip-e2e/test_marker.py\"] }}"
       - >-
         {{ (outputs.github_pr_files.body | jq('length == 3 and ([.[].filename] | sort) == [".github/workflows/paperclip-e2e.yml", "paperclip-e2e/marker.py", "paperclip-e2e/test_marker.py"] and all(.[]; .status == "added" and (.sha | test("^[0-9a-f]{40}$")))') | first) == true }}
     errorMessage: "PR revision is not the exact one-commit, three-added-file change."
@@ -285,12 +354,17 @@ tasks:
         {{ (outputs.github_checks.body | jq('.total_count > 0 and all(.check_runs[]; .status == "completed" and .conclusion == "success" and .head_sha == "' ~ (outputs.github_pr.body | jq('.[0].head.sha') | first) ~ '")') | first) == true }}
       - >-
         {{ (outputs.github_checks.body | jq('[.check_runs[] | select(.name == "paperclip-e2e" and .status == "completed" and .conclusion == "success")] | length == 1') | first) == true }}
+      - >-
+        {{ (outputs.harness_document.body | jq('(.body | fromjson).githubCheck.name == "paperclip-e2e" and (.body | fromjson).githubCheck.conclusion == "success"') | first) == true }}
     errorMessage: "GitHub checks are not all successful or the exact required check is absent."
 
   - id: evidence_values
     type: io.kestra.plugin.core.output.OutputValues
     values:
       kestraExecutionId: "{{ execution.id }}"
+      selectedProfile: "{{ inputs.profile }}"
+      llmProvider: minimax
+      llmGateway: 9router
       durableIssueMarker: "kestra:{{ execution.id }}"
       paperclipIssueId: "{{ outputs.poll_issue.body | jq('.id') | first }}"
       paperclipIssueIdentifier: "{{ outputs.poll_issue.body | jq('.identifier') | first }}"
@@ -332,37 +406,125 @@ tasks:
       paperclipIssueId: "{{ outputs.poll_issue.body | jq('.id') | first }}"
 
 errors:
-  - id: cancel_nonterminal_heartbeat
+  - id: cancel_issue_and_native_chain
     type: io.kestra.plugin.core.http.Request
-    runIf: "{{ outputs.native_heartbeat is defined and (outputs.native_heartbeat.body | jq('.status') | first) not in ['succeeded', 'failed', 'cancelled', 'timed_out'] }}"
-    uri: "{{ inputs.paperclip_base_url }}/api/heartbeat-runs/{{ outputs.native_heartbeat.body | jq('.id') | first }}/cancel"
-    method: POST
+    runIf: >-
+      {{ outputs.issues_after is defined and (outputs.issues_after.body | jq('[(if type == "array" then . else .data end)[] | select((.title // "") | contains("[kestra:' ~ execution.id ~ ']"))] | length') | first) == 1 }}
+    uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.issues_after.body | jq('[(if type == \"array\" then . else .data end)[] | select((.title // \"\") | contains(\"[kestra:' ~ execution.id ~ ']\"))][0].id') | first }}"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
     contentType: application/json
-    body: "{}"
+    body: '{"status":"cancelled"}'
     timeout: PT10S
-    allowFailure: true
 
-  - id: error_summary
+  - id: wait_for_cancelled_chain
+    type: io.kestra.plugin.core.flow.LoopUntil
+    runIf: >-
+      {{ outputs.issues_after is defined and (outputs.issues_after.body | jq('[(if type == "array" then . else .data end)[] | select((.title // "") | contains("[kestra:' ~ execution.id ~ ']"))] | length') | first) == 1 }}
+    condition: >-
+      {{ (outputs.poll_cancelled_issue.body | jq('.status') | first) == 'cancelled'
+        and (outputs.poll_cancelled_runs.body | jq('length <= 32 and all(.[]; (.status == "succeeded" or .status == "failed" or .status == "cancelled" or .status == "timed_out"))') | first) == true }}
+    checkFrequency:
+      interval: PT5S
+      maxDuration: PT2M
+      maxIterations: 24
+    failOnMaxReached: true
+    tasks:
+      - id: poll_cancelled_issue
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.issues_after.body | jq('[(if type == \"array\" then . else .data end)[] | select((.title // \"\") | contains(\"[kestra:' ~ execution.id ~ ']\"))][0].id') | first }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
+        timeout: PT10S
+      - id: poll_cancelled_runs
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.paperclip_base_url }}/api/issues/{{ outputs.issues_after.body | jq('[(if type == \"array\" then . else .data end)[] | select((.title // \"\") | contains(\"[kestra:' ~ execution.id ~ ']\"))][0].id') | first }}/runs"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
+        timeout: PT10S
+
+  - id: verify_cancelled_environment_leases
+    type: io.kestra.plugin.core.flow.ForEach
+    runIf: >-
+      {{ outputs.poll_cancelled_runs is defined }}
+    values: >-
+      {{ outputs.poll_cancelled_runs.body | jq('[.[] | .environmentLease | select(.provider == "daytona" and .providerLeaseId != null and .id != null) | .providerLeaseId] | unique') | first }}
+    concurrencyLimit: 1
+    tasks:
+      - id: cancelled_environment_lease
+        type: io.kestra.plugin.core.http.Request
+        uri: >-
+          {{ inputs.paperclip_base_url }}/api/environment-leases/{{ outputs.poll_cancelled_runs.body | jq('[.[] | .environmentLease | select(.providerLeaseId == "' ~ taskrun.value ~ '" and .status == "expired" and .cleanupStatus == "success") | .id] | first // ""') | first }}
+        method: GET
+        headers:
+          Authorization: "Bearer {{ secret('PAPERCLIP_BOARD_API_KEY') }}"
+        timeout: PT10S
+      - id: assert_cancelled_environment_lease_deleted
+        type: io.kestra.plugin.core.execution.Assert
+        conditions:
+          - "{{ (outputs.cancelled_environment_lease[taskrun.value].body | jq('.provider == \"daytona\" and .providerLeaseId == \"' ~ taskrun.value ~ '\" and .issueId == \"' ~ (outputs.poll_cancelled_issue.body | jq('.id') | first) ~ '\" and .status == \"expired\" and .cleanupStatus == \"success\"') | first) == true }}"
+        errorMessage: "Paperclip did not prove one successful expired lease for each unique Daytona provider resource in the cancelled issue heartbeat chain."
+
+  - id: failure_values
     type: io.kestra.plugin.core.output.OutputValues
     values:
       result: FAIL
       kestraExecutionId: "{{ execution.id }}"
-      paperclipIssueId: "{{ outputs.poll_issue is defined ? (outputs.poll_issue.body | jq('.id') | first) : 'not-reconciled' }}"
-      failedTasks: "{{ tasksWithState('failed') | json }}"
+      selectedProfile: "{{ inputs.profile }}"
+      llmProvider: minimax
+      llmGateway: 9router
+      paperclipIssueId: >-
+        {{ outputs.poll_issue is defined
+          ? (outputs.poll_issue.body | jq('.id') | first)
+          : (outputs.issues_after is defined
+            ? (outputs.issues_after.body | jq('[(if type == "array" then . else .data end)[] | select((.title // "") | contains("[kestra:' ~ execution.id ~ ']"))] | if length == 1 then .[0].id else "" end') | first)
+            : '') }}
+      failedTaskId: "{{ (tasksWithState('FAILED') | length) > 0 ? tasksWithState('FAILED')[0]['taskId'] : 'unknown' }}"
+      failedTasks: "{{ tasksWithState('FAILED') | json }}"
+      errorLogs: "{{ errorLogs() | json }}"
+
+  - id: write_failure_evidence
+    type: io.kestra.plugin.core.storage.Write
+    extension: .json
+    content: "{{ outputs.failure_values.values | json }}"
+
+  - id: error_summary
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      result: "{{ outputs.failure_values.values.result }}"
+      evidenceUri: "{{ outputs.write_failure_evidence.uri }}"
+      paperclipIssueId: "{{ outputs.failure_values.values.paperclipIssueId }}"
+      failedTaskId: "{{ outputs.failure_values.values.failedTaskId }}"
+      errorLogs: "{{ outputs.failure_values.values.errorLogs }}"
 
 outputs:
   - id: result
     type: STRING
-    value: "{{ outputs.final_summary.values.result }}"
+    value: "{{ outputs.final_summary is defined ? outputs.final_summary.values.result : outputs.error_summary.values.result }}"
   - id: evidence_uri
     type: FILE
-    value: "{{ outputs.final_summary.values.evidenceUri }}"
+    value: "{{ outputs.final_summary is defined ? outputs.final_summary.values.evidenceUri : outputs.error_summary.values.evidenceUri }}"
   - id: pull_request_url
     type: STRING
-    value: "{{ outputs.final_summary.values.pullRequestUrl }}"
+    value: "{{ outputs.final_summary is defined ? outputs.final_summary.values.pullRequestUrl : '' }}"
   - id: commit_sha
     type: STRING
-    value: "{{ outputs.final_summary.values.commitSha }}"
+    value: "{{ outputs.final_summary is defined ? outputs.final_summary.values.commitSha : '' }}"
   - id: paperclip_issue_id
     type: STRING
-    value: "{{ outputs.final_summary.values.paperclipIssueId }}"
+    value: "{{ outputs.final_summary is defined ? outputs.final_summary.values.paperclipIssueId : outputs.error_summary.values.paperclipIssueId }}"
+  - id: selected_profile
+    type: STRING
+    value: "{{ inputs.profile }}"
+  - id: llm_gateway
+    type: STRING
+    value: 9router
+  - id: failure_task_id
+    type: STRING
+    value: "{{ outputs.error_summary is defined ? outputs.error_summary.values.failedTaskId : '' }}"
+  - id: failure_logs
+    type: STRING
+    value: "{{ outputs.error_summary is defined ? outputs.error_summary.values.errorLogs : '[]' }}"

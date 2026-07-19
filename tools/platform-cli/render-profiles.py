@@ -45,6 +45,7 @@ def render_profile_bundles(catalog_path: Path, output: Path) -> list[str]:
                     "mcpPolicy": profile.get("mcpPolicy", {}),
                 },
             ),
+            "extensions": list(catalog.extensions_for(profile["ref"])),
             "limits": profile.get("limits", {}),
             "approval": profile.get("approval", {}),
         }

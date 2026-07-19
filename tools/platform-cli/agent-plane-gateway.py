@@ -2,9 +2,10 @@
 """Private fixed-route gateway from Daytona sandboxes to agent services.
 
 The process runs in the Daytona runner network namespace. Nested sandbox
-containers reach it through their bridge gateway (normally 172.20.0.1). It
-never binds a host/public port and it can proxy only the four explicitly
-declared upstreams. ToolHive routes require a distinct profile bearer token;
+containers reach it through the canonically pinned runner bridge gateway. It
+never binds a host/public port and it can proxy only the declared 9router and
+three profile-specific ToolHive upstreams. ToolHive routes require a distinct
+profile bearer token;
 9Router continues to enforce its own profile-scoped API keys.
 """
 
@@ -64,6 +65,8 @@ ROUTES = (
             ),
             "prefixes": ("/mcp",),
         }
+        # Every R1 coding harness uses the same MiniMax upstream through
+        # 9Router. Each keeps a separate ToolHive identity and route.
         for harness in ("CODEX", "CLAUDE", "PI")
     ),
 )

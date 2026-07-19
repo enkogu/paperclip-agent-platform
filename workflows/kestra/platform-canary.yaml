@@ -15,7 +15,7 @@ tasks:
 
   - id: paperclip_health
     type: io.kestra.plugin.core.http.Request
-    uri: http://host.docker.internal:3100/api/health
+    uri: "{{ envs.PAPERCLIP_BASE_URL }}/api/health"
     method: GET
     timeout: PT5S
 

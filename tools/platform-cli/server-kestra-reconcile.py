@@ -267,19 +267,32 @@ def load_profile_contract() -> dict[str, Any]:
     }
 
 
-def basic_auth(values: dict[str, str]) -> tuple[str, dict[str, str]]:
-    username = values.get("KESTRA_ADMIN_USER", "")
-    password = values.get("KESTRA_ADMIN_PASSWORD", "")
-    host = values.get("KESTRA_LOOPBACK_HOST", "127.0.0.1")
-    port = values.get("KESTRA_ORIGIN_PORT", "")
-    if not username or not password:
-        raise ReconcileError("kestra_basic_auth_refs_missing")
+def _required_value(values: dict[str, str], key: str) -> str:
+    value = values.get(key)
+    if not isinstance(value, str) or not value:
+        raise ReconcileError(f"canonical_env_ref_missing:{key}")
+    return value
+
+
+def basic_auth(values: dict[str, str]) -> tuple[str, dict[str, str], int]:
+    username = _required_value(values, "KESTRA_ADMIN_USER")
+    password = _required_value(values, "KESTRA_ADMIN_PASSWORD")
+    host = _required_value(values, "KESTRA_LOOPBACK_HOST")
+    port = _required_value(values, "KESTRA_ORIGIN_PORT")
+    timeout = _required_value(values, "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS")
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ReconcileError("kestra_origin_not_loopback")
     if not port.isdigit() or not 1024 <= int(port) <= 65535:
         raise ReconcileError("kestra_origin_port_invalid")
+    if not timeout.isdigit() or not 1 <= int(timeout) <= 300:
+        raise ReconcileError("kestra_reconcile_http_timeout_invalid")
     credential = base64.b64encode(f"{username}:{password}".encode()).decode()
-    return f"http://{host}:{port}", {"Authorization": f"Basic {credential}"}
+    url_host = f"[{host}]" if host == "::1" else host
+    return (
+        f"http://{url_host}:{port}",
+        {"Authorization": f"Basic {credential}"},
+        int(timeout),
+    )
 
 
 def request(
@@ -291,7 +304,14 @@ def request(
     body: bytes | None = None,
     content_type: str | None = None,
     allow_status: set[int] | None = None,
+    timeout_seconds: int,
 ) -> tuple[int, Any]:
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or not 1 <= timeout_seconds <= 300
+    ):
+        raise ReconcileError("kestra_reconcile_http_timeout_invalid")
     request_headers = {"Accept": "application/json", **headers}
     if content_type:
         request_headers["Content-Type"] = content_type
@@ -299,7 +319,7 @@ def request(
         base + path, data=body, method=method, headers=request_headers
     )
     try:
-        response = urllib.request.urlopen(req, timeout=60)
+        response = urllib.request.urlopen(req, timeout=timeout_seconds)
         with response:
             status_code = response.status
             raw = response.read(8_000_000)
@@ -369,6 +389,7 @@ def reconcile_flow(
     desired: dict[str, Any],
     *,
     mutate: bool,
+    timeout_seconds: int,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
     namespace = urllib.parse.quote(desired["namespace"], safe="")
     flow_id = urllib.parse.quote(desired["id"], safe="")
@@ -379,6 +400,7 @@ def reconcile_flow(
         "GET",
         flow_path + "?source=true",
         allow_status={200, 404},
+        timeout_seconds=timeout_seconds,
     )
     current_matches = False
     if status_code == 200 and isinstance(current, dict):
@@ -405,6 +427,7 @@ def reconcile_flow(
             path,
             body=desired["source"].encode(),
             content_type=YAML_MEDIA_TYPE,
+            timeout_seconds=timeout_seconds,
         )
         mutation = {
             "resource": "flow",
@@ -417,6 +440,7 @@ def reconcile_flow(
         "GET",
         flow_path + "?source=true",
         allow_status={200},
+        timeout_seconds=timeout_seconds,
     )
     return _flow_snapshot(observed, desired), mutation
 
@@ -453,6 +477,7 @@ def reconcile_kv(
     expected: dict[str, Any],
     *,
     mutate: bool,
+    timeout_seconds: int,
 ) -> tuple[dict[str, Any], dict[str, str] | None]:
     namespace = urllib.parse.quote(CONTROL_NAMESPACE, safe="")
     encoded_key = urllib.parse.quote(key, safe="")
@@ -463,6 +488,7 @@ def reconcile_kv(
         "GET",
         path,
         allow_status={200, 404},
+        timeout_seconds=timeout_seconds,
     )
     current_matches = (
         status_code == 200
@@ -482,6 +508,7 @@ def reconcile_kv(
             body=canonical_json(expected).encode(),
             content_type=KV_MEDIA_TYPE,
             allow_status={200, 204},
+            timeout_seconds=timeout_seconds,
         )
         mutation = {
             "resource": "kv",
@@ -494,6 +521,7 @@ def reconcile_kv(
         "GET",
         path,
         allow_status={200},
+        timeout_seconds=timeout_seconds,
     )
     return _kv_snapshot(observed, key, expected), mutation
 
@@ -517,11 +545,18 @@ def reconcile_pass(
     profile_contract: dict[str, Any],
     *,
     mutate: bool,
+    timeout_seconds: int,
 ) -> dict[str, Any]:
     mutations: list[dict[str, str]] = []
     observed_flows: list[dict[str, Any]] = []
     for desired in flows:
-        observed, mutation = reconcile_flow(base, headers, desired, mutate=mutate)
+        observed, mutation = reconcile_flow(
+            base,
+            headers,
+            desired,
+            mutate=mutate,
+            timeout_seconds=timeout_seconds,
+        )
         observed_flows.append(observed)
         if mutation:
             mutations.append(mutation)
@@ -530,7 +565,14 @@ def reconcile_pass(
         (FLOW_CATALOG_KEY, flow_catalog_value(observed_flows)),
         (PROFILE_CATALOG_KEY, profile_contract["value"]),
     ):
-        observed, mutation = reconcile_kv(base, headers, key, expected, mutate=mutate)
+        observed, mutation = reconcile_kv(
+            base,
+            headers,
+            key,
+            expected,
+            mutate=mutate,
+            timeout_seconds=timeout_seconds,
+        )
         kv_rows.append(observed)
         if mutation:
             mutations.append(mutation)
@@ -641,7 +683,7 @@ def execute(action: str) -> dict[str, Any]:
     canonical_sha = sha256_path(CANONICAL_ENV)
     producer_sha = sha256_path(producer_path())
     lock = platform_contract()
-    base, headers = basic_auth(values)
+    base, headers, timeout_seconds = basic_auth(values)
     flows = load_flows()
     profiles = load_profile_contract()
     mutate = action == "provision"
@@ -658,9 +700,23 @@ def execute(action: str) -> dict[str, Any]:
             "path": str(PROVISION_EVIDENCE),
             "sha256": sha256_path(PROVISION_EVIDENCE),
         }
-    first = reconcile_pass(base, headers, flows, profiles, mutate=mutate)
+    first = reconcile_pass(
+        base,
+        headers,
+        flows,
+        profiles,
+        mutate=mutate,
+        timeout_seconds=timeout_seconds,
+    )
     try:
-        second = reconcile_pass(base, headers, flows, profiles, mutate=False)
+        second = reconcile_pass(
+            base,
+            headers,
+            flows,
+            profiles,
+            mutate=False,
+            timeout_seconds=timeout_seconds,
+        )
     except ReconcileError as exc:
         raise ReconcileError("kestra_second_reconcile_not_noop") from exc
     stable = _stable_state(first, second)
@@ -686,6 +742,13 @@ def execute(action: str) -> dict[str, Any]:
             "passwordRef": "KESTRA_ADMIN_PASSWORD",
             "resolvedForLiveApi": True,
             "rawSecretIncluded": False,
+        },
+        "connection": {
+            "scheme": "http",
+            "hostRef": "KESTRA_LOOPBACK_HOST",
+            "portRef": "KESTRA_ORIGIN_PORT",
+            "timeoutSecondsRef": "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS",
+            "loopbackOnly": True,
         },
         "flowCatalogKey": FLOW_CATALOG_KEY,
         "profileCatalogKey": PROFILE_CATALOG_KEY,

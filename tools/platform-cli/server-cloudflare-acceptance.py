@@ -45,21 +45,28 @@ lock_path = root / "templates/platform.lock.yaml"
 evidence_path = root / "evidence/cloudflare-acceptance.json"
 observer_path = root / "evidence/cloudflare-external-observation.json"
 semantic_evidence_path = root / "evidence/cloudflare-app-semantics.json"
+dns_reconcile_evidence_path = root / "evidence/cloudflare-dns-reconcile.json"
 c029_integration_evidence_path = root / "evidence/integration-canary-C029.json"
 observability_evidence_path = root / "evidence/observability-data-canary.json"
-baserow_evidence_path = root / "evidence/baserow-verify.json"
-wikijs_evidence_path = root / "evidence/wikijs-verify.json"
 postgrest_evidence_path = root / "evidence/postgrest-verify.json"
-nocodb_evidence_path = root / "evidence/nocodb-verify.json"
-notion_evidence_path = root / "evidence/notion-connector-verify.json"
+notion_projection_canary_evidence_path = (
+    root / "evidence/notion-projection-live-canary.json"
+)
+notion_consumer_verification_evidence_path = (
+    root / "evidence/notion-projection-consumer-verify.json"
+)
 producer_path_expected = root / "bin/server-cloudflare-acceptance.py"
+cloudflared_step_path = root / "steps/cloudflare-tunnel.sh"
+origin_firewall_step_path = root / "steps/origin-firewall.sh"
 generator_contract = "mte-config-renderer/v1"
-protected_foreign_labels = ("paperclip", "chat")
-semantic_connection_ids = ("C004", "C005", "C020", "C025", "C026", "C032")
+searxng_canary_query = "OpenAI"
+searxng_canary_attempts = 3
+searxng_canary_retry_seconds = 1
+opentofu_null_metadata_contracts = frozenset({("1.2", "1.12.1")})
+semantic_connection_ids = ("C004", "C005", "C025", "C026", "C032")
 connection_evidence_ids = (
     "C004",
     "C005",
-    "C020",
     "C025",
     "C026",
     "C029",
@@ -72,7 +79,6 @@ connection_evidence_ids = (
 connection_ids = (
     "C004",
     "C005",
-    "C020",
     "C025",
     "C026",
     "C029",
@@ -86,11 +92,80 @@ connection_ids = (
 human_connections = {
     "C004": "paperclip",
     "C005": "kestra",
-    "C020": "activepieces",
     "C025": "searxng",
     "C032": "mattermost",
     "C046": "observability",
 }
+
+SERVICE_TOKEN_FIELDS = ("ID", "CLIENT_ID", "CLIENT_SECRET", "EXPIRES_AT")
+
+# SSH must stay reachable for governed operation. Every other port is a direct
+# origin or control-plane exposure that must be unreachable from the operator
+# machine, including Docker Swarm and cloudflared metrics ports observed during
+# the production pre-release audit.
+external_ssh_port = 22
+external_blocked_tcp_ports = (80, 443, 2377, 3000, 7946, 20241)
+
+origin_firewall_status_fields = frozenset(
+    {
+        "firewallPolicyVersion",
+        "firewallServiceActive",
+        "firewallServiceEnabled",
+        "firewallRecoveryTimerActive",
+        "firewallRecoveryTimerEnabled",
+        "publicInterface",
+        "publicInterfaceV4",
+        "publicInterfaceV6",
+        "operatorSshCidrsSha256",
+        "firewallSshCidrCount",
+        "firewallSshIpv4CidrCount",
+        "firewallSshIpv6CidrCount",
+        "firewallSshCidrsEnforced",
+        "firewallV4Established",
+        "firewallV6Established",
+        "firewallV4InputTcpDrop",
+        "firewallV4InputUdpDrop",
+        "firewallV4DockerTcpDrop",
+        "firewallV4DockerUdpDrop",
+        "firewallV6InputTcpDrop",
+        "firewallV6InputUdpDrop",
+        "firewallV6DockerTcpDrop",
+        "firewallV6DockerUdpDrop",
+        "firewallV4Input",
+        "firewallV4Docker",
+        "firewallV6Input",
+        "firewallV6Docker",
+        "udp443Blocked",
+        "publicTcpDefaultDenied",
+        "publicUdpDefaultDenied",
+    }
+)
+origin_firewall_true_fields = frozenset(
+    {
+        "firewallServiceActive",
+        "firewallServiceEnabled",
+        "firewallRecoveryTimerActive",
+        "firewallRecoveryTimerEnabled",
+        "firewallSshCidrsEnforced",
+        "firewallV4Established",
+        "firewallV6Established",
+        "firewallV4InputTcpDrop",
+        "firewallV4InputUdpDrop",
+        "firewallV4DockerTcpDrop",
+        "firewallV4DockerUdpDrop",
+        "firewallV6InputTcpDrop",
+        "firewallV6InputUdpDrop",
+        "firewallV6DockerTcpDrop",
+        "firewallV6DockerUdpDrop",
+        "firewallV4Input",
+        "firewallV4Docker",
+        "firewallV6Input",
+        "firewallV6Docker",
+        "udp443Blocked",
+        "publicTcpDefaultDenied",
+        "publicUdpDefaultDenied",
+    }
+)
 
 
 class AcceptanceError(RuntimeError):
@@ -178,6 +253,8 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def exact_mode(path: Path, mode: int, *, root_owned: bool = True) -> None:
+    if path.is_symlink():
+        raise AcceptanceError("unsafe_file_symlink", str(path))
     try:
         info = path.stat()
     except OSError as exc:
@@ -191,6 +268,8 @@ def exact_mode(path: Path, mode: int, *, root_owned: bool = True) -> None:
 def file_security_contract(path: Path, mode: int) -> dict[str, Any]:
     """Return a public, exact root-owned file contract after checking it."""
     exact_mode(path, mode)
+    if not path.is_file():
+        raise AcceptanceError("unsafe_file_type", str(path))
     return {
         "path": str(path),
         "ownerUid": 0,
@@ -462,6 +541,102 @@ def app_rows(
     return normalized
 
 
+def service_route_credentials(values: dict[str, str], app_id: str) -> dict[str, str]:
+    prefix = "CLOUDFLARE_ACCESS_ROUTE_" + app_id.upper().replace("-", "_")
+    names = {field: prefix + "_" + field for field in SERVICE_TOKEN_FIELDS}
+    require_values(values, *names.values())
+    expires_at = parse_iso(values[names["EXPIRES_AT"]])
+    if (expires_at - datetime.now(timezone.utc)).total_seconds() <= 300:
+        raise AcceptanceError("cloudflare_service_token_expired_or_near_expiry", app_id)
+    return {
+        "id": values[names["ID"]],
+        "client_id": values[names["CLIENT_ID"]],
+        "client_secret": values[names["CLIENT_SECRET"]],
+        "expires_at": values[names["EXPIRES_AT"]],
+    }
+
+
+def service_probe_paths(
+    config: dict[str, Any], apps: dict[str, dict[str, str]]
+) -> dict[str, str]:
+    components = config.get("spec", {}).get("components", [])
+    by_id = {
+        str(row.get("id")): row
+        for row in components
+        if isinstance(row, dict) and row.get("id")
+    }
+    result: dict[str, str] = {}
+    for app_id, app in apps.items():
+        if app["accessClass"] != "service":
+            continue
+        component = by_id.get(app_id)
+        health = component.get("health") if isinstance(component, dict) else None
+        health_url = str(health.get("url", "")) if isinstance(health, dict) else ""
+        parsed = urllib.parse.urlsplit(health_url)
+        if parsed.scheme != "http" or parsed.hostname != "127.0.0.1":
+            raise AcceptanceError("service_route_health_url_invalid", app_id)
+        result[app_id] = parsed.path or "/"
+    return result
+
+
+def service_edge_checks(
+    values: dict[str, str],
+    apps: dict[str, dict[str, str]],
+    config: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    service_apps = {
+        app_id: app for app_id, app in apps.items() if app["accessClass"] == "service"
+    }
+    if not service_apps:
+        return {}
+    credentials = {
+        app_id: service_route_credentials(values, app_id) for app_id in service_apps
+    }
+    paths = service_probe_paths(config, apps)
+    app_ids = sorted(service_apps)
+    if len(app_ids) < 2:
+        raise AcceptanceError("cross_route_service_token_unavailable")
+    checks: dict[str, dict[str, Any]] = {}
+    for index, app_id in enumerate(app_ids):
+        app = service_apps[app_id]
+        cross_id = app_ids[(index + 1) % len(app_ids)]
+        endpoint = "https://" + app["hostname"] + paths[app_id]
+        anonymous_status, _payload, _headers = request(
+            "GET", endpoint, allowed={401}, follow_redirects=False
+        )
+        intended = credentials[app_id]
+        intended_status, _payload, _headers = request(
+            "GET",
+            endpoint,
+            headers={
+                "CF-Access-Client-Id": intended["client_id"],
+                "CF-Access-Client-Secret": intended["client_secret"],
+            },
+            allowed={200},
+        )
+        cross = credentials[cross_id]
+        cross_status, _payload, _headers = request(
+            "GET",
+            endpoint,
+            headers={
+                "CF-Access-Client-Id": cross["client_id"],
+                "CF-Access-Client-Secret": cross["client_secret"],
+            },
+            allowed={401},
+            follow_redirects=False,
+        )
+        checks[app_id] = {
+            "hostname": app["hostname"],
+            "healthPath": paths[app_id],
+            "anonymousDenied": anonymous_status == 401,
+            "intendedTokenStatus": intended_status,
+            "crossTokenDenied": cross_status == 401,
+            "crossTokenRoute": cross_id,
+            "credentialValuesEmitted": False,
+        }
+    return checks
+
+
 def data_content_edge_contract(
     apps_projection: dict[str, Any], apps: dict[str, dict[str, str]]
 ) -> dict[str, Any]:
@@ -602,6 +777,89 @@ def one(rows: list[dict[str, Any]], code: str) -> dict[str, Any]:
     return rows[0]
 
 
+def dns_reconcile_status(
+    source_gate: dict[str, str],
+    apps: dict[str, dict[str, str]],
+    tunnel_id: str,
+) -> dict[str, Any]:
+    exact_mode(dns_reconcile_evidence_path, 0o600)
+    payload = load_json(dns_reconcile_evidence_path)
+    producer = root / "bin/server-cloudflare-dns.py"
+    exact_mode(producer, 0o700)
+    tfvars = iac_root / "terraform.tfvars.json"
+    exact_mode(tfvars, 0o600)
+    access_classes = {
+        app_id: row["accessClass"] for app_id, row in sorted(apps.items())
+    }
+    expected_target = tunnel_id + ".cfargotunnel.com"
+    expected_official_contracts = [
+        "https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/batch/",
+        "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/routing-to-tunnel/",
+    ]
+    fingerprints = (
+        payload.get("foreignRecordSetBeforeSha256"),
+        payload.get("foreignRecordSetAfterSha256"),
+    )
+    if not (
+        payload.get("apiVersion") == "micro-task-engine/v1alpha1"
+        and payload.get("kind") == "CloudflareDnsReconcileEvidence"
+        and payload.get("status") == "passed"
+        and payload.get("ok") is True
+        and payload.get("action") in {"apply", "verify"}
+        and payload.get("canonicalSourceSha256") == source_gate["sourceSha256"]
+        and payload.get("tfvarsSha256") == sha256_file(tfvars)
+        and payload.get("producerPath") == str(producer)
+        and payload.get("producerSha256") == sha256_file(producer)
+        and payload.get("desiredHostnameCount") == len(apps)
+        and payload.get("accessClassBindingSha256")
+        == canonical_json_sha256(access_classes)
+        and payload.get("tunnelTargetSha256") == canonical_json_sha256(expected_target)
+        and isinstance(payload.get("plannedDeleteCount"), int)
+        and not isinstance(payload.get("plannedDeleteCount"), bool)
+        and payload["plannedDeleteCount"] >= 0
+        and isinstance(payload.get("plannedCreateCount"), int)
+        and not isinstance(payload.get("plannedCreateCount"), bool)
+        and payload["plannedCreateCount"] >= 0
+        and isinstance(payload.get("batchApplied"), bool)
+        and payload.get("batchDatabaseTransactionAtomic") is True
+        and payload.get("edgePropagationAtomic") is False
+        and payload.get("batchOperationOrder")
+        == ["deletes", "patches", "puts", "posts"]
+        and payload.get("desiredHostnamesReserved") is True
+        and payload.get("desiredRecordsExact") is True
+        and payload.get("proxiedDnsOnly") is True
+        and payload.get("originAddressRecordCount") == 0
+        and isinstance(payload.get("foreignRecordCount"), int)
+        and not isinstance(payload.get("foreignRecordCount"), bool)
+        and payload["foreignRecordCount"] >= 0
+        and all(
+            isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
+            for value in fingerprints
+        )
+        and fingerprints[0] == fingerprints[1]
+        and payload.get("foreignRecordsPreserved") is True
+        and payload.get("officialContracts") == expected_official_contracts
+        and payload.get("secretValuesPrinted") is False
+    ):
+        raise AcceptanceError("cloudflare_dns_reconcile_evidence_invalid")
+    return {
+        "dependencyEvidence": {
+            "path": str(dns_reconcile_evidence_path),
+            "sha256": sha256_file(dns_reconcile_evidence_path),
+        },
+        "batchApplied": payload.get("batchApplied") is True,
+        "batchDatabaseTransactionAtomic": True,
+        "edgePropagationAtomic": False,
+        "desiredHostnamesReserved": True,
+        "desiredRecordsExact": True,
+        "proxiedDnsOnly": True,
+        "originAddressRecordCount": 0,
+        "foreignRecordCount": payload["foreignRecordCount"],
+        "foreignRecordsPreserved": True,
+        "foreignRecordSetSha256": fingerprints[1],
+    }
+
+
 def cloudflare_inventory(
     values: dict[str, str], apps: dict[str, dict[str, str]]
 ) -> dict[str, Any]:
@@ -611,8 +869,6 @@ def cloudflare_inventory(
         "CLOUDFLARE_ACCOUNT_ID",
         "CLOUDFLARE_ZONE_ID",
         "CLOUDFLARE_TUNNEL_NAME",
-        "CLOUDFLARE_ACCESS_ALLOWED_EMAILS",
-        "CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID",
     )
     api = CloudflareApi(values["CLOUDFLARE_API_TOKEN"])
     account = values["CLOUDFLARE_ACCOUNT_ID"]
@@ -641,12 +897,13 @@ def cloudflare_inventory(
     dns_ids: list[str] = []
     access_ids: list[str] = []
     policy_cache: dict[str, dict[str, Any]] = {}
+    human_apps_present = any(row["accessClass"] == "human" for row in apps.values())
     expected_human_emails = sorted(
         value.strip().lower()
-        for value in values["CLOUDFLARE_ACCESS_ALLOWED_EMAILS"].split(",")
+        for value in values.get("CLOUDFLARE_ACCESS_ALLOWED_EMAILS", "").split(",")
         if value.strip()
     )
-    if (
+    if human_apps_present and (
         not expected_human_emails
         or len(expected_human_emails) != len(set(expected_human_emails))
         or any(
@@ -669,9 +926,8 @@ def cloudflare_inventory(
             and bool(record.get("id"))
             and str(record.get("content", "")).lower().rstrip(".") == expected_target
             and record.get("proxied") is True
-            and str(record.get("comment", "")).startswith(
-                "Managed by MTE platform IaC for "
-            )
+            and record.get("ttl") == 1
+            and record.get("comment") == "Managed by MTE platform IaC for " + app_id
         ):
             raise AcceptanceError("managed_dns_contract_drift", app_id)
         dns_ids.append(str(record.get("id", "")))
@@ -718,12 +974,9 @@ def cloudflare_inventory(
                 and len(include) == len(observed_emails)
             )
         else:
+            route_token = service_route_credentials(values, app_id)
             policy_valid = policy.get("decision") == "non_identity" and include == [
-                {
-                    "service_token": {
-                        "token_id": values["CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID"]
-                    }
-                }
+                {"service_token": {"token_id": route_token["id"]}}
             ]
         if (
             not policy_valid
@@ -751,31 +1004,27 @@ def cloudflare_inventory(
     if actual_routes != expected_routes or catchall != [{"service": "http_status:404"}]:
         raise AcceptanceError("tunnel_ingress_contract_drift")
 
-    base_domain = values["PLATFORM_BASE_DOMAIN"].strip().lower().rstrip(".")
+    desired_hostnames = {row["hostname"] for row in apps.values()}
     foreign: list[dict[str, Any]] = []
-    for label in protected_foreign_labels:
-        hostname = label + "." + base_domain
-        row = one(
-            [
-                item
-                for item in dns
-                if str(item.get("name", "")).lower().rstrip(".") == hostname
-            ],
-            "protected_foreign_dns_missing",
-        )
-        if str(row.get("content", "")).lower().rstrip(".") == expected_target or str(
-            row.get("comment", "")
-        ).startswith("Managed by MTE platform IaC for "):
-            raise AcceptanceError("protected_foreign_dns_taken_over", label)
+    for row in dns:
+        hostname = str(row.get("name", "")).lower().rstrip(".")
+        if hostname in desired_hostnames:
+            continue
+        if str(row.get("comment", "")).startswith("Managed by MTE platform IaC for "):
+            raise AcceptanceError("retired_managed_dns_remains")
         foreign.append(
             {
-                "hostname": hostname,
-                "recordType": str(row.get("type", "")),
-                "recordFingerprint": hashlib.sha256(
-                    (
-                        str(row.get("type", "")) + "\0" + str(row.get("content", ""))
-                    ).encode()
-                ).hexdigest(),
+                "recordFingerprint": canonical_json_sha256(
+                    {
+                        "id": str(row.get("id", "")),
+                        "name": hostname,
+                        "type": str(row.get("type", "")),
+                        "content": str(row.get("content", "")),
+                        "proxied": row.get("proxied"),
+                        "ttl": row.get("ttl"),
+                        "comment": str(row.get("comment", "")),
+                    }
+                ),
             }
         )
     return {
@@ -788,8 +1037,15 @@ def cloudflare_inventory(
         "accessPolicyCount": len(policy_cache),
         "humanAccessPolicyScoped": True,
         "serviceAccessTokenScoped": True,
+        "desiredHostnamesReserved": True,
+        "dnsTargetTunnelBound": True,
+        "proxiedDnsOnly": True,
+        "originAddressRecordCount": 0,
         "routes": expected_routes,
         "foreign": foreign,
+        "foreignRecordSetSha256": canonical_json_sha256(
+            sorted(row["recordFingerprint"] for row in foreign)
+        ),
     }
 
 
@@ -877,148 +1133,48 @@ def semantic_kestra(values: dict[str, str], origin: str) -> dict[str, Any]:
     }
 
 
-def semantic_activepieces(values: dict[str, str], origin: str) -> dict[str, Any]:
-    require_values(
-        values,
-        "ACTIVEPIECES_ADMIN_EMAIL",
-        "ACTIVEPIECES_ADMIN_PASSWORD",
-        "ACTIVEPIECES_PROJECT_ID",
-    )
-    status_code, payload, _ = request(
-        "POST",
-        origin + "/api/v1/authentication/sign-in",
-        body={
-            "email": values["ACTIVEPIECES_ADMIN_EMAIL"],
-            "password": values["ACTIVEPIECES_ADMIN_PASSWORD"],
-        },
-    )
-    if not (
-        status_code == 200
-        and isinstance(payload, dict)
-        and payload.get("projectId") == values["ACTIVEPIECES_PROJECT_ID"]
-        and isinstance(payload.get("token"), str)
-        and payload.get("token")
-    ):
-        raise AcceptanceError("activepieces_authenticated_project_invalid")
-    return {
-        "semantic": "authenticated-project-session",
-        "projectIdentityVerified": True,
-        "originAuthenticationRequired": True,
-        "originAuthenticationVerified": True,
-    }
-
-
 def semantic_searxng(_values: dict[str, str], origin: str) -> dict[str, Any]:
-    query = urllib.parse.urlencode({"q": "OpenAI", "format": "json"})
-    status_code, payload, _ = request("GET", origin + "/search?" + query, timeout=60)
-    results = payload.get("results") if isinstance(payload, dict) else None
-    if status_code != 200 or not isinstance(results, list) or not results:
-        raise AcceptanceError("searxng_live_search_empty")
-    return {
-        "semantic": "live-json-search",
-        "resultCount": len(results),
-        "originAuthenticationRequired": False,
-        "originAuthenticationVerified": True,
-    }
-
-
-def semantic_baserow(values: dict[str, str], origin: str) -> dict[str, Any]:
-    require_values(values, "BASEROW_PAPERCLIP_TOKEN", "BASEROW_TABLE_ID")
-    query = urllib.parse.urlencode({"user_field_names": "true", "size": "1"})
-    status_code, payload, _ = request(
-        "GET",
-        origin
-        + "/api/database/rows/table/"
-        + urllib.parse.quote(values["BASEROW_TABLE_ID"])
-        + "/?"
-        + query,
-        headers={"Authorization": "Token " + values["BASEROW_PAPERCLIP_TOKEN"]},
+    query = urllib.parse.urlencode(
+        {"q": searxng_canary_query, "format": "json", "language": "en"}
     )
-    if not (
-        status_code == 200
-        and isinstance(payload, dict)
-        and isinstance(payload.get("count"), int)
-        and not isinstance(payload.get("count"), bool)
-        and isinstance(payload.get("results"), list)
-    ):
-        raise AcceptanceError("baserow_authenticated_table_read_invalid")
-    return {
-        "semantic": "authenticated-baserow-table-read",
-        "rowCount": payload["count"],
-        "originAuthenticationRequired": True,
-        "originAuthenticationVerified": True,
-    }
-
-
-def semantic_wikijs(values: dict[str, str], origin: str) -> dict[str, Any]:
-    require_values(values, "WIKIJS_API_TOKEN")
-    status_code, payload, _ = request(
-        "POST",
-        origin + "/graphql",
-        headers={"Authorization": "Bearer " + values["WIKIJS_API_TOKEN"]},
-        body={
-            "query": (
-                "query MteSystemInfo { system { info { currentVersion dbType dbHost } } }"
-            )
-        },
-    )
-    info = (
-        payload.get("data", {}).get("system", {}).get("info")
-        if isinstance(payload, dict)
-        and isinstance(payload.get("data"), dict)
-        and isinstance(payload["data"].get("system"), dict)
-        else None
-    )
-    if not (
-        status_code == 200
-        and isinstance(info, dict)
-        and info.get("currentVersion") == "2.5.314"
-        and info.get("dbType") == "postgres"
-        and info.get("dbHost") == "mte-postgres"
-        and not payload.get("errors")
-    ):
-        raise AcceptanceError("wikijs_authenticated_system_info_invalid")
-    return {
-        "semantic": "authenticated-wikijs-system-info",
-        "version": "2.5.314",
-        "databaseType": "postgres",
-        "originAuthenticationRequired": True,
-        "originAuthenticationVerified": True,
-    }
-
-
-def semantic_nocodb(values: dict[str, str], origin: str) -> dict[str, Any]:
-    require_values(values, "NOCODB_ADMIN_EMAIL", "NOCODB_ADMIN_PASSWORD")
-    status, signed_in, _headers = request(
-        "POST",
-        origin + "/api/v1/auth/user/signin",
-        body={
-            "email": values["NOCODB_ADMIN_EMAIL"],
-            "password": values["NOCODB_ADMIN_PASSWORD"],
-        },
-    )
-    token = str((signed_in or {}).get("token") or "")
-    if status != 200 or not token:
-        raise AcceptanceError("nocodb_admin_auth_invalid")
-    authenticated_status, bases, _headers = request(
-        "GET",
-        origin + "/api/v2/meta/bases",
-        headers={"xc-auth": token},
-    )
-    denied_status, _denied, _headers = request(
-        "GET",
-        origin + "/api/v2/meta/bases",
-        headers={"xc-auth": "invalid"},
-        allowed={401, 403},
-    )
-    if authenticated_status != 200 or not isinstance(bases, (dict, list)):
-        raise AcceptanceError("nocodb_authenticated_bases_read_invalid")
-    return {
-        "semantic": "authenticated-nocodb-base-read",
-        "originAuthenticationRequired": True,
-        "originAuthenticationVerified": denied_status in {401, 403},
-        "authenticatedStatus": authenticated_status,
-    }
+    endpoint = origin + "/search?" + query
+    for attempt in range(1, searxng_canary_attempts + 1):
+        status_code, payload, _ = request("GET", endpoint, timeout=60)
+        if status_code != 200 or not isinstance(payload, dict):
+            raise AcceptanceError("searxng_live_search_contract_invalid")
+        if payload.get("query") != searxng_canary_query:
+            raise AcceptanceError("searxng_live_search_contract_invalid")
+        results = payload.get("results")
+        if not isinstance(results, list) or any(
+            not isinstance(row, dict) for row in results
+        ):
+            raise AcceptanceError("searxng_live_search_contract_invalid")
+        valid_results = [
+            row
+            for row in results
+            if isinstance(row.get("title"), str)
+            and row["title"].strip()
+            and isinstance(row.get("url"), str)
+            and urllib.parse.urlsplit(row["url"]).scheme in {"http", "https"}
+            and bool(urllib.parse.urlsplit(row["url"]).netloc)
+        ]
+        if valid_results:
+            return {
+                "semantic": "live-json-search",
+                "canaryQuerySha256": hashlib.sha256(
+                    searxng_canary_query.encode()
+                ).hexdigest(),
+                "attemptCount": attempt,
+                "resultCount": len(results),
+                "validResultCount": len(valid_results),
+                "originAuthenticationRequired": False,
+                "originAuthenticationVerified": True,
+            }
+        if results:
+            raise AcceptanceError("searxng_live_search_contract_invalid")
+        if attempt < searxng_canary_attempts:
+            time.sleep(searxng_canary_retry_seconds)
+    raise AcceptanceError("searxng_live_search_empty")
 
 
 def semantic_mattermost(values: dict[str, str], origin: str) -> dict[str, Any]:
@@ -1105,11 +1261,7 @@ def semantic_grafana(values: dict[str, str], origin: str) -> dict[str, Any]:
 semantic_checks = {
     "paperclip": semantic_paperclip,
     "kestra": semantic_kestra,
-    "activepieces": semantic_activepieces,
     "searxng": semantic_searxng,
-    "baserow": semantic_baserow,
-    "wikijs": semantic_wikijs,
-    "nocodb": semantic_nocodb,
     "mattermost": semantic_mattermost,
     "observability": semantic_grafana,
 }
@@ -1288,7 +1440,7 @@ def fresh_component_dependency(
 def c029_persistence_dependencies(
     source_gate: dict[str, str], base_domain: str
 ) -> list[dict[str, str]]:
-    component_api_prefix = "mte." + base_domain.strip().lower().rstrip(".")
+    _ = base_domain
     document = fresh_dependency(
         c029_integration_evidence_path,
         source_gate=source_gate,
@@ -1305,19 +1457,6 @@ def c029_persistence_dependencies(
     if document.get("selected") != ["C029"] or len(rows) != 1 or len(matching) != 1:
         raise AcceptanceError("ose_storage_persistence_dependency_missing")
     row = matching[0]
-    baserow = (
-        row.get("baserowPersistence")
-        if isinstance(row.get("baserowPersistence"), dict)
-        else {}
-    )
-    wikijs = (
-        row.get("wikijsPersistence")
-        if isinstance(row.get("wikijsPersistence"), dict)
-        else {}
-    )
-    licenses = (
-        row.get("osiLicenses") if isinstance(row.get("osiLicenses"), list) else []
-    )
     dependency_evidence = (
         row.get("dependencyEvidence")
         if isinstance(row.get("dependencyEvidence"), dict)
@@ -1326,20 +1465,6 @@ def c029_persistence_dependencies(
 
     def sha256(value: Any) -> bool:
         return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
-
-    def old_storage_key_present(value: Any) -> bool:
-        if isinstance(value, dict):
-            return any(
-                re.search(r"noco(?:db|docs)", str(key), re.I)
-                or old_storage_key_present(nested)
-                for key, nested in value.items()
-            )
-        if isinstance(value, list):
-            return any(old_storage_key_present(nested) for nested in value)
-        return False
-
-    def numeric_identifier(value: Any) -> bool:
-        return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
     profile = str(row.get("dataContentProfile") or "")
     if profile == "postgres-notion":
@@ -1376,11 +1501,28 @@ def c029_persistence_dependencies(
             "cleanupVerified",
             "linkageVerified",
         )
-        notion_producer = root / "bin/server-notion.py"
+        notion_producer = root / "bin/server-notion-sync.py"
+        expected_canary_reference = {
+            "path": str(notion_projection_canary_evidence_path),
+            "sha256": sha256_file(notion_projection_canary_evidence_path),
+            "kind": "NotionProjectionLiveCanary",
+            "producerSha256": sha256_file(notion_producer),
+        }
+        expected_verification_reference = {
+            "path": str(notion_consumer_verification_evidence_path),
+            "sha256": sha256_file(notion_consumer_verification_evidence_path),
+            "kind": "NotionProjectionConsumerVerification",
+            "producerSha256": sha256_file(notion_producer),
+        }
+        consumer_evidence = (
+            row.get("consumerVerificationEvidence")
+            if isinstance(row.get("consumerVerificationEvidence"), dict)
+            else {}
+        )
         if not (
             row.get("ok") is True
             and row.get("state") == "passed"
-            and row.get("source") == "server_notion_connector_canary"
+            and row.get("source") == "server_notion_projection_consumer_canary"
             and row.get("roles")
             == {
                 "tablesUi": "notion",
@@ -1419,126 +1561,106 @@ def c029_persistence_dependencies(
             and row.get("crossProviderLinkageVerified") is True
             and row.get("cleanupCompleted") is True
             and row.get("redacted") is True
-            and dependency_evidence
-            == {
-                "path": str(notion_evidence_path),
-                "sha256": sha256_file(notion_evidence_path),
-                "kind": "NotionConnectorVerification",
-                "producerSha256": sha256_file(notion_producer),
-            }
+            and dependency_evidence == expected_canary_reference
+            and consumer_evidence == expected_verification_reference
         ):
-            raise AcceptanceError("notion_connector_canary_dependency_invalid")
+            raise AcceptanceError("notion_projection_canary_dependency_invalid")
 
-        notion_verification = fresh_component_dependency(
-            notion_evidence_path,
+        notion_canary = fresh_component_dependency(
+            notion_projection_canary_evidence_path,
             source_gate=source_gate,
             api_version="micro-task-engine/v1alpha1",
-            kind="NotionConnectorVerification",
+            kind="NotionProjectionLiveCanary",
             producer=notion_producer,
         )
-        identity = (
-            notion_verification.get("identity")
-            if isinstance(notion_verification.get("identity"), dict)
-            else {}
-        )
-        canary = (
-            notion_verification.get("canary")
-            if isinstance(notion_verification.get("canary"), dict)
-            else {}
-        )
-        verified_notion = (
-            canary.get("notion") if isinstance(canary.get("notion"), dict) else {}
-        )
-        verified_table = (
-            verified_notion.get("table")
-            if isinstance(verified_notion.get("table"), dict)
-            else {}
-        )
-        verified_document = (
-            verified_notion.get("document")
-            if isinstance(verified_notion.get("document"), dict)
-            else {}
-        )
-        verified_cleanup = (
-            notion_verification.get("cleanup")
-            if isinstance(notion_verification.get("cleanup"), dict)
-            else {}
-        )
-        secret_audit = (
-            notion_verification.get("secretAudit")
-            if isinstance(notion_verification.get("secretAudit"), dict)
-            else {}
-        )
-        resources = (
-            notion_verification.get("resources")
-            if isinstance(notion_verification.get("resources"), dict)
-            else {}
-        )
-        schema = (
-            notion_verification.get("schema")
-            if isinstance(notion_verification.get("schema"), dict)
-            else {}
+        notion_verification = fresh_component_dependency(
+            notion_consumer_verification_evidence_path,
+            source_gate=source_gate,
+            api_version="micro-task-engine/v1alpha1",
+            kind="NotionProjectionConsumerVerification",
+            producer=notion_producer,
         )
         canary_linkage = (
-            canary.get("linkage") if isinstance(canary.get("linkage"), dict) else {}
+            notion_canary.get("linkage")
+            if isinstance(notion_canary.get("linkage"), dict)
+            else {}
+        )
+        canary_cleanup = (
+            notion_canary.get("cleanup")
+            if isinstance(notion_canary.get("cleanup"), dict)
+            else {}
+        )
+        delivery = (
+            notion_verification.get("delivery")
+            if isinstance(notion_verification.get("delivery"), dict)
+            else {}
+        )
+        systemd = (
+            notion_verification.get("systemd")
+            if isinstance(notion_verification.get("systemd"), dict)
+            else {}
+        )
+        evidence_contracts = (
+            notion_canary.get("evidence"),
+            notion_verification.get("evidence"),
+        )
+        linkage_pairs = (
+            ("entity", "record", table),
+            ("document", "document", notion_document),
         )
         if not (
-            notion_verification.get("dataContentProfile") == profile
-            and notion_verification.get("notionApiVersion") == "2025-09-03"
-            and isinstance(identity.get("botId"), str)
-            and bool(identity.get("botId"))
-            and isinstance(identity.get("workspaceId"), str)
-            and bool(identity.get("workspaceId"))
-            and identity.get("botExact") is True
-            and identity.get("workspaceExact") is True
-            and set(resources) == {"root", "documents", "database", "dataSource"}
-            and all(
-                isinstance(resource, dict) and resource.get("exact") is True
-                for resource in resources.values()
+            notion_canary.get("dataContentProfile") == profile
+            and notion_verification.get("dataContentProfile") == profile
+            and notion_canary.get("provider") == "notion"
+            and notion_verification.get("provider") == "notion"
+            and notion_canary.get("redacted") is True
+            and notion_verification.get("redacted") is True
+            and evidence_contracts
+            == (
+                {
+                    "path": str(notion_projection_canary_evidence_path),
+                    "mode": "0600",
+                },
+                {
+                    "path": str(notion_consumer_verification_evidence_path),
+                    "mode": "0600",
+                },
             )
-            and schema.get("exact") is True
-            and isinstance(schema.get("properties"), dict)
-            and bool(schema.get("properties"))
-            and canary.get("kind") == "NotionConnectorCanary"
-            and canary.get("status") == "passed"
-            and canary.get("ok") is True
-            and canary.get("dataContentProfile") == profile
-            and canary.get("canonicalSourceSha256") == source_gate["sourceSha256"]
-            and canary.get("producerSha256") == sha256_file(notion_producer)
-            and canary.get("redacted") is True
-            and set(canary_linkage) == {"record", "document"}
+            and set(canary_linkage) == {"entity", "document"}
             and all(
-                isinstance(canary_linkage.get(kind), dict)
+                isinstance(canary_linkage.get(canary_kind), dict)
+                and canary_linkage[canary_kind].get("canonicalObjectIdSha256")
+                == postgres[row_kind].get("objectIdSha256")
+                and canary_linkage[canary_kind].get("providerObjectIdSha256")
+                == projected.get("pageIdSha256")
                 and all(
-                    canary_linkage[kind].get(key) == postgres[kind].get(key)
+                    canary_linkage[canary_kind].get(key) == postgres[row_kind].get(key)
                     for key in (
-                        "objectIdSha256",
                         "initialRevision",
                         "finalRevision",
                         "initialContentSha256",
                         "finalContentSha256",
                     )
                 )
-                for kind in ("record", "document")
+                for canary_kind, row_kind, projected in linkage_pairs
             )
-            and isinstance(verified_table.get("pageId"), str)
-            and sha256(table.get("pageIdSha256"))
-            and hashlib.sha256(verified_table["pageId"].encode()).hexdigest()
-            == table.get("pageIdSha256")
-            and isinstance(verified_document.get("pageId"), str)
-            and sha256(notion_document.get("pageIdSha256"))
-            and hashlib.sha256(verified_document["pageId"].encode()).hexdigest()
-            == notion_document.get("pageIdSha256")
-            and all(verified_table.get(key) is True for key in table_required[:-1])
+            and canary_cleanup.get("verified") is True
             and all(
-                verified_document.get(key) is True for key in document_required[:-1]
+                delivery.get(key) == 0
+                for key in (
+                    "pending",
+                    "processing",
+                    "failed",
+                    "eligible",
+                    "exhausted",
+                    "expiredLeases",
+                )
             )
-            and verified_cleanup.get("verified") is True
-            and notion_verification.get("redacted") is True
-            and secret_audit.get("tokenPresent") is False
-            and secret_audit.get("rawMarkerPresent") is False
+            and delivery.get("schemaReady") is True
+            and systemd
+            and all(value is True for value in systemd.values())
         ):
-            raise AcceptanceError("notion_connector_verification_invalid")
+            raise AcceptanceError("notion_projection_consumer_evidence_invalid")
         return [
             {
                 "path": str(c029_integration_evidence_path),
@@ -1548,366 +1670,11 @@ def c029_persistence_dependencies(
                     root / "bin/server-integration-canaries.py"
                 ),
             },
-            {
-                "path": str(notion_evidence_path),
-                "sha256": sha256_file(notion_evidence_path),
-                "kind": "NotionConnectorVerification",
-                "producerSha256": sha256_file(notion_producer),
-            },
+            expected_canary_reference,
+            expected_verification_reference,
         ]
 
-    if profile == "postgres-postgrest-nocodb-nocodocs":
-        tables = (
-            row.get("tablesPersistence")
-            if isinstance(row.get("tablesPersistence"), dict)
-            else {}
-        )
-        documents = (
-            row.get("documentsPersistence")
-            if isinstance(row.get("documentsPersistence"), dict)
-            else {}
-        )
-        if not (
-            row.get("ok") is True
-            and row.get("state") == "passed"
-            and row.get("source") == "controlled_data_content_application_restarts"
-            and row.get("roles")
-            == {
-                "tablesUi": "nocodb",
-                "tablesApi": "postgrest",
-                "documentsUi": "nocodb",
-                "documentsApi": "nocodb",
-            }
-            and all(
-                item.get("restartObserved") is True
-                and item.get("persistenceVerified") is True
-                and item.get("postDeleteAbsent") is True
-                and item.get("cleanupCompleted") is True
-                and sha256(item.get("markerSha256"))
-                for item in (tables, documents)
-            )
-            and tables.get("nocodbVisibilityVerified") is True
-            and tables.get("singlePostgresStateVerified") is True
-            and documents.get("endpoint") == "/api/v3/docs"
-            and documents.get("requiredPlan")
-            == "licensed-self-hosted-business-or-higher"
-            and row.get("applicationRestartObserved") is True
-            and row.get("tablePersistenceVerified") is True
-            and row.get("documentPersistenceVerified") is True
-            and row.get("cleanupCompleted") is True
-        ):
-            raise AcceptanceError("data_content_persistence_dependency_invalid")
-
-        postgrest_document = fresh_component_dependency(
-            postgrest_evidence_path,
-            source_gate=source_gate,
-            api_version="micro-task-engine/v1alpha1",
-            kind="PostgrestVerification",
-            producer=root / "bin/server-postgrest.py",
-        )
-        nocodb_document = fresh_component_dependency(
-            nocodb_evidence_path,
-            source_gate=source_gate,
-            api_version="micro-task-engine/v1alpha1",
-            kind="NocoDbNocoDocsVerification",
-            producer=root / "bin/server-nocodb.py",
-        )
-        if not (
-            postgrest_document.get("profile") == profile
-            and postgrest_document.get("persistence")
-            and all(
-                postgrest_document["persistence"].get(key) is True
-                for key in (
-                    "restartObserved",
-                    "persistenceVerified",
-                    "postDeleteAbsent",
-                    "cleanupCompleted",
-                )
-            )
-            and nocodb_document.get("profile") == profile
-            and nocodb_document.get("dataState", {}).get("owner")
-            == "postgres-postgrest"
-            and nocodb_document.get("dataState", {}).get("nocodbUniqueTableState")
-            is False
-            and nocodb_document.get("documentsApi", {}).get("endpoint")
-            == "/api/v3/docs"
-            and nocodb_document.get("documentsApi", {}).get("requiredPlan")
-            == "licensed-self-hosted-business-or-higher"
-            and nocodb_document.get("release", {}).get("license")
-            == "LicenseRef-NocoDB-Sustainable-Use-1.0"
-            and nocodb_document.get("release", {}).get("exception", {}).get("approval")
-            == "user-approved-2026-07-15"
-        ):
-            raise AcceptanceError("data_content_component_dependency_invalid")
-        expected_refs = {
-            "postgrest": {
-                "path": str(postgrest_evidence_path),
-                "sha256": sha256_file(postgrest_evidence_path),
-                "kind": "PostgrestVerification",
-                "producerSha256": sha256_file(root / "bin/server-postgrest.py"),
-            },
-            "nocodb": {
-                "path": str(nocodb_evidence_path),
-                "sha256": sha256_file(nocodb_evidence_path),
-                "kind": "NocoDbNocoDocsVerification",
-                "producerSha256": sha256_file(root / "bin/server-nocodb.py"),
-            },
-        }
-        if dependency_evidence != expected_refs:
-            raise AcceptanceError("data_content_dependency_reference_invalid")
-        return [
-            {
-                "path": str(c029_integration_evidence_path),
-                "sha256": sha256_file(c029_integration_evidence_path),
-            },
-            {
-                "path": str(postgrest_evidence_path),
-                "sha256": sha256_file(postgrest_evidence_path),
-            },
-            {
-                "path": str(nocodb_evidence_path),
-                "sha256": sha256_file(nocodb_evidence_path),
-            },
-        ]
-
-    expected_row_keys = {
-        "id",
-        "ok",
-        "state",
-        "source",
-        "dataContentProfile",
-        "roles",
-        "tablesPersistence",
-        "documentsPersistence",
-        "baserowPersistence",
-        "wikijsPersistence",
-        "osiLicenses",
-        "applicationRestartObserved",
-        "tablePersistenceVerified",
-        "documentPersistenceVerified",
-        "cleanupCompleted",
-        "dependencyEvidence",
-    }
-    if not (
-        set(row) == expected_row_keys
-        and row.get("ok") is True
-        and row.get("state") == "passed"
-        and row.get("source") == "controlled_ose_application_restarts"
-        and row.get("dataContentProfile") == "baserow-wikijs"
-        and row.get("roles")
-        == {
-            "tablesUi": "baserow",
-            "tablesApi": "baserow",
-            "documentsUi": "wikijs",
-            "documentsApi": "wikijs",
-        }
-        and not old_storage_key_present(row)
-        and set(baserow)
-        == {
-            "databaseId",
-            "tableId",
-            "rowId",
-            "markerSha256",
-            "restartObserved",
-            "persistenceVerified",
-            "postDeleteStatus",
-            "cleanupCompleted",
-        }
-        and all(
-            numeric_identifier(baserow.get(key))
-            for key in ("databaseId", "tableId", "rowId")
-        )
-        and sha256(baserow.get("markerSha256"))
-        and baserow.get("restartObserved") is True
-        and baserow.get("persistenceVerified") is True
-        and baserow.get("postDeleteStatus") == 404
-        and baserow.get("cleanupCompleted") is True
-        and set(wikijs)
-        == {
-            "pageId",
-            "pathHashSha256",
-            "markerSha256",
-            "restartObserved",
-            "persistenceVerified",
-            "postDeleteStatus",
-            "cleanupCompleted",
-        }
-        and numeric_identifier(wikijs.get("pageId"))
-        and sha256(wikijs.get("pathHashSha256"))
-        and sha256(wikijs.get("markerSha256"))
-        and wikijs.get("restartObserved") is True
-        and wikijs.get("persistenceVerified") is True
-        and wikijs.get("postDeleteStatus") == 404
-        and wikijs.get("cleanupCompleted") is True
-        and licenses
-        == [
-            {
-                "component": "baserow",
-                "version": "2.3.1",
-                "spdx": "MIT",
-                "imageDigest": "sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a",
-                "verified": True,
-            },
-            {
-                "component": "wikijs",
-                "version": "2.5.314",
-                "spdx": "AGPL-3.0-only",
-                "imageDigest": "sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e",
-                "verified": True,
-            },
-        ]
-        and row.get("tablePersistenceVerified") is True
-        and row.get("documentPersistenceVerified") is True
-        and row.get("applicationRestartObserved") is True
-        and row.get("cleanupCompleted") is True
-    ):
-        raise AcceptanceError("ose_storage_persistence_dependency_invalid")
-
-    baserow_document = fresh_component_dependency(
-        baserow_evidence_path,
-        source_gate=source_gate,
-        api_version=component_api_prefix + "/v1",
-        kind="BaserowAcceptance",
-        producer=root / "bin/server-baserow.py",
-    )
-    distribution = (
-        baserow_document.get("distribution")
-        if isinstance(baserow_document.get("distribution"), dict)
-        else {}
-    )
-    rest_api = (
-        baserow_document.get("restApi")
-        if isinstance(baserow_document.get("restApi"), dict)
-        else {}
-    )
-    mcp = (
-        baserow_document.get("mcp")
-        if isinstance(baserow_document.get("mcp"), dict)
-        else {}
-    )
-    baserow_component_persistence = (
-        baserow_document.get("baserowPersistence")
-        if isinstance(baserow_document.get("baserowPersistence"), dict)
-        else {}
-    )
-    if not (
-        distribution.get("name") == "Baserow OSE"
-        and distribution.get("version") == "2.3.1"
-        and distribution.get("image")
-        == "baserow/baserow:2.3.1@sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a"
-        and distribution.get("platformDigest")
-        == "sha256:16d9dd21b3f282c9300d876da66c8036e217143cae0af8f1dd2da5b45af0e30b"
-        and distribution.get("license") == "MIT"
-        and distribution.get("licenseSource")
-        == "https://github.com/baserow/baserow/blob/2.3.1/LICENSE"
-        and distribution.get("licenseSourceSha256")
-        == "1c1fa26d7bb6fddee61c4120803a7190ee3199ac29062bcc1ff0f00a0de08e2b"
-        and distribution.get("enterpriseLicenseConfigured") is False
-        and distribution.get("premiumFeaturesUsed") is False
-        and rest_api.get("ok") is True
-        and rest_api.get("tokenCheckStatus") == 200
-        and rest_api.get("rowsStatus") == 200
-        and mcp.get("ok") is True
-        and mcp.get("initializeOk") is True
-        and mcp.get("toolsListOk") is True
-        and isinstance(mcp.get("toolNames"), list)
-        and bool(mcp.get("toolNames"))
-        and all(
-            baserow_component_persistence.get(key) == value
-            for key, value in baserow.items()
-        )
-    ):
-        raise AcceptanceError("baserow_component_dependency_invalid")
-
-    wikijs_document = fresh_component_dependency(
-        wikijs_evidence_path,
-        source_gate=source_gate,
-        api_version="micro-task-engine/v1alpha1",
-        kind="WikiJsVerification",
-        producer=root / "bin/server-wikijs.py",
-    )
-    wiki_image = (
-        wikijs_document.get("image")
-        if isinstance(wikijs_document.get("image"), dict)
-        else {}
-    )
-    graphql = (
-        wikijs_document.get("graphql")
-        if isinstance(wikijs_document.get("graphql"), dict)
-        else {}
-    )
-    secret_audit = (
-        wikijs_document.get("secretAudit")
-        if isinstance(wikijs_document.get("secretAudit"), dict)
-        else {}
-    )
-    wiki_component_projection = {
-        "pageId": graphql.get("pageId"),
-        "pathHashSha256": graphql.get("pathHashSha256"),
-        "markerSha256": graphql.get("markerSha256"),
-        "restartObserved": graphql.get("restartObserved"),
-        "persistenceVerified": graphql.get("persistenceVerified"),
-        "postDeleteStatus": graphql.get("postDeleteStatus404"),
-        "cleanupCompleted": graphql.get("cleanupCompleted"),
-    }
-    if not (
-        wiki_image.get("license")
-        == {
-            "spdx": "AGPL-3.0-only",
-            "source": "https://github.com/requarks/wiki/blob/v2.5.314/LICENSE",
-        }
-        and wiki_image.get("ref")
-        == "ghcr.io/requarks/wiki:2.5.314@sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e"
-        and wiki_image.get("version") == "2.5.314"
-        and wiki_image.get("digest")
-        == "sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e"
-        and wiki_image.get("upstreamCommit")
-        == "6f042e97cc2d3acda6b6ff611de8e0faacce91c1"
-        and graphql.get("bearerAuthenticated") is True
-        and graphql.get("restartObserved") is True
-        and graphql.get("persistenceVerified") is True
-        and graphql.get("cleanupCompleted") is True
-        and graphql.get("postDeleteGraphqlMissing") is True
-        and graphql.get("postDeleteStatus404") == 404
-        and sha256(graphql.get("pathHashSha256"))
-        and sha256(graphql.get("markerSha256"))
-        and wiki_component_projection == wikijs
-        and secret_audit.get("rawSecretsPresent") is False
-        and secret_audit.get("contentMarkerPresent") is False
-    ):
-        raise AcceptanceError("wikijs_component_dependency_invalid")
-
-    expected_refs = {
-        "baserow": {
-            "path": str(baserow_evidence_path),
-            "sha256": sha256_file(baserow_evidence_path),
-            "kind": "BaserowAcceptance",
-            "producerSha256": sha256_file(root / "bin/server-baserow.py"),
-        },
-        "wikijs": {
-            "path": str(wikijs_evidence_path),
-            "sha256": sha256_file(wikijs_evidence_path),
-            "kind": "WikiJsVerification",
-            "producerSha256": sha256_file(root / "bin/server-wikijs.py"),
-        },
-    }
-    if dependency_evidence != expected_refs:
-        raise AcceptanceError("ose_storage_dependency_reference_invalid")
-
-    return [
-        {
-            "path": str(c029_integration_evidence_path),
-            "sha256": sha256_file(c029_integration_evidence_path),
-        },
-        {
-            "path": str(baserow_evidence_path),
-            "sha256": sha256_file(baserow_evidence_path),
-        },
-        {
-            "path": str(wikijs_evidence_path),
-            "sha256": sha256_file(wikijs_evidence_path),
-        },
-    ]
+    raise AcceptanceError("data_content_profile_unsupported", profile)
 
 
 def c046_datasource_dependency(source_gate: dict[str, str]) -> dict[str, str]:
@@ -2070,16 +1837,10 @@ def firecrawl_row(values: dict[str, str], app: dict[str, str]) -> dict[str, Any]
         raise AcceptanceError("firecrawl_access_class_invalid")
     require_values(
         values,
-        "CLOUDFLARE_ACCESS_CLIENT_ID",
-        "CLOUDFLARE_ACCESS_CLIENT_SECRET",
-        "CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID",
-        "CLOUDFLARE_ACCESS_EXPIRES_AT",
         "FIRECRAWL_API_KEY",
         "FIRECRAWL_HEALTH_URL",
     )
-    expires_at = parse_iso(values["CLOUDFLARE_ACCESS_EXPIRES_AT"])
-    if (expires_at - datetime.now(timezone.utc)).total_seconds() <= 300:
-        raise AcceptanceError("cloudflare_service_token_expired_or_near_expiry")
+    route_token = service_route_credentials(values, "firecrawl")
     base = "https://" + app["hostname"]
     health = urllib.parse.urlsplit(values["FIRECRAWL_HEALTH_URL"])
     if not (
@@ -2097,73 +1858,41 @@ def firecrawl_row(values: dict[str, str], app: dict[str, str]) -> dict[str, Any]
         "GET", base + health_path, allowed={401}, follow_redirects=False
     )
     service_headers = {
-        "CF-Access-Client-Id": values["CLOUDFLARE_ACCESS_CLIENT_ID"],
-        "CF-Access-Client-Secret": values["CLOUDFLARE_ACCESS_CLIENT_SECRET"],
+        "CF-Access-Client-Id": route_token["client_id"],
+        "CF-Access-Client-Secret": route_token["client_secret"],
     }
     service_status, _payload, _headers = request(
         "GET", base + health_path, headers=service_headers, allowed={200}
     )
-    marker = "MTE-C026-" + secrets.token_hex(12)
-    suffix = hashlib.sha256(marker.encode()).hexdigest()[:12]
-    container = "mte-cf-marker-" + suffix
-    code = (
-        "import os;from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer;"
-        "m=os.environ['MARKER'].encode();"
-        "H=type('H',(BaseHTTPRequestHandler,),{"
-        "'do_GET':lambda s:(s.send_response(200),s.send_header('Content-Type','text/plain'),"
-        "s.end_headers(),s.wfile.write(m))[-1],"
-        "'log_message':lambda *a:None});"
-        "ThreadingHTTPServer(('0.0.0.0',8080),H).serve_forever()"
+    scrape_headers = {
+        **service_headers,
+        "Authorization": "Bearer " + values["FIRECRAWL_API_KEY"],
+    }
+    scrape_status, scrape, _ = request(
+        "POST",
+        base + "/v1/scrape",
+        headers=scrape_headers,
+        body={
+            "url": "https://example.com/",
+            "formats": ["markdown"],
+            "onlyMainContent": False,
+            "maxAge": 0,
+        },
+        allowed={200},
+        timeout=180,
     )
-    cleanup = False
-    try:
-        docker_run(["docker", "rm", "-f", container], allow_failure=True)
-        docker_run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "-d",
-                "--name",
-                container,
-                "--network",
-                "mte-firecrawl",
-                "-e",
-                "MARKER=" + marker,
-                "python:3.13-slim",
-                "python",
-                "-c",
-                code,
-            ],
-            timeout=120,
-        )
-        time.sleep(1)
-        scrape_headers = {
-            **service_headers,
-            "Authorization": "Bearer " + values["FIRECRAWL_API_KEY"],
-        }
-        scrape_status, scrape, _ = request(
-            "POST",
-            base + "/v1/scrape",
-            headers=scrape_headers,
-            body={
-                "url": "http://" + container + ":8080/",
-                "formats": ["markdown"],
-                "onlyMainContent": False,
-            },
-            allowed={200},
-            timeout=180,
-        )
-        markdown = ""
-        if isinstance(scrape, dict) and isinstance(scrape.get("data"), dict):
-            markdown = str(scrape["data"].get("markdown", ""))
-        if scrape_status != 200 or marker not in markdown:
-            raise AcceptanceError("firecrawl_controlled_marker_missing")
-    finally:
-        removed = docker_run(["docker", "rm", "-f", container], allow_failure=True)
-        cleanup = removed.returncode == 0
-    if not cleanup:
-        raise AcceptanceError("firecrawl_marker_cleanup_failed")
+    data = scrape.get("data") if isinstance(scrape, dict) else None
+    markdown = data.get("markdown") if isinstance(data, dict) else None
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if not (
+        scrape_status == 200
+        and scrape.get("success") is True
+        and isinstance(markdown, str)
+        and "Example Domain" in markdown
+        and isinstance(metadata, dict)
+        and metadata.get("statusCode") == 200
+    ):
+        raise AcceptanceError("firecrawl_live_scrape_invalid")
     return {
         "id": "C026",
         "ok": True,
@@ -2182,9 +1911,10 @@ def firecrawl_row(values: dict[str, str], app: dict[str, str]) -> dict[str, Any]
         "serviceTokenExpiryVerified": True,
         "serviceTokenCredentialsPresent": True,
         "serviceTokenCredentialValuesEmitted": False,
-        "controlledScrapeMarkerObserved": True,
-        "markerResultSha256": hashlib.sha256(markdown.encode()).hexdigest(),
-        "markerContainerRemoved": True,
+        "liveScrapeKnownDocumentObserved": True,
+        "liveScrapeResultSha256": hashlib.sha256(markdown.encode()).hexdigest(),
+        "liveScrapeMetadataStatus": 200,
+        "liveScrapeCacheBypassed": True,
     }
 
 
@@ -2193,7 +1923,7 @@ def socket_observation(host: str, timeout: float) -> dict[str, Any]:
     if not parsed or parsed in {"localhost", "127.0.0.1", "::1"}:
         raise AcceptanceError("observer_target_invalid")
     ports: dict[str, dict[str, Any]] = {}
-    for port in (22, 80, 443, 3000):
+    for port in (external_ssh_port, *external_blocked_tcp_ports):
         started = time.monotonic()
         try:
             connection = socket.create_connection((parsed, port), timeout=timeout)
@@ -2219,8 +1949,10 @@ def socket_observation(host: str, timeout: float) -> dict[str, Any]:
         "producerSha256": sha256_file(Path(__file__).resolve()),
         "ports": ports,
         "ok": (
-            ports["22"]["open"] is True
-            and all(ports[str(port)]["open"] is False for port in (80, 443, 3000))
+            ports[str(external_ssh_port)]["open"] is True
+            and all(
+                ports[str(port)]["open"] is False for port in external_blocked_tcp_ports
+            )
         ),
     }
 
@@ -2289,9 +2021,12 @@ def validate_observation(
         and expected not in excluded
         and -30 <= age <= 300
         and isinstance(ports, dict)
-        and set(ports) == {"22", "80", "443", "3000"}
-        and ports["22"].get("open") is True
-        and all(ports[str(port)].get("open") is False for port in (80, 443, 3000))
+        and set(ports)
+        == {str(external_ssh_port), *(str(port) for port in external_blocked_tcp_ports)}
+        and ports[str(external_ssh_port)].get("open") is True
+        and all(
+            ports[str(port)].get("open") is False for port in external_blocked_tcp_ports
+        )
         and payload.get("ok") is True
     ):
         raise AcceptanceError("external_port_observation_invalid")
@@ -2299,7 +2034,9 @@ def validate_observation(
         "expectedHost": expected,
         "excludedHosts": sorted(excluded),
         "sshReachable": True,
-        "externalPortsBlocked": {"80": True, "443": True, "3000": True},
+        "externalPortsBlocked": {
+            str(port): True for port in external_blocked_tcp_ports
+        },
         "evidenceSha256": sha256_file(path),
         "ageSeconds": round(age, 3),
         **identity,
@@ -2307,57 +2044,65 @@ def validate_observation(
 
 
 def firewall_status() -> dict[str, Any]:
-    active = docker_run(
-        ["systemctl", "is-active", "mte-cloudflare-origin-firewall.service"],
-        allow_failure=True,
+    """Validate the v2 origin-firewall producer rather than stale rule shapes."""
+    if (
+        not origin_firewall_step_path.is_file()
+        or origin_firewall_step_path.is_symlink()
+    ):
+        raise AcceptanceError("origin_firewall_producer_missing")
+    exact_mode(origin_firewall_step_path, 0o700)
+    completed = docker_run(
+        [str(origin_firewall_step_path), "status"], allow_failure=True
     )
-    enabled = docker_run(
-        ["systemctl", "is-enabled", "mte-cloudflare-origin-firewall.service"],
-        allow_failure=True,
-    )
-    interface = docker_run(
-        ["sh", "-c", "ip -4 route show default | awk 'NR==1{print $5}'"]
-    ).stdout.strip()
-    if not interface:
-        raise AcceptanceError("public_interface_missing")
-    rule = [
-        "-i",
-        interface,
-        "-p",
-        "tcp",
-        "-m",
-        "multiport",
-        "--dports",
-        "80,443,3000",
-        "-m",
-        "comment",
-        "--comment",
-        "mte-cloudflare-origin-block",
-        "-j",
-        "DROP",
-    ]
-    checks: dict[str, bool] = {}
-    for tool, family in (("iptables", "V4"), ("ip6tables", "V6")):
-        for chain, suffix in (("INPUT", "Input"), ("DOCKER-USER", "Docker")):
-            result = docker_run([tool, "-w", "-C", chain, *rule], allow_failure=True)
-            checks["firewall" + family + suffix] = result.returncode == 0
-    if active.returncode != 0 or enabled.returncode != 0 or not all(checks.values()):
+    if completed.returncode != 0:
         raise AcceptanceError("origin_firewall_contract_failed")
-    return {
-        "firewallServiceActive": True,
-        "firewallServiceEnabled": True,
-        "publicInterface": interface,
-        **checks,
-    }
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AcceptanceError("origin_firewall_status_invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != origin_firewall_status_fields:
+        raise AcceptanceError("origin_firewall_status_invalid")
+    counts = (
+        payload.get("firewallSshCidrCount"),
+        payload.get("firewallSshIpv4CidrCount"),
+        payload.get("firewallSshIpv6CidrCount"),
+    )
+    fingerprint = payload.get("operatorSshCidrsSha256")
+    interfaces = (
+        payload.get("publicInterface"),
+        payload.get("publicInterfaceV4"),
+        payload.get("publicInterfaceV6"),
+    )
+    if not (
+        payload.get("firewallPolicyVersion") == "mte-origin-firewall/v2"
+        and all(payload.get(field) is True for field in origin_firewall_true_fields)
+        and all(isinstance(value, str) and value for value in interfaces)
+        and isinstance(fingerprint, str)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", fingerprint))
+        and all(
+            isinstance(value, int) and not isinstance(value, bool) for value in counts
+        )
+        and counts[0] >= 1
+        and counts[0] == counts[1] + counts[2]
+    ):
+        raise AcceptanceError("origin_firewall_contract_failed")
+    return payload
 
 
-def cloudflared_status() -> dict[str, Any]:
-    state = docker_run(
-        ["docker", "inspect", "--format", "{{json .State}}", "mte-cloudflared"]
-    )
-    restarts = docker_run(
-        ["docker", "inspect", "--format", "{{.RestartCount}}", "mte-cloudflared"]
-    )
+def cloudflared_status(values: dict[str, str]) -> dict[str, Any]:
+    """Prove the live connector matches the canonical runtime contract."""
+    require_values(values, "CLOUDFLARED_CONTAINER_NAME")
+    name = values["CLOUDFLARED_CONTAINER_NAME"]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name):
+        raise AcceptanceError("cloudflared_container_name_invalid")
+    if not cloudflared_step_path.is_file() or cloudflared_step_path.is_symlink():
+        raise AcceptanceError("cloudflared_runtime_producer_missing")
+    exact_mode(cloudflared_step_path, 0o700)
+    verified = docker_run([str(cloudflared_step_path), "verify"], allow_failure=True)
+    if verified.returncode != 0:
+        raise AcceptanceError("cloudflared_runtime_contract_failed")
+    state = docker_run(["docker", "inspect", "--format", "{{json .State}}", name])
+    restarts = docker_run(["docker", "inspect", "--format", "{{.RestartCount}}", name])
     try:
         payload = json.loads(state.stdout)
         restart_count = int(restarts.stdout.strip())
@@ -2365,7 +2110,11 @@ def cloudflared_status() -> dict[str, Any]:
         raise AcceptanceError("cloudflared_state_invalid") from exc
     if payload.get("Running") is not True or restart_count != 0:
         raise AcceptanceError("cloudflared_runtime_unhealthy")
-    return {"cloudflaredRunning": True, "restartCount": restart_count}
+    return {
+        "cloudflaredRunning": True,
+        "restartCount": restart_count,
+        "cloudflaredRuntimeConfigVerified": True,
+    }
 
 
 def lock_image() -> str:
@@ -2426,6 +2175,46 @@ def plan_action_summary(document: dict[str, Any]) -> dict[str, int]:
     ):
         raise AcceptanceError("opentofu_saved_plan_not_empty")
     return counts
+
+
+def saved_plan_metadata(
+    document: dict[str, Any], action_counts: dict[str, int]
+) -> dict[str, Any]:
+    """Validate explicit metadata or OpenTofu's null empty-plan metadata."""
+    applyable = document.get("applyable")
+    complete = document.get("complete")
+    errored = document.get("errored")
+    if errored is not False:
+        raise AcceptanceError("opentofu_saved_plan_metadata_invalid")
+    if applyable is False and complete is True:
+        mode = "explicit"
+    elif applyable is None and complete is None:
+        if (
+            document.get("format_version"),
+            document.get("terraform_version"),
+        ) not in opentofu_null_metadata_contracts or any(
+            section not in document
+            for section in (
+                "resource_changes",
+                "resource_drift",
+                "output_changes",
+            )
+        ):
+            raise AcceptanceError("opentofu_saved_plan_metadata_invalid")
+        if any(
+            action_counts[action]
+            for action in ("create", "update", "delete", "forget", "import")
+        ):
+            raise AcceptanceError("opentofu_saved_plan_not_empty")
+        mode = "opentofu-null-empty"
+    else:
+        raise AcceptanceError("opentofu_saved_plan_metadata_invalid")
+    return {
+        "applyable": applyable,
+        "complete": complete,
+        "errored": False,
+        "mode": mode,
+    }
 
 
 def tofu_status(values: dict[str, str]) -> dict[str, Any]:
@@ -2544,14 +2333,10 @@ def tofu_status(values: dict[str, str]) -> dict[str, Any]:
             raise AcceptanceError("opentofu_saved_plan_schema_invalid")
         plan_timestamp = parse_iso(plan_document.get("timestamp"))
         plan_age = (datetime.now(timezone.utc) - plan_timestamp).total_seconds()
-        if not (
-            plan_document.get("applyable") is False
-            and plan_document.get("complete") is True
-            and plan_document.get("errored") is False
-            and -30 <= plan_age <= 300
-        ):
+        if not -30 <= plan_age <= 300:
             raise AcceptanceError("opentofu_saved_plan_metadata_invalid")
         action_counts = plan_action_summary(plan_document)
+        metadata = saved_plan_metadata(plan_document, action_counts)
         os.replace(temporary_plan, saved_plan)
         saved_plan.chmod(0o600)
         exact_mode(saved_plan, 0o600)
@@ -2578,9 +2363,10 @@ def tofu_status(values: dict[str, str]) -> dict[str, Any]:
         "savedPlanAgeSeconds": round(time.time() - saved_plan.stat().st_mtime, 3),
         "savedPlanMode": "0600",
         "savedPlanOwner": "root:root",
-        "savedPlanApplyable": False,
-        "savedPlanComplete": True,
-        "savedPlanErrored": False,
+        "savedPlanApplyable": metadata["applyable"],
+        "savedPlanComplete": metadata["complete"],
+        "savedPlanErrored": metadata["errored"],
+        "savedPlanMetadataMode": metadata["mode"],
         "savedPlanActionCounts": action_counts,
         "tfvarsContainsApiToken": False,
     }
@@ -2630,6 +2416,10 @@ def run_acceptance(external_observation: Path) -> dict[str, Any]:
     data_content = data_content_edge_contract(apps_projection, apps)
     connection_apps = human_connection_contract(data_content)
     inventory = cloudflare_inventory(values, apps)
+    service_routes = service_edge_checks(values, apps, config)
+    dns_reconcile = dns_reconcile_status(source_gate, apps, inventory["tunnelId"])
+    if inventory["foreignRecordSetSha256"] != dns_reconcile["foreignRecordSetSha256"]:
+        raise AcceptanceError("cloudflare_dns_foreign_inventory_drift")
     rows = human_rows(values, apps, connection_apps, data_content)
     firecrawl = apps.get("firecrawl")
     if not isinstance(firecrawl, dict):
@@ -2659,13 +2449,14 @@ def run_acceptance(external_observation: Path) -> dict[str, Any]:
                 "serviceSemanticVerified": True,
                 "originSemanticVerified": True,
                 "originAuthenticationVerified": True,
-                "notionConnectorVerified": True,
+                "notionProjectionConsumerVerified": True,
                 "postgresSystemOfRecordVerified": True,
                 "crossProviderLinkageVerified": True,
                 "applicationRestartApplicable": False,
                 "dataContentEvidence": {
                     "integrationCanary": storage_dependencies[0],
-                    "notionConnector": storage_dependencies[1],
+                    "notionProjectionCanary": storage_dependencies[1],
+                    "notionConsumerVerification": storage_dependencies[2],
                 },
             }
         )
@@ -2705,7 +2496,7 @@ def run_acceptance(external_observation: Path) -> dict[str, Any]:
         "externalPortsBlocked": external["externalPortsBlocked"],
         **firewall,
     }
-    runtime = cloudflared_status()
+    runtime = cloudflared_status(values)
     rows["C065"] = {
         "id": "C065",
         "ok": True,
@@ -2727,7 +2518,7 @@ def run_acceptance(external_observation: Path) -> dict[str, Any]:
         "expectedAccessClass": "edge",
         "edgeGateVerified": True,
         "serviceSemanticVerified": True,
-        "dependencyEvidence": [],
+        "dependencyEvidence": [dns_reconcile["dependencyEvidence"]],
         "exactManagedRoutes": len(inventory["routes"]),
         "exactDnsRecords": inventory["dnsRecordCount"],
         "exactAccessApplications": inventory["accessApplicationCount"],
@@ -2736,9 +2527,24 @@ def run_acceptance(external_observation: Path) -> dict[str, Any]:
         "accessClassesVerified": True,
         "humanAccessPolicyScoped": inventory["humanAccessPolicyScoped"],
         "serviceAccessTokenScoped": inventory["serviceAccessTokenScoped"],
-        "foreignDnsPreserved": len(inventory["foreign"])
-        == len(protected_foreign_labels),
-        "protectedForeignRecords": inventory["foreign"],
+        "serviceRouteChecks": service_routes,
+        "serviceRouteCheckCount": len(service_routes),
+        "crossRouteTokensDenied": all(
+            row["crossTokenDenied"] for row in service_routes.values()
+        ),
+        "desiredHostnamesReserved": inventory["desiredHostnamesReserved"],
+        "desiredRecordsExact": dns_reconcile["desiredRecordsExact"],
+        "dnsTargetTunnelBound": inventory["dnsTargetTunnelBound"],
+        "proxiedDnsOnly": inventory["proxiedDnsOnly"],
+        "originAddressRecordCount": inventory["originAddressRecordCount"],
+        "batchApplied": dns_reconcile["batchApplied"],
+        "batchDatabaseTransactionAtomic": dns_reconcile[
+            "batchDatabaseTransactionAtomic"
+        ],
+        "edgePropagationAtomic": dns_reconcile["edgePropagationAtomic"],
+        "foreignDnsPreserved": dns_reconcile["foreignRecordsPreserved"],
+        "foreignRecordCount": dns_reconcile["foreignRecordCount"],
+        "foreignRecordSetSha256": inventory["foreignRecordSetSha256"],
     }
     tofu = tofu_status(values)
     rows["C067"] = {

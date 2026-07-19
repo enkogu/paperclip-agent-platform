@@ -2,12 +2,13 @@ name: mte-kestra
 x-logging: &id001
   driver: json-file
   options:
-    max-size: 10m
-    max-file: '5'
+    max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+    max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
 services:
   kestra-storage-init:
     image: ${MTE_KESTRA_KESTRA_IMAGE:?required}
     user: 0:0
+    network_mode: none
     entrypoint:
     - /bin/sh
     - -ec
@@ -35,6 +36,8 @@ services:
       KESTRA_DB_PASSWORD: ${KESTRA_DB_PASSWORD:?required}
       KESTRA_ADMIN_USER: ${KESTRA_ADMIN_USER:?required}
       KESTRA_ADMIN_PASSWORD: ${KESTRA_ADMIN_PASSWORD:?required}
+      PAPERCLIP_BASE_URL: http://${PAPERCLIP_CONTAINER_HOST:?required}:${PAPERCLIP_PORT:?required}
+      SECRET_PAPERCLIP_BOARD_API_KEY: ${KESTRA_SECRET_PAPERCLIP_BOARD_API_KEY:-}
     volumes:
     - /opt/mte-platform/config/services/kestra/application.yaml:/etc/kestra/application.yaml:ro
     - kestra-storage:/app/storage
@@ -44,8 +47,6 @@ services:
     ports:
     - ${MTE_KESTRA_KESTRA_PORT_1_MAPPING:?required}
     - ${MTE_KESTRA_KESTRA_PORT_2_MAPPING:?required}
-    extra_hosts:
-    - host.docker.internal:host-gateway
     networks:
     - kestra-data
     - control
@@ -54,15 +55,15 @@ services:
       test:
       - CMD-SHELL
       - curl -fsS http://127.0.0.1:8081/health >/dev/null || exit 1
-      interval: 15s
-      timeout: 5s
-      retries: 20
-      start_period: 90s
+      interval: ${MTE_HEALTHCHECK_SLOW_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_SLOW_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_SLOW_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_SLOW_START_PERIOD:?required}
     restart: unless-stopped
     stop_grace_period: 6m
     cpus: ${KESTRA_CPU_LIMIT:?required}
     mem_limit: ${KESTRA_MEMORY_LIMIT:?required}
-    pids_limit: 1024
+    pids_limit: ${MTE_PIDS_HEAVY_LIMIT:?required}
     logging: *id001
 volumes:
   kestra-storage:
@@ -73,6 +74,7 @@ networks:
     external: true
   control:
     name: mte-control
+    external: true
   llm:
     name: mte-llm
     external: true

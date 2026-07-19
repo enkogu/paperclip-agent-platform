@@ -78,7 +78,7 @@ class BootstrapPaperclipTests(unittest.TestCase):
         profile = profiles[0]
         common = {
             "profile": profile,
-            "workspace_root": Path("/workspaces"),
+            "workspace_root": Path("/home/daytona/paperclip-workspace"),
             "instructions_root": Path("/profiles"),
             "max_concurrency": None,
             "catalog_sha256": catalog_sha,
@@ -88,18 +88,71 @@ class BootstrapPaperclipTests(unittest.TestCase):
         self.assertEqual(native["metadata"]["managedBy"], "mte-profile-reconciler")
         self.assertEqual(native["metadata"]["catalogSha256"], catalog_sha)
         self.assertEqual(
+            native["adapterConfig"]["cwd"],
+            "/home/daytona/paperclip-workspace",
+        )
+        self.assertEqual(
             native["metadata"]["toolBundleRef"],
             profile["toolAccess"]["bundleId"],
         )
+        self.assertEqual(
+            native["runtimeConfig"]["modelProfiles"]["cheap"]["adapterConfig"],
+            {"model": profile["nativeAdapterConfig"]["model"]},
+        )
         with self.assertRaisesRegex(ValueError, "only native"):
             self.module.desired_agent(mode="smoke", **common)
+
+    def test_recovery_model_profile_stays_on_canonical_route(self):
+        profiles, catalog_sha = self.module.profile_catalog()
+        by_ref = {profile["ref"]: profile for profile in profiles}
+
+        for ref in ("coding-daytona-codex", "coding-daytona-claude"):
+            desired = self.module.desired_agent(
+                by_ref[ref],
+                mode="native",
+                workspace_root=Path("/home/daytona/paperclip-workspace"),
+                instructions_root=Path("/profiles"),
+                max_concurrency=None,
+                catalog_sha256=catalog_sha,
+            )
+            cheap = desired["runtimeConfig"]["modelProfiles"]["cheap"]
+            self.assertTrue(cheap["enabled"])
+            self.assertEqual(
+                cheap["adapterConfig"]["model"],
+                desired["adapterConfig"]["model"],
+            )
+
+        pi = self.module.desired_agent(
+            by_ref["coding-daytona-pi"],
+            mode="native",
+            workspace_root=Path("/home/daytona/paperclip-workspace"),
+            instructions_root=Path("/profiles"),
+            max_concurrency=None,
+            catalog_sha256=catalog_sha,
+        )
+        self.assertEqual(pi["runtimeConfig"]["modelProfiles"], {})
+
+    def test_missing_recovery_model_profile_is_agent_drift(self):
+        profiles, catalog_sha = self.module.profile_catalog()
+        desired = self.module.desired_agent(
+            profiles[0],
+            mode="native",
+            workspace_root=Path("/home/daytona/paperclip-workspace"),
+            instructions_root=Path("/profiles"),
+            max_concurrency=None,
+            catalog_sha256=catalog_sha,
+        )
+        current = copy.deepcopy(desired)
+        del current["runtimeConfig"]["modelProfiles"]
+
+        self.assertTrue(self.module.agent_has_drift(current, desired))
 
     def test_unchanged_agent_requires_no_patch_and_output_is_mode_0600(self):
         profiles, catalog_sha = self.module.profile_catalog()
         desired = self.module.desired_agent(
             profiles[0],
             mode="native",
-            workspace_root=Path("/workspaces"),
+            workspace_root=Path("/home/daytona/paperclip-workspace"),
             instructions_root=Path("/profiles"),
             max_concurrency=None,
             catalog_sha256=catalog_sha,
@@ -142,7 +195,7 @@ class BootstrapPaperclipTests(unittest.TestCase):
                 url="http://paperclip.test",
                 token="",
                 mode="native",
-                workspace_root="/workspaces",
+                workspace_root="/home/daytona/paperclip-workspace",
                 instructions_root="/profiles",
                 max_concurrency=None,
                 output=Path(directory) / "bootstrap.json",

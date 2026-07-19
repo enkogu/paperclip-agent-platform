@@ -7,6 +7,11 @@ toolPolicies:
       provider: postgrest
       allowed: true
       credentialRef: POSTGREST_PAPERCLIP_TOKEN
+      toolBundleDelivery:
+        status: blocked
+        failClosed: true
+        inProfileToolBundle: false
+        blocker: postgrest-mcp-workload-not-reviewed
     notionAgentAccess:
       mode: read_only
       rawCredentialInHarness: false
@@ -57,6 +62,132 @@ toolPolicies:
         - create
         - update
         - archive
+skillPackages:
+  verification-before-completion:
+    source: skills/verification-before-completion
+    projection: runtime/paperclip/profiles/skills/verification-before-completion
+    manifest: SKILL.md
+    manifestSha256: 7560fd8dff901740f317a259488ffbbb473dfb69203617491e7e511a41eba730
+    metadata: agents/openai.yaml
+    metadataSha256: f2e13306667f509a59ed35834eaf136dc23806b74fa82b80e0ee8b9f1309f207
+    contractId: mte.verify-before-completion.v1
+    nativeDestinations:
+      codex: /home/daytona/.agents/skills/verification-before-completion
+      claude: /home/daytona/.claude/skills/verification-before-completion
+      pi: /home/daytona/.pi/mte-profile/skills/verification-before-completion
+extensions:
+  - ref: context7-codex
+    kind: extension
+    mcpCapability: context7
+    deliveryKey: context7
+    enabledProfiles:
+      - coding-daytona-codex
+    package:
+      kind: runtime
+      ref: codex
+    config:
+      mode: native_remote_mcp
+      serverName: context7
+      endpointRef: MTE_CONTEXT7_MCP_URL
+      credentialRef: CONTEXT7_API_KEY
+      credentialRequired: false
+      runtimeConfigSource: nativeAdapterConfig.extraArgs
+    credentialRefs:
+      - CONTEXT7_API_KEY
+  - ref: context7-claude
+    kind: extension
+    mcpCapability: context7
+    deliveryKey: context7
+    enabledProfiles:
+      - coding-daytona-claude
+    package:
+      kind: runtime
+      ref: claudeCode
+    config:
+      mode: native_remote_mcp
+      serverName: context7
+      endpointRef: MTE_CONTEXT7_MCP_URL
+      credentialRef: CONTEXT7_API_KEY
+      credentialRequired: false
+      configPath: /etc/claude-code/managed-mcp.json
+    credentialRefs:
+      - CONTEXT7_API_KEY
+  - ref: context7-pi
+    kind: extension
+    mcpCapability: context7-pi-extension
+    deliveryKey: context7
+    enabledProfiles:
+      - coding-daytona-pi
+    package:
+      kind: npm
+      ref: '@upstash/context7-pi'
+      versionRef: MTE_CONTEXT7_PI_VERSION
+      integrityRef: MTE_CONTEXT7_PI_NPM_INTEGRITY
+    config:
+      mode: official_pi_extension
+      credentialRef: CONTEXT7_API_KEY
+      credentialRequired: false
+      configPath: /home/daytona/.pi/mte-profile/settings.json
+    credentialRefs:
+      - CONTEXT7_API_KEY
+  - ref: toolhive-codex
+    kind: extension
+    mcpCapability: toolhive
+    deliveryKey: profileTools
+    enabledProfiles:
+      - coding-daytona-codex
+    package:
+      kind: runtime
+      ref: codex
+    config:
+      mode: native_remote_mcp
+      serverName: mte-profile-tools
+      endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+      credentialRef: MTE_TOOLHIVE_BEARER_TOKEN
+      runtimeConfigSource: nativeAdapterConfig.extraArgs
+    credentialRefs:
+      - MTE_TOOLHIVE_BEARER_TOKEN
+  - ref: toolhive-claude
+    kind: extension
+    mcpCapability: toolhive
+    deliveryKey: profileTools
+    enabledProfiles:
+      - coding-daytona-claude
+    package:
+      kind: runtime
+      ref: claudeCode
+    config:
+      mode: native_remote_mcp
+      serverName: mte-profile-tools
+      endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+      credentialRef: MTE_TOOLHIVE_BEARER_TOKEN
+      configPath: /etc/claude-code/managed-mcp.json
+    credentialRefs:
+      - MTE_TOOLHIVE_BEARER_TOKEN
+  - ref: toolhive-pi
+    kind: extension
+    mcpCapability: toolhive-pi-extension
+    deliveryKey: profileTools
+    enabledProfiles:
+      - coding-daytona-pi
+    package:
+      kind: local
+      ref: deployment/agent-runtime/pi/mte-toolhive.js
+      integrityRef: MTE_PI_TOOLHIVE_EXTENSION_SHA256
+    config:
+      mode: pi_extension
+      projectionRootRef: MTE_PI_CODING_AGENT_DIR
+      projectionRelativePath: extensions/mte-toolhive.js
+      endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+      credentialRef: MTE_TOOLHIVE_BEARER_TOKEN
+      bindingRef: MTE_TOOLHIVE_BINDING_REF
+      bundleRef: MTE_TOOLHIVE_BUNDLE_ID
+      workloadRef: MTE_TOOLHIVE_WORKLOAD_ID
+      tools:
+        - toolhive_list_tools
+        - toolhive_call
+    credentialRefs:
+      - MTE_TOOLHIVE_BEARER_TOKEN
 profiles:
   - ref: coding-daytona-codex
     title: Coding - Daytona / Codex
@@ -72,6 +203,7 @@ profiles:
       runtimeSecretEnv: OPENAI_API_KEY
       envAllowlist:
         - CODEX_HOME
+        - CONTEXT7_API_KEY
         - GH_TOKEN
         - GITHUB_TOKEN
         - MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
@@ -100,8 +232,13 @@ profiles:
       toolhiveIdentityPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_EVERYTHING_PROXY_PORT
       toolhiveNotionPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_NOTION_PROXY_PORT
     nativeAdapterConfig:
-      cwd: /home/daytona/workspaces/coding-daytona-codex
+      cwd: /home/daytona/paperclip-workspace
       model: ${PROFILE_CODING_DAYTONA_CODEX_MODEL:?required}
+      # Paperclip 2026.707.0 builds the complete user-authored issue context in
+      # context.paperclipTaskMarkdown, but the Codex adapter does not append it
+      # to a fresh-session prompt.  Keep this declarative adapter override until
+      # upstream does so natively; continuations retain the initial context.
+      bootstrapPromptTemplate: '{{context.paperclipTaskMarkdown}}'
       extraArgs:
         - -c
         - model_provider="mte9router"
@@ -113,16 +250,36 @@ profiles:
         - model_providers.mte9router.env_key="OPENAI_API_KEY"
         - -c
         - model_providers.mte9router.wire_api="responses"
+        - -c
+        - mcp_servers.mte-profile-tools.url="${MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL:?required}"
+        - -c
+        - mcp_servers.mte-profile-tools.bearer_token_env_var="MTE_TOOLHIVE_BEARER_TOKEN"
+        - -c
+        - mcp_servers.context7.url="${MTE_CONTEXT7_MCP_URL:?required}"
       timeoutSec: ${PROFILE_CODING_DAYTONA_CODEX_TIMEOUT_SEC:?required}
       dangerouslyBypassApprovalsAndSandbox: true
+    # Paperclip's status-only recovery handoff requests the built-in `cheap`
+    # model profile. Override that profile back to this agent's canonical
+    # 9router model instead of accepting the Codex adapter's OpenAI default.
+    paperclipRuntimeConfig:
+      modelProfiles:
+        cheap:
+          enabled: true
+          label: MTE 9router MiniMax recovery
+          adapterConfig:
+            model: ${PROFILE_CODING_DAYTONA_CODEX_MODEL:?required}
     instructions: instructions/coding.md
     skills:
       - verification-before-completion
+    extensions:
+      - context7-codex
+      - toolhive-codex
     mcpPolicy:
       allow:
         - github
         - filesystem
         - toolhive
+        - context7
       deny:
         - publishing
     limits:
@@ -153,6 +310,23 @@ profiles:
             - canary.echo
             - notion.tables.read
             - notion.documents.read
+    toolDelivery:
+      context7:
+        mode: native_remote_mcp
+        serverName: context7
+        endpoint: ${MTE_CONTEXT7_MCP_URL:?required}
+        authentication: optional_bearer_env
+        runtimeConfigSource: nativeAdapterConfig.extraArgs
+        tools:
+          - resolve-library-id
+          - query-docs
+      profileTools:
+        mode: native_remote_mcp
+        serverName: mte-profile-tools
+        endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL
+        bearerTokenEnv: MTE_TOOLHIVE_BEARER_TOKEN
+        runtimeConfigSource: nativeAdapterConfig.extraArgs
+        status: available
     authPolicy:
       oauthInImage: false
       persistentSecretsInImage: false
@@ -203,6 +377,7 @@ profiles:
       envAllowlist:
         - ANTHROPIC_API_KEY
         - ANTHROPIC_BASE_URL
+        - CONTEXT7_API_KEY
         - GH_TOKEN
         - GITHUB_TOKEN
         - MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
@@ -226,18 +401,31 @@ profiles:
       toolhiveIdentityPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_EVERYTHING_PROXY_PORT
       toolhiveNotionPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_NOTION_PROXY_PORT
     nativeAdapterConfig:
-      cwd: /home/daytona/workspaces/coding-daytona-claude
+      cwd: /home/daytona/paperclip-workspace
       model: ${PROFILE_CODING_DAYTONA_CLAUDE_MODEL:?required}
       timeoutSec: ${PROFILE_CODING_DAYTONA_CLAUDE_TIMEOUT_SEC:?required}
       dangerouslySkipPermissions: true
+    # Keep Paperclip's status-only recovery handoff on the same declared
+    # 9router MiniMax route as the primary Claude Code run.
+    paperclipRuntimeConfig:
+      modelProfiles:
+        cheap:
+          enabled: true
+          label: MTE 9router MiniMax recovery
+          adapterConfig:
+            model: ${PROFILE_CODING_DAYTONA_CLAUDE_MODEL:?required}
     instructions: instructions/coding.md
     skills:
       - verification-before-completion
+    extensions:
+      - context7-claude
+      - toolhive-claude
     mcpPolicy:
       allow:
         - github
         - filesystem
         - toolhive
+        - context7
       deny:
         - publishing
     limits:
@@ -268,6 +456,23 @@ profiles:
             - canary.echo
             - notion.tables.read
             - notion.documents.read
+    toolDelivery:
+      context7:
+        mode: native_remote_mcp
+        serverName: context7
+        endpoint: ${MTE_CONTEXT7_MCP_URL:?required}
+        authentication: optional_bearer_env
+        configPath: /etc/claude-code/managed-mcp.json
+        tools:
+          - resolve-library-id
+          - query-docs
+      profileTools:
+        mode: native_remote_mcp
+        serverName: mte-profile-tools
+        endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL
+        bearerTokenEnv: MTE_TOOLHIVE_BEARER_TOKEN
+        configPath: /etc/claude-code/managed-mcp.json
+        status: available
     authPolicy:
       oauthInImage: false
       persistentSecretsInImage: false
@@ -316,6 +521,7 @@ profiles:
       packageKey: pi
       runtimeSecretEnv: OPENAI_API_KEY
       envAllowlist:
+        - CONTEXT7_API_KEY
         - GH_TOKEN
         - GITHUB_TOKEN
         - MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
@@ -342,18 +548,28 @@ profiles:
       toolhiveIdentityPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_EVERYTHING_PROXY_PORT
       toolhiveNotionPortRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_NOTION_PROXY_PORT
     nativeAdapterConfig:
-      cwd: /home/daytona/workspaces/coding-daytona-pi
+      cwd: /home/daytona/paperclip-workspace
       provider: ${PROFILE_CODING_DAYTONA_PI_PROVIDER:?required}
       model: ${PROFILE_CODING_DAYTONA_PI_MODEL:?required}
+      # Pi has the same fresh-session gap as Codex in Paperclip 2026.707.0.
+      bootstrapPromptTemplate: '{{context.paperclipTaskMarkdown}}'
       timeoutSec: ${PROFILE_CODING_DAYTONA_PI_TIMEOUT_SEC:?required}
+    # Pi 2026.707.0 does not advertise a `cheap` profile. Paperclip therefore
+    # falls back to this primary adapter config without applying an override.
+    paperclipRuntimeConfig:
+      modelProfiles: {}
     instructions: instructions/coding.md
     skills:
       - verification-before-completion
+    extensions:
+      - context7-pi
+      - toolhive-pi
     mcpPolicy:
       allow:
         - github
         - filesystem
-        - toolhive
+        - context7-pi-extension
+        - toolhive-pi-extension
       deny:
         - publishing
     limits:
@@ -369,6 +585,8 @@ profiles:
       apiKeyRef: NINEROUTER_PROFILE_CODING_DAYTONA_PI_API_KEY
     toolRouting:
       provider: toolhive
+      harnessDeliveryStatus: available
+      failClosed: true
       mcpUrlRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
       bearerTokenRef: TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN
       servers:
@@ -384,6 +602,25 @@ profiles:
             - canary.echo
             - notion.tables.read
             - notion.documents.read
+    toolDelivery:
+      context7:
+        mode: official_pi_extension
+        package: ${MTE_CONTEXT7_PI_PACKAGE:?required}
+        version: ${MTE_CONTEXT7_PI_VERSION:?required}
+        npmIntegrity: ${MTE_CONTEXT7_PI_NPM_INTEGRITY:?required}
+        configPath: /home/daytona/.pi/mte-profile/settings.json
+        authentication: optional_bearer_env
+        tools:
+          - resolve-library-id
+          - query-docs
+      profileTools:
+        mode: reviewed_pi_extension
+        status: available
+        failClosed: true
+        extensionRef: toolhive-pi
+        endpointRef: MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL
+        bearerTokenEnv: MTE_TOOLHIVE_BEARER_TOKEN
+        sandboxReachabilityProbeOnly: false
     authPolicy:
       oauthInImage: false
       persistentSecretsInImage: false

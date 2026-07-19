@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 2,
+  "hermes": {
+    "distribution": "hermes-agent",
+    "extras": ["messaging", "mcp"],
+    "version": "0.18.2",
+    "wheel": {
+      "filename": "hermes_agent-0.18.2-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/0c/4c/91652c61450763bfe165c65b83026503de0ac9ddad2c11ee522490bf4c2d/hermes_agent-0.18.2-py3-none-any.whl",
+      "sha256": "8f02155cfc84b28bd98551cd18dffec0efa9ec070dd08f90f1a850f1c779492f",
+      "size": 9569078
+    },
+    "provenance": {
+      "pypi": "https://pypi.org/integrity/hermes-agent/0.18.2/hermes_agent-0.18.2-py3-none-any.whl/provenance",
+      "signerIdentity": "https://github.com/NousResearch/hermes-agent/.github/workflows/release.yml@refs/tags/v2026.7.7.2",
+      "signerIssuer": "https://token.actions.githubusercontent.com",
+      "signerRepository": "NousResearch/hermes-agent",
+      "signerTagRef": "refs/tags/v2026.7.7.2",
+      "sigstoreBundleUrl": "https://github.com/NousResearch/hermes-agent/releases/download/v2026.7.7.2/hermes_agent-0.18.2-py3-none-any.whl.sigstore.json",
+      "sigstoreBundleSha256": "20cea7962a0773b21c75652845742ae5d414632864cd08684993f286f486c0ad",
+      "sigstoreVerifierImage": "node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
+      "sigstoreVerifierPackageVersion": "3.0.0"
+    },
+    "upstream": {
+      "repository": "https://github.com/NousResearch/hermes-agent.git",
+      "tag": "v2026.7.7.2",
+      "commit": "9de9c25f620ff7f1ce0fd5457d596052d5159596"
+    }
+  },
+  "osPackages": {
+    "canonicalEnvironmentKey": "HERMES_APT_PACKAGES",
+    "names": [
+      "ca-certificates",
+      "curl",
+      "ffmpeg",
+      "python3",
+      "python3-venv",
+      "ripgrep",
+      "sudo"
+    ]
+  },
+  "python": {
+    "abi": "cp312",
+    "allowDependencySourceBuilds": false,
+    "implementation": "cp",
+    "packageCount": 89,
+    "platform": "manylinux2014_x86_64",
+    "requirementsFile": "requirements-messaging.lock",
+    "requirementsSha256": "cdd060f00da533c59d989a3e7489a02adabe3afabdfdb789c05a70f51ed16959",
+    "resolvedAt": "2026-07-20",
+    "version": "3.12"
+  }
+}

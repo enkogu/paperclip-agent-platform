@@ -13,8 +13,9 @@ from pathlib import Path
 import re
 import secrets
 import subprocess
+import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,60 +29,25 @@ MANIFEST = SECRET_ROOT / "projections-manifest.json"
 PLATFORM_ENV = SECRET_ROOT / "platform.env"
 SERVICE_ENV_DIR = SECRET_ROOT / "services"
 EVIDENCE = ROOT / "evidence/observability-data-canary.json"
-POSTGREST_VERIFY_EVIDENCE = ROOT / "evidence/postgrest-verify.json"
-NOTION_VERIFY_EVIDENCE = ROOT / "evidence/notion-connector-verify.json"
-ACTIVEPIECES_PROVISION_EVIDENCE = ROOT / "evidence/provision-activepieces.json"
 INDEX_PASS = {
     1: ROOT / "evidence/indexed-reconcile-pass-1.json",
     2: ROOT / "evidence/indexed-reconcile-pass-2.json",
 }
 INDEX_FINAL = ROOT / "evidence/indexed-reconcile-idempotency.json"
-HOST_DOKPLOY_EVIDENCE = ROOT / "evidence/host-dokploy-acceptance.json"
-OTLP = "http://127.0.0.1:4318"
+COMPOSE = ROOT / "deployment/compose.yaml"
+COMPOSE_ENV = SECRET_ROOT / "compose.env"
 OTLP_EMITTER_CONTAINER = "mte-paperclip"
 OTLP_EMITTER_SERVICE = "paperclip"
 OTLP_RUNNER_CONTAINER = "mte-daytona-runner"
 OTLP_RUNNER_SERVICE = "daytona-runner"
-VM = "http://127.0.0.1:18428"
-VL = "http://127.0.0.1:19428"
-VT = "http://127.0.0.1:10428/select/jaeger"
-VMALERT = "http://127.0.0.1:18881"
-ALERTMANAGER = "http://127.0.0.1:19093"
-GRAFANA = "http://127.0.0.1:13000"
 GENERATOR_VERSION = "mte-config-renderer/v1"
 OBSERVABILITY_EVIDENCE_SCHEMA_VERSION = 2
 
 POSTGRES_VOLUMES = {
     "application-data": "mte-postgres-data",
     "mattermost": "mte-mattermost-db-data",
-    "activepieces": "mte-activepieces-postgres",
     "firecrawl": "mte-firecrawl-postgres",
     "kestra": "mte-kestra-postgres",
-}
-REDIS_VOLUME = "mte-activepieces-redis"
-DATASOURCES = {
-    "victoriametrics": {
-        "name": "VictoriaMetrics",
-        "type": "prometheus",
-        "url": "http://victoriametrics:8428",
-        "access": "proxy",
-        "isDefault": True,
-        "editable": False,
-    },
-    "victorialogs": {
-        "name": "VictoriaLogs",
-        "type": "victoriametrics-logs-datasource",
-        "url": "http://victorialogs:9428",
-        "access": "proxy",
-        "editable": False,
-    },
-    "victoriatraces": {
-        "name": "VictoriaTraces",
-        "type": "jaeger",
-        "url": "http://victoriatraces:10428/select/jaeger",
-        "access": "proxy",
-        "editable": False,
-    },
 }
 CRITERIA = [
     "C040",
@@ -94,39 +60,33 @@ CRITERIA = [
     "C048",
     "C049",
     "C050",
-    "C061",
-    "C062",
     "C063",
     "C064",
     "C069",
     "C070",
 ]
-INDEX_PRODUCERS = (
-    "server-observability-canary.py",
-    "server-dokploy.py",
-    "server-provision.py",
-    "server-toolhive.py",
-    "server-config.py",
+COMPOSE_PROJECT = "mte-platform"
+OBSERVABILITY_COMPOSE_SERVICES = (
+    "alertmanager",
+    "blackbox-exporter",
+    "cadvisor",
+    "grafana",
+    "node-exporter",
+    "otel-collector",
+    "victorialogs",
+    "victoriametrics",
+    "victoriatraces",
+    "vmalert",
 )
-HOST_DOKPLOY_PRODUCERS = (
-    "server-host-dokploy-acceptance.py",
-    "server-dokploy.py",
+ONE_SHOT_COMPOSE_SERVICES = frozenset(
+    {"config-init", "kestra-storage-init", "searxng-config-init"}
 )
 POSTGRES_NOTION_PROFILE = "postgres-notion"
 POSTGRES_NOTION_COMPONENTS = ("postgrest",)
-POSTGRES_NOTION_DORMANT_COMPONENTS = frozenset({"baserow", "wikijs", "nocodb"})
 PROFILE_RUNTIME_CONTRACTS = {
     "postgres-notion": {
         "componentIds": ("postgrest",),
         "externalProviders": ("notion",),
-    },
-    "baserow-wikijs": {
-        "componentIds": ("postgrest", "baserow", "wikijs"),
-        "externalProviders": (),
-    },
-    "postgres-postgrest-nocodb-nocodocs": {
-        "componentIds": ("postgrest", "nocodb"),
-        "externalProviders": (),
     },
 }
 PROFILE_COMPONENT_IDS = frozenset(
@@ -136,7 +96,6 @@ PROFILE_COMPONENT_IDS = frozenset(
 )
 CORE_APPLICATION_COMPONENTS = (
     "mattermost",
-    "activepieces",
     "firecrawl",
     "kestra",
     "searxng",
@@ -151,6 +110,196 @@ class CanaryError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class ObservabilityRuntime(NamedTuple):
+    """Validated, canonical runtime inputs derived only from platform.env."""
+
+    host_otlp_url: str
+    container_otlp_url: str
+    victoriametrics_url: str
+    victorialogs_url: str
+    victoriatraces_url: str
+    vmalert_url: str
+    alertmanager_url: str
+    grafana_url: str
+    query_timeout_seconds: int
+    poll_interval_seconds: int
+    series_max_age_seconds: int
+    alert_fire_timeout_seconds: int
+    alert_resolve_timeout_seconds: int
+    alert_poll_interval_seconds: int
+    http_timeout_seconds: int
+    command_timeout_seconds: int
+    datasources: dict[str, dict[str, Any]]
+
+
+def required_positive_int(values: dict[str, str], key: str) -> int:
+    raw = values.get(key, "").strip()
+    if not raw:
+        raise CanaryError("missing_observability_runtime", key)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise CanaryError("invalid_observability_runtime", key) from exc
+    if value <= 0:
+        raise CanaryError("invalid_observability_runtime", key)
+    return value
+
+
+def required_http_base(values: dict[str, str], key: str) -> str:
+    raw = values.get(key, "").strip()
+    if not raw:
+        raise CanaryError("missing_observability_runtime", key)
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise CanaryError("invalid_observability_runtime", key) from exc
+    if (
+        parsed.scheme != "http"
+        or not parsed.hostname
+        or port is None
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise CanaryError("invalid_observability_runtime", key)
+    return raw.rstrip("/")
+
+
+def mapped_endpoint(
+    values: dict[str, str],
+    key: str,
+    *,
+    path: str = "",
+) -> tuple[str, int]:
+    raw = values.get(key, "").strip()
+    if not raw:
+        raise CanaryError("missing_observability_runtime", key)
+    try:
+        host, published_raw, container_raw = raw.rsplit(":", 2)
+        published, container = int(published_raw), int(container_raw)
+    except (ValueError, TypeError) as exc:
+        raise CanaryError("invalid_observability_runtime", key) from exc
+    host = host.strip("[]")
+    if (
+        not host
+        or not (1 <= published <= 65535)
+        or not (1 <= container <= 65535)
+        or (path and not path.startswith("/"))
+    ):
+        raise CanaryError("invalid_observability_runtime", key)
+    authority = f"[{host}]" if ":" in host else host
+    return f"http://{authority}:{published}{path}", container
+
+
+def observability_runtime(values: dict[str, str]) -> ObservabilityRuntime:
+    """Resolve endpoints and timings from the one canonical environment."""
+    host_otlp = required_http_base(values, "OBSERVABILITY_OTLP_HTTP_URL")
+    container_otlp = required_http_base(values, "OBSERVABILITY_CONTAINER_OTLP_HTTP_URL")
+    vm, vm_container_port = mapped_endpoint(
+        values, "MTE_OBSERVABILITY_VICTORIAMETRICS_PORT_1_MAPPING"
+    )
+    vl, vl_container_port = mapped_endpoint(
+        values, "MTE_OBSERVABILITY_VICTORIALOGS_PORT_1_MAPPING"
+    )
+    vt, vt_container_port = mapped_endpoint(
+        values,
+        "MTE_OBSERVABILITY_VICTORIATRACES_PORT_1_MAPPING",
+        path="/select/jaeger",
+    )
+    vmalert, _ = mapped_endpoint(values, "MTE_OBSERVABILITY_VMALERT_PORT_1_MAPPING")
+    alertmanager, _ = mapped_endpoint(
+        values, "MTE_OBSERVABILITY_ALERTMANAGER_PORT_1_MAPPING"
+    )
+    grafana_health = values.get("OBSERVABILITY_HEALTH_URL", "").strip()
+    try:
+        parsed_grafana = urllib.parse.urlsplit(grafana_health)
+        grafana_port = parsed_grafana.port
+    except ValueError as exc:
+        raise CanaryError(
+            "invalid_observability_runtime", "OBSERVABILITY_HEALTH_URL"
+        ) from exc
+    if (
+        parsed_grafana.scheme not in {"http", "https"}
+        or not parsed_grafana.hostname
+        or grafana_port is None
+        or parsed_grafana.username
+        or parsed_grafana.password
+        or parsed_grafana.query
+        or parsed_grafana.fragment
+    ):
+        code = (
+            "missing_observability_runtime"
+            if not grafana_health
+            else "invalid_observability_runtime"
+        )
+        raise CanaryError(code, "OBSERVABILITY_HEALTH_URL")
+    grafana = urllib.parse.urlunsplit(
+        (parsed_grafana.scheme, parsed_grafana.netloc, "", "", "")
+    )
+    datasources = {
+        "victoriametrics": {
+            "name": "VictoriaMetrics",
+            "type": "prometheus",
+            "url": f"http://victoriametrics:{vm_container_port}",
+            "access": "proxy",
+            "isDefault": True,
+            "editable": False,
+        },
+        "victorialogs": {
+            "name": "VictoriaLogs",
+            "type": "victoriametrics-logs-datasource",
+            "url": f"http://victorialogs:{vl_container_port}",
+            "access": "proxy",
+            "editable": False,
+        },
+        "victoriatraces": {
+            "name": "VictoriaTraces",
+            "type": "jaeger",
+            "url": f"http://victoriatraces:{vt_container_port}/select/jaeger",
+            "access": "proxy",
+            "editable": False,
+        },
+    }
+    return ObservabilityRuntime(
+        host_otlp_url=host_otlp,
+        container_otlp_url=container_otlp,
+        victoriametrics_url=vm,
+        victorialogs_url=vl,
+        victoriatraces_url=vt,
+        vmalert_url=vmalert,
+        alertmanager_url=alertmanager,
+        grafana_url=grafana,
+        query_timeout_seconds=required_positive_int(
+            values, "OBSERVABILITY_QUERY_TIMEOUT_SECONDS"
+        ),
+        poll_interval_seconds=required_positive_int(
+            values, "OBSERVABILITY_POLL_INTERVAL_SECONDS"
+        ),
+        series_max_age_seconds=required_positive_int(
+            values, "OBSERVABILITY_SERIES_MAX_AGE_SECONDS"
+        ),
+        alert_fire_timeout_seconds=required_positive_int(
+            values, "OBSERVABILITY_ALERT_FIRE_TIMEOUT_SECONDS"
+        ),
+        alert_resolve_timeout_seconds=required_positive_int(
+            values, "OBSERVABILITY_ALERT_RESOLVE_TIMEOUT_SECONDS"
+        ),
+        alert_poll_interval_seconds=required_positive_int(
+            values, "OBSERVABILITY_ALERT_POLL_INTERVAL_SECONDS"
+        ),
+        http_timeout_seconds=required_positive_int(
+            values, "OBSERVABILITY_HTTP_TIMEOUT_SECONDS"
+        ),
+        command_timeout_seconds=required_positive_int(
+            values, "OBSERVABILITY_COMMAND_TIMEOUT_SECONDS"
+        ),
+        datasources=datasources,
+    )
 
 
 def utcnow() -> str:
@@ -183,8 +332,16 @@ def installed_producer_hashes(names: tuple[str, ...]) -> dict[str, str]:
 
 
 def producer_hashes() -> dict[str, str]:
-    """Return the stable, profile-independent indexed control-plane producers."""
-    return installed_producer_hashes(INDEX_PRODUCERS)
+    """Bind indexed evidence to its producer and reconciler dependencies."""
+    return installed_producer_hashes(
+        (
+            Path(__file__).name,
+            "server-provision.py",
+            "server-toolhive.py",
+            "server-profile-reconcile.py",
+            "server-config.py",
+        )
+    )
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -328,11 +485,25 @@ def runtime_values(
 def atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.parent.chmod(0o700)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    temporary.chmod(0o600)
-    temporary.replace(path)
-    path.chmod(0o600)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        path.chmod(0o600)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def request_json(
@@ -342,7 +513,7 @@ def request_json(
     body: Any | None = None,
     headers: dict[str, str] | None = None,
     allow_status: set[int] | None = None,
-    timeout: int = 30,
+    timeout: int,
 ) -> tuple[int, Any]:
     request_headers = {"Accept": "application/json", **(headers or {})}
     data = None
@@ -377,7 +548,7 @@ def run(
     argv: list[str],
     *,
     stdin: str | None = None,
-    timeout: int = 60,
+    timeout: int,
     allow_failure: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -418,29 +589,36 @@ def exact_hash_gate(
     return {"sourceSha256": expected, "generatorVersion": GENERATOR_VERSION}
 
 
-def docker_inventory() -> list[dict[str, Any]]:
+def docker_inventory(
+    runtime: ObservabilityRuntime,
+    *,
+    all_containers: bool = False,
+) -> list[dict[str, Any]]:
     names = run(
-        ["docker", "ps", "--format", "{{.Names}}"], timeout=30
+        ["docker", "ps", *(["-a"] if all_containers else []), "--format", "{{.Names}}"],
+        timeout=runtime.command_timeout_seconds,
     ).stdout.splitlines()
     if not names:
         raise CanaryError("docker_inventory_empty", "no running containers")
-    # Restrict inspect output to names and mounts; full Docker inspect would
-    # unnecessarily read every container's environment and secret values.
+    # Restrict the one inspect snapshot to runtime identity and state; full
+    # Docker inspect would unnecessarily read container environments/secrets.
     output = run(
         [
             "docker",
             "inspect",
             "--format",
             "{{json .Name}}\t{{json .Mounts}}\t{{json .NetworkSettings.Ports}}"
-            "\t{{json .Config.Labels}}\t{{json .Config.Image}}",
+            "\t{{json .Config.Labels}}\t{{json .Config.Image}}\t{{json .State}}",
             *names,
         ],
-        timeout=60,
+        timeout=runtime.command_timeout_seconds,
     ).stdout
     items: list[dict[str, Any]] = []
     try:
         for line in output.splitlines():
-            raw_name, raw_mounts, raw_ports, raw_labels, raw_image = line.split("\t", 4)
+            raw_name, raw_mounts, raw_ports, raw_labels, raw_image, raw_state = (
+                line.split("\t", 5)
+            )
             items.append(
                 {
                     "Name": json.loads(raw_name),
@@ -448,6 +626,7 @@ def docker_inventory() -> list[dict[str, Any]]:
                     "Ports": json.loads(raw_ports),
                     "Labels": json.loads(raw_labels) or {},
                     "Image": json.loads(raw_image),
+                    "State": json.loads(raw_state) or {},
                 }
             )
     except (ValueError, json.JSONDecodeError) as exc:
@@ -458,6 +637,104 @@ def docker_inventory() -> list[dict[str, Any]]:
     return items
 
 
+def direct_compose_proof(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Prove the canonical aggregate Compose project owns the live stack."""
+    observed: dict[str, dict[str, Any]] = {}
+    for item in items:
+        labels = item.get("Labels") or {}
+        if labels.get("com.docker.compose.project") != COMPOSE_PROJECT:
+            continue
+        service = str(labels.get("com.docker.compose.service") or "")
+        if service not in OBSERVABILITY_COMPOSE_SERVICES:
+            continue
+        if service in observed:
+            raise CanaryError("compose_runtime_duplicate", service)
+        config_hash = str(labels.get("com.docker.compose.config-hash") or "")
+        if not config_hash:
+            raise CanaryError("compose_runtime_invalid", f"{service}:config-hash")
+        observed[service] = {
+            "container": str(item.get("Name") or "").lstrip("/"),
+            "configHash": config_hash,
+        }
+    missing = sorted(set(OBSERVABILITY_COMPOSE_SERVICES) - set(observed))
+    if missing:
+        raise CanaryError("compose_runtime_missing", ",".join(missing))
+    identity = {
+        "project": COMPOSE_PROJECT,
+        "services": {key: observed[key] for key in sorted(observed)},
+    }
+    return {
+        "contract": "direct-docker-compose",
+        "project": COMPOSE_PROJECT,
+        "serviceCount": len(observed),
+        "services": sorted(observed),
+        "runtimeIdentitySha256": hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        "allContainersRunning": True,
+        "noDuplicateServices": True,
+    }
+
+
+def stable_projection(value: Any) -> Any:
+    """Remove volatile and secret-shaped fields from an identity snapshot."""
+    volatile = {
+        "timestamp",
+        "startedat",
+        "finishedat",
+        "generatedat",
+        "completedat",
+        "durationseconds",
+        "health",
+        "reason",
+        "error",
+        "errortype",
+    }
+    if isinstance(value, dict):
+        projected: dict[str, Any] = {}
+        for key in sorted(value):
+            lower = key.lower()
+            redacted_fingerprint = (
+                lower in {"bottoken", "alertwebhook"}
+                and isinstance(value[key], str)
+                and re.fullmatch(r"[0-9a-f]{12}", value[key]) is not None
+            )
+            if lower in volatile or (
+                SENSITIVE_EVIDENCE_KEY_RE.search(key)
+                and "fingerprint" not in lower
+                and not redacted_fingerprint
+            ):
+                continue
+            projected[key] = stable_projection(value[key])
+        return projected
+    if isinstance(value, list):
+        projected = [stable_projection(item) for item in value]
+        if all(isinstance(item, dict) for item in projected):
+            return sorted(projected, key=lambda item: json.dumps(item, sort_keys=True))
+        return projected
+    return value
+
+
+def canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def assert_no_list_duplicates(value: Any, path: str = "root") -> None:
+    if isinstance(value, list):
+        rows = [row for row in value if isinstance(row, dict)]
+        for field in ("id", "uid", "name", "component", "profileRef"):
+            identities = [str(row[field]) for row in rows if row.get(field)]
+            if len(identities) != len(set(identities)):
+                raise CanaryError("indexed_inventory_duplicate", f"{path}.{field}")
+        for index, item in enumerate(value):
+            assert_no_list_duplicates(item, f"{path}[{index}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            assert_no_list_duplicates(item, f"{path}.{key}")
+
+
 def require_containers(items: list[dict[str, Any]]) -> dict[str, str]:
     volumes: dict[str, str] = {}
     for item in items:
@@ -465,7 +742,7 @@ def require_containers(items: list[dict[str, Any]]) -> dict[str, str]:
         for mount in item.get("Mounts", []) or []:
             if mount.get("Type") == "volume" and mount.get("Name"):
                 volumes[str(mount["Name"])] = name
-    required = {**POSTGRES_VOLUMES, "activepieces-redis": REDIS_VOLUME}
+    required = dict(POSTGRES_VOLUMES)
     missing = sorted(key for key, volume in required.items() if volume not in volumes)
     if missing:
         raise CanaryError(
@@ -536,23 +813,8 @@ def application_paths(
             raise CanaryError("application_path_missing", component)
         primary[component] = by_port[parsed.port]
 
-    def sibling(component: str, service: str) -> str:
-        source = by_name[primary[component]]
-        project = source.get("Labels", {}).get("com.docker.compose.project")
-        matches = [
-            name
-            for name, item in by_name.items()
-            if item.get("Labels", {}).get("com.docker.compose.project") == project
-            and item.get("Labels", {}).get("com.docker.compose.service") == service
-        ]
-        if len(matches) != 1:
-            raise CanaryError("application_path_missing", f"{component}-{service}")
-        return matches[0]
-
     paths = {
         "mattermost": primary["mattermost"],
-        "activepieces-app": primary["activepieces"],
-        "activepieces-worker": sibling("activepieces", "worker"),
         "firecrawl-api": primary["firecrawl"],
         "kestra": primary["kestra"],
         "searxng": primary["searxng"],
@@ -703,8 +965,17 @@ def probe_metric_payload(run_id: str, value: int) -> dict[str, Any]:
     }
 
 
-def send_otlp(kind: str, payload: dict[str, Any]) -> int:
-    status, _ = request_json("POST", f"{OTLP}/v1/{kind}", body=payload)
+def send_otlp(
+    kind: str,
+    payload: dict[str, Any],
+    runtime: ObservabilityRuntime,
+) -> int:
+    status, _ = request_json(
+        "POST",
+        f"{runtime.host_otlp_url}/v1/{kind}",
+        body=payload,
+        timeout=runtime.http_timeout_seconds,
+    )
     if status not in {200, 202}:
         raise CanaryError("otlp_rejected", f"OTLP {kind} returned {status}")
     return status
@@ -714,6 +985,7 @@ def send_otlp_from_container(
     container: str,
     kind: str,
     payload: dict[str, Any],
+    runtime: ObservabilityRuntime,
 ) -> int:
     if container != OTLP_EMITTER_CONTAINER:
         raise CanaryError("otlp_emitter_invalid", container)
@@ -735,10 +1007,10 @@ def send_otlp_from_container(
             "node",
             "-e",
             helper,
-            f"{OTLP}/v1/{kind}",
+            f"{runtime.container_otlp_url}/v1/{kind}",
         ],
         stdin=json.dumps(payload, separators=(",", ":")),
-        timeout=45,
+        timeout=runtime.command_timeout_seconds,
     )
     try:
         status = int(result.stdout.strip())
@@ -749,7 +1021,7 @@ def send_otlp_from_container(
     return status
 
 
-def otel_collector_network() -> str:
+def otel_collector_network(runtime: ObservabilityRuntime) -> str:
     names = run(
         [
             "docker",
@@ -758,7 +1030,8 @@ def otel_collector_network() -> str:
             "label=com.docker.compose.service=otel-collector",
             "--format",
             "{{.Names}}",
-        ]
+        ],
+        timeout=runtime.command_timeout_seconds,
     ).stdout.splitlines()
     if len(names) != 1:
         raise CanaryError(
@@ -771,7 +1044,8 @@ def otel_collector_network() -> str:
             "--format",
             "{{json .NetworkSettings.Networks}}",
             names[0],
-        ]
+        ],
+        timeout=runtime.command_timeout_seconds,
     ).stdout.strip()
     try:
         networks = json.loads(raw)
@@ -791,6 +1065,7 @@ def send_otlp_from_runner(
     container: str,
     kind: str,
     payload: dict[str, Any],
+    runtime: ObservabilityRuntime,
 ) -> int:
     if container != OTLP_RUNNER_CONTAINER:
         raise CanaryError("otlp_emitter_invalid", container)
@@ -807,17 +1082,17 @@ def send_otlp_from_runner(
             "-w",
             "%{http_code}",
             "--max-time",
-            "30",
+            str(runtime.http_timeout_seconds),
             "-H",
             "Content-Type: application/json",
             "-X",
             "POST",
             "--data-binary",
             "@-",
-            f"http://otel-collector:4318/v1/{kind}",
+            f"{runtime.container_otlp_url}/v1/{kind}",
         ],
         stdin=json.dumps(payload, separators=(",", ":")),
-        timeout=45,
+        timeout=runtime.command_timeout_seconds,
     )
     try:
         status = int(result.stdout.strip())
@@ -828,11 +1103,14 @@ def send_otlp_from_runner(
     return status
 
 
-def runner_otlp_bundle(
+def container_otlp_bundle(
     container: str,
     payloads: dict[str, dict[str, Any]],
+    runtime: ObservabilityRuntime,
 ) -> tuple[dict[str, int], dict[str, Any]]:
-    network = otel_collector_network()
+    if container not in {OTLP_EMITTER_CONTAINER, OTLP_RUNNER_CONTAINER}:
+        raise CanaryError("otlp_emitter_invalid", container)
+    network = otel_collector_network(runtime)
     connected = False
     statuses: dict[str, int] = {}
     try:
@@ -844,13 +1122,19 @@ def runner_otlp_bundle(
                 network,
                 container,
             ],
+            timeout=runtime.command_timeout_seconds,
             allow_failure=True,
         )
         if result.returncode:
             raise CanaryError("otel_runner_attach_failed", "network connect failed")
         connected = True
+        sender = (
+            send_otlp_from_container
+            if container == OTLP_EMITTER_CONTAINER
+            else send_otlp_from_runner
+        )
         statuses = {
-            kind: send_otlp_from_runner(container, kind, payload)
+            kind: sender(container, kind, payload, runtime)
             for kind, payload in payloads.items()
         }
     finally:
@@ -863,6 +1147,7 @@ def runner_otlp_bundle(
                     network,
                     container,
                 ],
+                timeout=runtime.command_timeout_seconds,
                 allow_failure=True,
             )
             if detached.returncode:
@@ -876,7 +1161,8 @@ def runner_otlp_bundle(
             "--format",
             "{{json .NetworkSettings.Networks}}",
             container,
-        ]
+        ],
+        timeout=runtime.command_timeout_seconds,
     ).stdout.strip()
     try:
         remaining = json.loads(networks_raw)
@@ -891,9 +1177,25 @@ def runner_otlp_bundle(
     }
 
 
-def prom_query(query: str, base: str = VM) -> list[dict[str, Any]]:
+def runner_otlp_bundle(
+    container: str,
+    payloads: dict[str, dict[str, Any]],
+    runtime: ObservabilityRuntime,
+) -> tuple[dict[str, int], dict[str, Any]]:
+    if container != OTLP_RUNNER_CONTAINER:
+        raise CanaryError("otlp_emitter_invalid", container)
+    return container_otlp_bundle(container, payloads, runtime)
+
+
+def prom_query(
+    query: str,
+    runtime: ObservabilityRuntime,
+    *,
+    base: str | None = None,
+) -> list[dict[str, Any]]:
+    base = base or runtime.victoriametrics_url
     url = base + "/api/v1/query?" + urllib.parse.urlencode({"query": query})
-    status, body = request_json("GET", url)
+    status, body = request_json("GET", url, timeout=runtime.http_timeout_seconds)
     if status != 200 or not isinstance(body, dict) or body.get("status") != "success":
         raise CanaryError("prom_query_failed", "Prometheus query failed")
     result = body.get("data", {}).get("result", [])
@@ -902,7 +1204,7 @@ def prom_query(query: str, base: str = VM) -> list[dict[str, Any]]:
     return result
 
 
-def wait_for(predicate: Callable[[], Any], *, timeout: int, interval: int = 5) -> Any:
+def wait_for(predicate: Callable[[], Any], *, timeout: int, interval: int) -> Any:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
@@ -912,20 +1214,36 @@ def wait_for(predicate: Callable[[], Any], *, timeout: int, interval: int = 5) -
     raise CanaryError("canary_timeout", f"condition timed out after {timeout}s")
 
 
-def query_correlated_data(run_id: str, trace_id: str) -> dict[str, Any]:
+def query_correlated_data(
+    run_id: str,
+    trace_id: str,
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
     metric = wait_for(
         lambda: prom_query(
-            f'mte_observability_canary{{run_id="{run_id}",trace_id="{trace_id}"}}'
+            f'mte_observability_canary{{run_id="{run_id}",trace_id="{trace_id}"}}',
+            runtime,
         ),
-        timeout=90,
+        timeout=runtime.query_timeout_seconds,
+        interval=runtime.poll_interval_seconds,
     )
     query = f'run_id:="{run_id}" AND trace_id:="{trace_id}"'
 
     def logs() -> list[str] | bool:
-        url = VL + "/select/logsql/query?" + urllib.parse.urlencode({"query": query})
-        status, body = request_json("GET", url)
+        url = (
+            runtime.victorialogs_url
+            + "/select/logsql/query?"
+            + urllib.parse.urlencode({"query": query})
+        )
+        status, body = request_json("GET", url, timeout=runtime.http_timeout_seconds)
         if status != 200:
             return False
+        # VictoriaLogs returns newline-delimited JSON.  A query matching one
+        # record is also valid JSON by itself, so request_json() decodes it to
+        # a dict instead of leaving it as an NDJSON string.  Both canary
+        # emitters intentionally produce one correlated record each.
+        if isinstance(body, dict):
+            return [body] if body else False
         if isinstance(body, list):
             return body or False
         if isinstance(body, str):
@@ -935,8 +1253,9 @@ def query_correlated_data(run_id: str, trace_id: str) -> dict[str, Any]:
     def trace() -> dict[str, Any] | bool:
         status, body = request_json(
             "GET",
-            f"{VT}/api/traces/{trace_id}",
+            f"{runtime.victoriatraces_url}/api/traces/{trace_id}",
             allow_status={404},
+            timeout=runtime.http_timeout_seconds,
         )
         return (
             body
@@ -944,8 +1263,16 @@ def query_correlated_data(run_id: str, trace_id: str) -> dict[str, Any]:
             else False
         )
 
-    log_rows = wait_for(logs, timeout=90)
-    trace_body = wait_for(trace, timeout=90)
+    log_rows = wait_for(
+        logs,
+        timeout=runtime.query_timeout_seconds,
+        interval=runtime.poll_interval_seconds,
+    )
+    trace_body = wait_for(
+        trace,
+        timeout=runtime.query_timeout_seconds,
+        interval=runtime.poll_interval_seconds,
+    )
     return {
         "metricSeries": len(metric),
         "logRecords": len(log_rows),
@@ -955,8 +1282,11 @@ def query_correlated_data(run_id: str, trace_id: str) -> dict[str, Any]:
     }
 
 
-def series_freshness(query: str, *, max_age: int = 180) -> dict[str, Any]:
-    rows = prom_query(query)
+def series_freshness(
+    query: str,
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
+    rows = prom_query(query, runtime)
     timestamps = [
         float(row["value"][0])
         for row in rows
@@ -965,8 +1295,11 @@ def series_freshness(query: str, *, max_age: int = 180) -> dict[str, Any]:
     if not timestamps:
         raise CanaryError("series_missing", "required metric series missing")
     age = max(0.0, time.time() - max(timestamps))
-    if age > max_age:
-        raise CanaryError("series_stale", f"metric series older than {max_age}s")
+    if age > runtime.series_max_age_seconds:
+        raise CanaryError(
+            "series_stale",
+            f"metric series older than {runtime.series_max_age_seconds}s",
+        )
     return {"series": len(rows), "freshnessSeconds": round(age, 3)}
 
 
@@ -989,9 +1322,12 @@ def declared_http_targets(config: dict[str, Any]) -> dict[str, str]:
     return targets
 
 
-def blackbox_proof(config: dict[str, Any]) -> dict[str, Any]:
+def blackbox_proof(
+    config: dict[str, Any],
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
     expected = declared_http_targets(config)
-    rows = prom_query('probe_success{service.name="platform_health"}')
+    rows = prom_query('probe_success{service.name="platform_health"}', runtime)
     values: dict[str, float] = {}
     ages: dict[str, float] = {}
     addresses: dict[str, str] = {}
@@ -1016,7 +1352,9 @@ def blackbox_proof(config: dict[str, Any]) -> dict[str, Any]:
     )
     failing = sorted(service for service in expected_ids if values.get(service) != 1.0)
     stale = sorted(
-        service for service in expected_ids if ages.get(service, 10**9) > 180
+        service
+        for service in expected_ids
+        if ages.get(service, 10**9) > runtime.series_max_age_seconds
     )
     if missing or extra or mismatched or failing or stale:
         detail = {
@@ -1052,26 +1390,32 @@ def grafana_call(
     method: str,
     path: str,
     auth: dict[str, str],
+    runtime: ObservabilityRuntime,
     *,
     body: Any | None = None,
     allow_status: set[int] | None = None,
 ) -> tuple[int, Any]:
     return request_json(
         method,
-        GRAFANA + path,
+        runtime.grafana_url + path,
         body=body,
         headers=auth,
         allow_status=allow_status,
+        timeout=runtime.http_timeout_seconds,
     )
 
 
-def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
+def reconcile_grafana_once(
+    auth: dict[str, str],
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
     datasource_ids: dict[str, int] = {}
-    for uid, expected in DATASOURCES.items():
+    for uid, expected in runtime.datasources.items():
         status, existing = grafana_call(
             "GET",
             f"/api/datasources/uid/{uid}",
             auth,
+            runtime,
             allow_status={404},
         )
         if status == 404:
@@ -1079,11 +1423,14 @@ def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
                 "POST",
                 "/api/datasources",
                 auth,
+                runtime,
                 body={"uid": uid, **expected},
             )
             if status not in {200, 201}:
                 raise CanaryError("grafana_reconcile_failed", f"create {uid} failed")
-            _, existing = grafana_call("GET", f"/api/datasources/uid/{uid}", auth)
+            _, existing = grafana_call(
+                "GET", f"/api/datasources/uid/{uid}", auth, runtime
+            )
         if not isinstance(existing, dict):
             raise CanaryError("grafana_datasource_invalid", f"{uid} invalid")
         drift = [
@@ -1100,10 +1447,11 @@ def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
         "GET",
         f"/api/folders/{folder_uid}",
         auth,
+        runtime,
         allow_status={404},
     )
     if status == 404:
-        _, folders = grafana_call("GET", "/api/folders?limit=1000", auth)
+        _, folders = grafana_call("GET", "/api/folders?limit=1000", auth, runtime)
         exact_folders = (
             [item for item in folders if item.get("title") == "MTE Platform"]
             if isinstance(folders, list)
@@ -1118,11 +1466,12 @@ def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
                 "POST",
                 "/api/folders",
                 auth,
+                runtime,
                 body={"uid": folder_uid, "title": "MTE Platform"},
             )
             if status not in {200, 201, 409}:
                 raise CanaryError("grafana_reconcile_failed", "folder create failed")
-            _, folder = grafana_call("GET", f"/api/folders/{folder_uid}", auth)
+            _, folder = grafana_call("GET", f"/api/folders/{folder_uid}", auth, runtime)
     if not isinstance(folder, dict) or folder.get("title") != "MTE Platform":
         raise CanaryError("grafana_folder_drift", "MTE Platform folder drifted")
 
@@ -1130,7 +1479,7 @@ def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
     search_path = "/api/serviceaccounts/search?" + urllib.parse.urlencode(
         {"query": account_name, "perpage": 100},
     )
-    _, search = grafana_call("GET", search_path, auth)
+    _, search = grafana_call("GET", search_path, auth, runtime)
     accounts = search.get("serviceAccounts", []) if isinstance(search, dict) else []
     exact = [item for item in accounts if item.get("name") == account_name]
     if not exact:
@@ -1138,13 +1487,14 @@ def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
             "POST",
             "/api/serviceaccounts",
             auth,
+            runtime,
             body={"name": account_name, "role": "Viewer", "isDisabled": False},
         )
         if status not in {200, 201}:
             raise CanaryError(
                 "grafana_reconcile_failed", "service account create failed"
             )
-        _, search = grafana_call("GET", search_path, auth)
+        _, search = grafana_call("GET", search_path, auth, runtime)
         accounts = search.get("serviceAccounts", []) if isinstance(search, dict) else []
         exact = [item for item in accounts if item.get("name") == account_name]
     if len(exact) != 1:
@@ -1168,9 +1518,12 @@ def reconcile_grafana_once(auth: dict[str, str]) -> dict[str, Any]:
     return fingerprint
 
 
-def grafana_reconcile_twice(auth: dict[str, str]) -> dict[str, Any]:
-    first = reconcile_grafana_once(auth)
-    second = reconcile_grafana_once(auth)
+def grafana_reconcile_twice(
+    auth: dict[str, str],
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
+    first = reconcile_grafana_once(auth, runtime)
+    second = reconcile_grafana_once(auth, runtime)
     if first != second or second.get("serviceAccountCount") != 1:
         raise CanaryError(
             "reconcile_not_idempotent", "second reconcile changed identity"
@@ -1178,252 +1531,294 @@ def grafana_reconcile_twice(auth: dict[str, str]) -> dict[str, Any]:
     return {"first": first, "second": second, "idempotent": True}
 
 
-def run_json_command(argv: list[str], *, timeout: int = 1800) -> Any:
-    completed = run(argv, timeout=timeout)
+def run_json_command(argv: list[str], runtime: ObservabilityRuntime) -> Any:
+    completed = run(argv, timeout=runtime.command_timeout_seconds)
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
         raise CanaryError("command_json_invalid", Path(argv[1]).name) from exc
 
 
-def validate_host_dokploy_acceptance(gate: dict[str, str]) -> dict[str, Any]:
-    evidence = load_json(HOST_DOKPLOY_EVIDENCE)
-    current = installed_producer_hashes(HOST_DOKPLOY_PRODUCERS)
-    expected_producers = {
-        "server-host-dokploy-acceptance.py": current[
-            "server-host-dokploy-acceptance.py"
-        ],
-        "server-dokploy.py": current["server-dokploy.py"],
-    }
-    c061 = evidence.get("C061", {})
-    c062 = evidence.get("C062", {})
-    first = c062.get("firstRevision", {}) if isinstance(c062, dict) else {}
-    second = c062.get("secondRevision", {}) if isinstance(c062, dict) else {}
-    cleanup = c062.get("cleanup", {}) if isinstance(c062, dict) else {}
-    remaining = cleanup.get("remaining", {}) if isinstance(cleanup, dict) else {}
-    created = c062.get("engineResourcesCreated", {}) if isinstance(c062, dict) else {}
-    expected_operations = [
-        "list",
-        "create",
-        "update",
-        "status",
-        "update",
-        "status",
-        "delete",
+def canonical_compose_command(*arguments: str) -> list[str]:
+    return [
+        "docker",
+        "compose",
+        "--env-file",
+        str(COMPOSE_ENV),
+        "-f",
+        str(COMPOSE),
+        *arguments,
     ]
-    invalid = (
-        evidence.get("status") != "passed"
-        or evidence.get("sourceGate") != gate
-        or evidence.get("producerHashes") != expected_producers
-        or c061.get("status") != "pass"
-        or c061.get("apiKeyAuthenticated") is not True
-        or c061.get("operations") != expected_operations
-        or not all(
-            c061.get(key) is True
-            for key in (
-                "resourceCreated",
-                "resourceUpdated",
-                "statusObserved",
-                "resourceDeleted",
-            )
-        )
-        or c062.get("status") != "pass"
-        or c062.get("configHashChanged") is not True
-        or first.get("containerStates") != ["running"]
-        or second.get("containerStates") != ["running"]
-        or not first.get("configHashes")
-        or not second.get("configHashes")
-        or set(first.get("configHashes", [])) == set(second.get("configHashes", []))
-        or any(
-            int(created.get(key) or 0) < 1
-            for key in (
-                "containers",
-                "volumes",
-                "networks",
-            )
-        )
-        or cleanup.get("noResidualResources") is not True
-        or any(
-            int(remaining.get(key, -1)) != 0
-            for key in (
-                "containers",
-                "volumes",
-                "networks",
-            )
-        )
+
+
+def canonical_compose_environment() -> dict[str, str]:
+    allowed = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        in {
+            "HOME",
+            "PATH",
+            "DOCKER_CONFIG",
+            "DOCKER_CONTEXT",
+            "DOCKER_HOST",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+        }
+    }
+    allowed.setdefault("HOME", "/root")
+    allowed.setdefault(
+        "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     )
-    if invalid:
-        raise CanaryError(
-            "host_dokploy_acceptance_invalid",
-            "ephemeral Dokploy and Docker lifecycle evidence is incomplete",
+    return allowed
+
+
+def compose_inventory(runtime: ObservabilityRuntime) -> dict[str, Any]:
+    expected = {
+        row.strip()
+        for row in run(
+            canonical_compose_command("config", "--services"),
+            timeout=runtime.command_timeout_seconds,
+            env=canonical_compose_environment(),
+        ).stdout.splitlines()
+        if row.strip()
+    }
+    observed: dict[str, dict[str, Any]] = {}
+    for item in docker_inventory(runtime, all_containers=True):
+        labels = item.get("Labels") or {}
+        if labels.get("com.docker.compose.project") != COMPOSE_PROJECT:
+            continue
+        service = str(labels.get("com.docker.compose.service") or "")
+        if not service or service in observed:
+            raise CanaryError("indexed_inventory_duplicate", service or "compose")
+        state = item.get("State") if isinstance(item.get("State"), dict) else {}
+        status = str(state.get("Status") or "")
+        running = state.get("Running") is True
+        health_document = (
+            state.get("Health") if isinstance(state.get("Health"), dict) else {}
         )
-    return evidence
-
-
-def host_dokploy_acceptance(
-    expected_hash: str,
-    gate: dict[str, str],
-    *,
-    execute: bool,
-) -> dict[str, Any]:
-    if execute:
-        result = run_json_command(
-            [
-                "python3",
-                str(SERVER_BIN / "server-host-dokploy-acceptance.py"),
-                "apply",
-                "--expected-source-hash",
-                expected_hash,
-            ]
-        )
-        if not isinstance(result, dict) or result.get("status") != "passed":
-            raise CanaryError(
-                "host_dokploy_acceptance_failed",
-                "producer did not pass",
-            )
-    return validate_host_dokploy_acceptance(gate)
-
-
-def dokploy_control_plane_proof(expected_components: list[str]) -> dict[str, Any]:
-    proof = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-dokploy.py"),
-            "proof",
-        ]
-    )
-    if not isinstance(proof, dict):
-        raise CanaryError("dokploy_api_proof_invalid", "proof is not an object")
-    fingerprint = str(proof.get("credentialFingerprintSha256") or "")
-    resources = proof.get("resources")
+        health = str(health_document.get("Status") or "not-configured")
+        if service in ONE_SHOT_COMPOSE_SERVICES:
+            if running or status != "exited" or state.get("ExitCode") != 0:
+                raise CanaryError("indexed_compose_runtime_not_ready", service)
+        elif not running or status != "running" or health not in {
+            "healthy",
+            "not-configured",
+        }:
+            raise CanaryError("indexed_compose_runtime_not_ready", service)
+        observed[service] = {
+            "container": str(item.get("Name") or "").lstrip("/"),
+            "configHash": str(labels.get("com.docker.compose.config-hash") or ""),
+            "image": str(item.get("Image") or ""),
+            "state": status,
+            "running": running,
+            "health": health,
+        }
+        if service in ONE_SHOT_COMPOSE_SERVICES:
+            observed[service]["exitCode"] = state.get("ExitCode")
     if (
-        proof.get("apiKeyAuthenticated") is not True
-        or proof.get("credentialRef") != "DOKPLOY_API_TOKEN"
-        or proof.get("credentialSource") != str(PLATFORM_ENV)
-        or not re.fullmatch(r"[0-9a-f]{64}", fingerprint)
-        or not isinstance(resources, list)
+        not expected
+        or set(observed) != expected
+        or any(
+            not row["container"] or not row["configHash"] or not row["image"]
+            for row in observed.values()
+        )
     ):
-        raise CanaryError(
-            "dokploy_api_proof_invalid", "dedicated credential proof failed"
-        )
-    observed = sorted(str(row.get("component")) for row in resources)
-    if observed != sorted(expected_components):
-        raise CanaryError("dokploy_api_proof_invalid", "resource inventory mismatch")
-    if any(row.get("status") not in {"done", "idle"} for row in resources):
-        raise CanaryError(
-            "dokploy_api_resource_unready", "compose resource is not ready"
-        )
+        raise CanaryError("indexed_compose_inventory_invalid", "aggregate-compose")
+    identity = {key: observed[key] for key in sorted(observed)}
     return {
-        "apiKeyAuthenticated": True,
-        "credentialRef": proof["credentialRef"],
-        "credentialSource": proof["credentialSource"],
-        "credentialFingerprintSha256": fingerprint,
-        "projectCount": int(proof.get("projectCount") or 0),
-        "resources": resources,
+        "project": COMPOSE_PROJECT,
+        "services": identity,
+        "componentCount": len(identity),
+        "identitySha256": canonical_json_sha256(identity),
     }
 
 
-def docker_engine_proof(resources: list[dict[str, Any]]) -> dict[str, Any]:
-    version_raw = run(
-        [
-            "docker",
-            "version",
-            "--format",
-            "{{json .Server}}",
-        ]
-    ).stdout.strip()
-    try:
-        version = json.loads(version_raw)
-    except json.JSONDecodeError as exc:
-        raise CanaryError("docker_engine_invalid", "server version invalid") from exc
-    if not isinstance(version, dict) or not version.get("Version"):
-        raise CanaryError("docker_engine_invalid", "server version missing")
-    names = run(
-        [
-            "docker",
-            "ps",
-            "--format",
-            "{{.Names}}",
-        ]
-    ).stdout.splitlines()
-    if not names:
-        raise CanaryError("docker_engine_invalid", "no running containers")
-    raw = run(
-        [
-            "docker",
-            "inspect",
-            "--format",
-            "{{json .Name}}\t{{json .State.Status}}\t{{json .Config.Labels}}",
-            *names,
-        ]
-    ).stdout
-    containers: list[dict[str, Any]] = []
-    for line in raw.splitlines():
-        try:
-            raw_name, raw_state, raw_labels = line.split("\t", 2)
-            containers.append(
-                {
-                    "name": str(json.loads(raw_name)).lstrip("/"),
-                    "state": json.loads(raw_state),
-                    "labels": json.loads(raw_labels) or {},
-                }
-            )
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise CanaryError(
-                "docker_engine_invalid", "inspect output invalid"
-            ) from exc
-    projects: list[dict[str, Any]] = []
-    for resource in resources:
-        app_name = str(resource.get("appName") or "")
-        if (
-            not app_name
-            or resource.get("composeType") != "docker-compose"
-            or resource.get("sourceType") != "raw"
-        ):
-            raise CanaryError(
-                "dokploy_engine_binding_invalid", str(resource.get("component"))
-            )
-        matches = [
-            row
-            for row in containers
-            if row["labels"].get("com.docker.compose.project") == app_name
-        ]
-        if not matches or any(row["state"] != "running" for row in matches):
-            raise CanaryError(
-                "dokploy_engine_binding_invalid", str(resource.get("component"))
-            )
-        services = sorted(
-            {
-                str(row["labels"].get("com.docker.compose.service") or "")
-                for row in matches
-            }
-        )
-        config_hashes = sorted(
-            {
-                str(row["labels"].get("com.docker.compose.config-hash") or "")
-                for row in matches
-            }
-        )
-        if "" in services or "" in config_hashes:
-            raise CanaryError(
-                "dokploy_engine_binding_invalid", str(resource.get("component"))
-            )
-        projects.append(
-            {
-                "component": resource.get("component"),
-                "composeId": resource.get("composeId"),
-                "appName": app_name,
-                "runningContainers": len(matches),
-                "services": services,
-                "configHashes": config_hashes,
-            }
-        )
-    return {
-        "serverVersion": str(version["Version"]),
-        "apiVersion": str(version.get("ApiVersion") or ""),
-        "projects": projects,
-        "allContainersRunning": True,
+def indexed_inventory(
+    expected_hash: str,
+    runtime: ObservabilityRuntime,
+    values: dict[str, str],
+) -> dict[str, Any]:
+    gate = exact_hash_gate(expected_hash, load_json(CONFIG), load_json(MANIFEST))
+    provisioner = run_json_command(
+        ["python3", str(SERVER_BIN / "server-provision.py"), "status"], runtime
+    )
+    toolhive = run_json_command(
+        ["python3", str(SERVER_BIN / "server-toolhive.py"), "status"], runtime
+    )
+    profile = run_json_command(
+        ["python3", str(SERVER_BIN / "server-profile-reconcile.py"), "status"],
+        runtime,
+    )
+    if provisioner.get("ok") is not True or provisioner.get("incomplete") != []:
+        raise CanaryError("indexed_provisioner_not_ready", "status")
+    if toolhive.get("binary") != "ready" or toolhive.get("canary") != "ready":
+        raise CanaryError("indexed_toolhive_not_ready", "status")
+    if profile.get("status") != "passed" or profile.get("ok") is not True:
+        raise CanaryError("indexed_profile_not_finalized", "status")
+    for name, document in (
+        ("provisioner", provisioner),
+        ("toolhive", toolhive),
+        ("profileReconcile", profile),
+    ):
+        assert_no_list_duplicates(document, name)
+    profile_rows = (
+        profile.get("profiles") if isinstance(profile.get("profiles"), list) else []
+    )
+    profile_summary = [
+        {
+            "profileRef": row.get("profileRef"),
+            "paperclip": (row.get("paperclip") or {}).get("status") == "ready",
+            "toolhive": (row.get("toolhive") or {}).get("status") == "ready",
+            "kestra": (row.get("kestra") or {}).get("status") == "ready",
+        }
+        for row in profile_rows
+        if isinstance(row, dict)
+    ]
+    toolhive_identity = {
+        **stable_projection(toolhive),
+        "profileBundles": [
+            {"profileRef": row["profileRef"], "status": "ready"}
+            for row in profile_summary
+            if row.get("toolhive") is True
+        ],
     }
+    identity = {
+        "compose": compose_inventory(runtime),
+        "provisioner": stable_projection(provisioner),
+        "toolhive": toolhive_identity,
+        "profileReconcile": {"profiles": profile_summary},
+    }
+    scan_for_secrets(identity, values)
+    return {
+        "sourceGate": gate,
+        "identity": identity,
+        "identitySha256": canonical_json_sha256(identity),
+        "noDuplicates": True,
+    }
+
+
+def indexed_reconcile_pass(
+    expected_hash: str,
+    pass_number: int,
+) -> dict[str, Any]:
+    if pass_number not in INDEX_PASS:
+        raise CanaryError("invalid_reconcile_pass", str(pass_number))
+    config, manifest = load_json(CONFIG), load_json(MANIFEST)
+    values = runtime_values(dotenv(PLATFORM_ENV), config, manifest)
+    runtime = observability_runtime(values)
+    before = indexed_inventory(expected_hash, runtime, values)
+    run(
+        canonical_compose_command("up", "-d", "--wait"),
+        timeout=runtime.command_timeout_seconds,
+        env=canonical_compose_environment(),
+    )
+    provisioner = run_json_command(
+        ["python3", str(SERVER_BIN / "server-provision.py"), "provision"], runtime
+    )
+    if (
+        provisioner.get("ok") is not True
+        or provisioner.get("incomplete") != []
+        or (provisioner.get("canonicalMutationGuard") or {}).get("changedKeys") != []
+    ):
+        raise CanaryError("indexed_provisioner_not_idempotent", str(pass_number))
+    run_json_command(
+        ["python3", str(SERVER_BIN / "server-toolhive.py"), "provision"], runtime
+    )
+    grafana = reconcile_grafana_once(basic_auth(values), runtime)
+    after = indexed_inventory(expected_hash, runtime, values)
+    before_services = before["identity"]["compose"]["services"]
+    after_services = after["identity"]["compose"]["services"]
+    actions = {
+        service: (
+            "unchanged"
+            if before_services.get(service) == after_services.get(service)
+            else "changed"
+        )
+        for service in sorted(after_services)
+    }
+    if pass_number == 2 and set(actions.values()) != {"unchanged"}:
+        raise CanaryError("indexed_second_pass_changed", "aggregate-compose")
+    payload = {
+        "apiVersion": "micro-task-engine/v1alpha1",
+        "kind": "IndexedReconcilePass",
+        "pass": pass_number,
+        "status": "passed",
+        "completedAt": utcnow(),
+        "producerSha256": producer_sha256(),
+        "producerHashes": producer_hashes(),
+        "sourceGate": after["sourceGate"],
+        "before": before,
+        "after": after,
+        "composeActions": actions,
+        "provisionerIdentitySha256": canonical_json_sha256(
+            after["identity"]["provisioner"]
+        ),
+        "toolhiveIdentitySha256": canonical_json_sha256(after["identity"]["toolhive"]),
+        "grafanaFingerprint": grafana["sha256"],
+    }
+    scan_for_secrets(payload, values)
+    atomic_json(INDEX_PASS[pass_number], payload)
+    return payload
+
+
+def finalize_indexed_idempotency(expected_hash: str) -> dict[str, Any]:
+    gate = exact_hash_gate(expected_hash, load_json(CONFIG), load_json(MANIFEST))
+    first, second = load_json(INDEX_PASS[1]), load_json(INDEX_PASS[2])
+    current_hashes = producer_hashes()
+    if first.get("sourceGate") != gate or second.get("sourceGate") != gate:
+        raise CanaryError("indexed_source_gate_drift", "reconcile passes")
+    if (
+        first.get("producerHashes") != current_hashes
+        or second.get("producerHashes") != current_hashes
+    ):
+        raise CanaryError("indexed_producer_drift", "reconcile passes")
+    first_after = (first.get("after") or {}).get("identitySha256")
+    second_before = (second.get("before") or {}).get("identitySha256")
+    second_after = (second.get("after") or {}).get("identitySha256")
+    if not first_after or first_after != second_before or second_before != second_after:
+        raise CanaryError("indexed_identity_changed", "reconcile passes")
+    actions = second.get("composeActions") or {}
+    if not actions or set(actions.values()) != {"unchanged"}:
+        raise CanaryError("indexed_second_pass_changed", "aggregate-compose")
+    if (
+        first.get("provisionerIdentitySha256")
+        != second.get("provisionerIdentitySha256")
+        or first.get("toolhiveIdentitySha256") != second.get("toolhiveIdentitySha256")
+        or first.get("grafanaFingerprint") != second.get("grafanaFingerprint")
+    ):
+        raise CanaryError("indexed_identity_changed", "reconciler identities")
+    if not (first.get("after") or {}).get("noDuplicates") or not (
+        second.get("after") or {}
+    ).get("noDuplicates"):
+        raise CanaryError("indexed_inventory_duplicate", "reconcile passes")
+    identity = (second.get("after") or {}).get("identity") or {}
+    compose = identity.get("compose") or {}
+    payload = {
+        "apiVersion": "micro-task-engine/v1alpha1",
+        "kind": "IndexedDeployIdempotencyEvidence",
+        "status": "passed",
+        "completedAt": utcnow(),
+        "producerSha256": producer_sha256(),
+        "producerHashes": current_hashes,
+        "sourceGate": gate,
+        "componentCount": compose.get("componentCount"),
+        "stableComposeIdentity": True,
+        "noDuplicateResources": True,
+        "secondPassNoChange": True,
+        "inventoryIdentitySha256": second_after,
+        "passes": [str(INDEX_PASS[1]), str(INDEX_PASS[2])],
+        "coverage": [
+            "direct-compose-all-indexed-components",
+            "server-provision-all-adapters",
+            "toolhive-provisioning",
+            "grafana-provisioning",
+            "canonical-aggregate-compose",
+            "live-runtime-labels",
+        ],
+    }
+    atomic_json(INDEX_FINAL, payload)
+    return payload
 
 
 def secret_permissions_proof(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1497,632 +1892,19 @@ def secret_permissions_proof(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def stable_projection(value: Any) -> Any:
-    volatile = {
-        "timestamp",
-        "startedat",
-        "finishedat",
-        "generatedat",
-        "completedat",
-        "updatedat",
-        "durationseconds",
-        "status",
-        "action",
-        "ok",
-        "health",
-        "reason",
-        "error",
-        "errortype",
-    }
-    if isinstance(value, dict):
-        projected: dict[str, Any] = {}
-        for key in sorted(value):
-            lower = key.lower()
-            if lower in volatile or (
-                SENSITIVE_EVIDENCE_KEY_RE.search(key) and "fingerprint" not in lower
-            ):
-                continue
-            projected[key] = stable_projection(value[key])
-        return projected
-    if isinstance(value, list):
-        projected = [stable_projection(item) for item in value]
-        if all(isinstance(item, dict) for item in projected):
-            return sorted(projected, key=lambda item: json.dumps(item, sort_keys=True))
-        return projected
-    return value
-
-
-def canonical_json_sha256(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def indexed_evidence_reference(
-    path: Path,
-    *,
-    kind: str,
-    producer: str,
-    profile_field: str,
-    profile: str,
-    canonical_source_sha256: str,
-) -> dict[str, str]:
-    """Bind indexed proof to a redacted producer artifact without copying it."""
-    document = load_json(path)
-    producer_hash = installed_producer_hashes((producer,))[producer]
-    if path.stat().st_mode & 0o777 != 0o600:
-        raise CanaryError("indexed_evidence_mode_invalid", str(path))
-    if (
-        document.get("apiVersion") != "micro-task-engine/v1alpha1"
-        or document.get("kind") != kind
-        or document.get("status") != "passed"
-        or document.get("ok") is not True
-        or document.get(profile_field) != profile
-        or document.get("canonicalSourceSha256") != canonical_source_sha256
-        or document.get("producerSha256") != producer_hash
-    ):
-        raise CanaryError("indexed_profile_evidence_invalid", kind)
-    return {
-        "path": str(path),
-        "kind": kind,
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "semanticSha256": canonical_json_sha256(stable_projection(document)),
-        "producerSha256": producer_hash,
-    }
-
-
-def postgres_notion_contract(
-    config: dict[str, Any], values: dict[str, str]
-) -> dict[str, Any]:
-    profile = values.get("DATA_CONTENT_PROFILE", "")
-    plane = load_json(DATA_CONTENT_PLANE)
-    source_sha = hashlib.sha256(PLATFORM_ENV.read_bytes()).hexdigest()
-    components = {
-        str(row.get("id"))
-        for row in config.get("spec", {}).get("components", [])
-        if isinstance(row, dict) and row.get("compose")
-    }
-    provider_components = plane.get("componentIds")
-    providers = plane.get("providers")
-    external = sorted(
-        str(name)
-        for name, row in (providers.items() if isinstance(providers, dict) else [])
-        if isinstance(row, dict) and row.get("deployment") == "external"
-    )
-    if (
-        profile != POSTGRES_NOTION_PROFILE
-        or plane.get("profile") != profile
-        or provider_components != list(POSTGRES_NOTION_COMPONENTS)
-        or plane.get("systemOfRecord", {}).get("providerId") != "postgres"
-        or plane.get("binding", {}).get("sourceSha256") != source_sha
-        or plane.get("_generated", {}).get("sourceSha256") != source_sha
-        or not set(POSTGRES_NOTION_COMPONENTS) <= components
-        or components & POSTGRES_NOTION_DORMANT_COMPONENTS
-        or external != ["notion"]
-    ):
-        raise CanaryError(
-            "indexed_data_content_profile_invalid",
-            profile or "missing-profile",
-        )
-    return {
-        "profile": profile,
-        "systemOfRecord": "postgres",
-        "providerComponents": list(POSTGRES_NOTION_COMPONENTS),
-        "externalProviders": external,
-    }
-
-
-def profile_declarative_reconcile(
-    config: dict[str, Any], values: dict[str, str]
-) -> dict[str, Any]:
-    """Reconcile only the selected profile's declarative provider resources."""
-    contract = postgres_notion_contract(config, values)
-    canonical_source_sha = hashlib.sha256(PLATFORM_ENV.read_bytes()).hexdigest()
-    postgrest = run_json_command(
-        ["python3", str(SERVER_BIN / "server-postgrest.py"), "provision"]
-    )
-    notion = run_json_command(
-        ["python3", str(SERVER_BIN / "server-notion.py"), "provision", "--json"]
-    )
-    activepieces = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-activepieces-provision-verify.py"),
-            "provision",
-        ]
-    )
-    postgrest_canonical = (
-        postgrest.get("canonical") if isinstance(postgrest, dict) else None
-    )
-    role_bindings = (
-        postgrest.get("roleBindings") if isinstance(postgrest, dict) else None
-    )
-    notion_created = notion.get("created") if isinstance(notion, dict) else None
-    notion_schema = notion.get("schema") if isinstance(notion, dict) else None
-    flows = (
-        activepieces.get("managedFlows")
-        if isinstance(activepieces, dict)
-        and isinstance(activepieces.get("managedFlows"), list)
-        else []
-    )
-    slots = (
-        activepieces.get("credentialSlots")
-        if isinstance(activepieces, dict)
-        and isinstance(activepieces.get("credentialSlots"), list)
-        else []
-    )
-    if (
-        not isinstance(postgrest, dict)
-        or postgrest.get("ok") is not True
-        or postgrest.get("status") != "converged"
-        or not isinstance(postgrest_canonical, dict)
-        or postgrest_canonical.get("changedKeys") != []
-        or not isinstance(role_bindings, dict)
-        or role_bindings.get("distinct") is not True
-    ):
-        raise CanaryError(
-            "indexed_final_not_stable", "PostgREST provisioning was not a no-op"
-        )
-    if (
-        not isinstance(notion, dict)
-        or notion.get("apiVersion") != "micro-task-engine/v1alpha1"
-        or notion.get("kind") != "NotionConnectorProvision"
-        or notion.get("status") != "converged"
-        or notion.get("ok") is not True
-        or notion.get("dataContentProfile") != POSTGRES_NOTION_PROFILE
-        or notion.get("changedKeys") != []
-        or notion.get("redacted") is not True
-        or not isinstance(notion_created, dict)
-        or any(value is not False for value in notion_created.values())
-        or not isinstance(notion_schema, dict)
-        or notion_schema.get("exact") is not True
-        or notion_schema.get("changed") is not False
-    ):
-        raise CanaryError(
-            "indexed_final_not_stable", "Notion provisioning was not a no-op"
-        )
-    if (
-        not isinstance(activepieces, dict)
-        or activepieces.get("apiVersion") != "micro-task-engine/v1alpha1"
-        or activepieces.get("kind") != "ActivepiecesProvisionEvidence"
-        or activepieces.get("dataContentProfile") != POSTGRES_NOTION_PROFILE
-        or activepieces.get("status") != "passed"
-        or activepieces.get("ok") is not True
-        or activepieces.get("secondRunNoOp") is not True
-        or activepieces.get("mutationCount") != 0
-        or activepieces.get("duplicateCount") != 0
-        or activepieces.get("mcpTokenIssuable") is not True
-        or activepieces.get("mcpTokenPersisted") is not False
-        or len(flows) != 3
-        or any(
-            not isinstance(row, dict) or row.get("status") != "ready" for row in flows
-        )
-        or len(slots) != 1
-        or any(
-            not isinstance(row, dict)
-            or row.get("status") != "ready"
-            or row.get("type") != "project-variable"
-            or row.get("valueRedacted") is not True
-            for row in slots
-        )
-    ):
-        raise CanaryError(
-            "indexed_final_not_stable",
-            "Activepieces declarative provisioning was not a no-op",
-        )
-    evidence = {
-        "postgrest": indexed_evidence_reference(
-            POSTGREST_VERIFY_EVIDENCE,
-            kind="PostgrestVerification",
-            producer="server-postgrest.py",
-            profile_field="profile",
-            profile=POSTGRES_NOTION_PROFILE,
-            canonical_source_sha256=canonical_source_sha,
-        ),
-        "notion": indexed_evidence_reference(
-            NOTION_VERIFY_EVIDENCE,
-            kind="NotionConnectorVerification",
-            producer="server-notion.py",
-            profile_field="dataContentProfile",
-            profile=POSTGRES_NOTION_PROFILE,
-            canonical_source_sha256=canonical_source_sha,
-        ),
-        "activepieces": indexed_evidence_reference(
-            ACTIVEPIECES_PROVISION_EVIDENCE,
-            kind="ActivepiecesProvisionEvidence",
-            producer="server-activepieces-provision-verify.py",
-            profile_field="dataContentProfile",
-            profile=POSTGRES_NOTION_PROFILE,
-            canonical_source_sha256=canonical_source_sha,
-        ),
-    }
-    summary = {
-        **contract,
-        "postgrest": {
-            "status": "converged",
-            "canonicalChangedKeys": [],
-            "roleBindingsDistinct": True,
-            "evidence": evidence["postgrest"],
-        },
-        "notion": {
-            "status": "converged",
-            "createdResourceCount": 0,
-            "schemaExact": True,
-            "schemaChanged": False,
-            "canonicalChangedKeys": [],
-            "evidence": evidence["notion"],
-        },
-        "activepieces": {
-            "status": "passed",
-            "managedFlowCount": len(flows),
-            "credentialSlotCount": len(slots),
-            "credentialKinds": sorted(
-                str(row["type"]) for row in slots if isinstance(row, dict)
-            ),
-            "secondRunNoOp": True,
-            "mutationCount": 0,
-            "duplicateCount": 0,
-            "mcpTokenPersisted": False,
-            "evidence": evidence["activepieces"],
-        },
-    }
-    scan_for_secrets(summary, values)
-    identity = json.loads(json.dumps(summary))
-    for row in identity.values():
-        if not isinstance(row, dict) or not isinstance(row.get("evidence"), dict):
-            continue
-        row["evidence"].pop("sha256", None)
-    return {
-        "summary": summary,
-        "identitySha256": canonical_json_sha256(identity),
-    }
-
-
-def assert_no_list_duplicates(value: Any, path: str = "root") -> None:
-    if isinstance(value, list):
-        rows = [row for row in value if isinstance(row, dict)]
-        for field in ("id", "uid", "name", "component", "profile"):
-            identities = [str(row[field]) for row in rows if row.get(field)]
-            if len(identities) != len(set(identities)):
-                raise CanaryError(
-                    "indexed_inventory_duplicate",
-                    f"{path}.{field}",
-                )
-        for index, item in enumerate(value):
-            assert_no_list_duplicates(item, f"{path}[{index}]")
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            assert_no_list_duplicates(item, f"{path}.{key}")
-
-
-def grafana_inventory(auth: dict[str, str]) -> dict[str, Any]:
-    datasources: dict[str, Any] = {}
-    for uid in DATASOURCES:
-        status, row = grafana_call(
-            "GET",
-            f"/api/datasources/uid/{uid}",
-            auth,
-            allow_status={404},
-        )
-        datasources[uid] = (
-            None
-            if status == 404
-            else {
-                "id": row.get("id"),
-                "uid": row.get("uid"),
-                "name": row.get("name"),
-            }
-        )
-    _, folders = grafana_call("GET", "/api/folders?limit=1000", auth)
-    exact_folders = (
-        [
-            {"id": row.get("id"), "uid": row.get("uid"), "title": row.get("title")}
-            for row in folders
-            if row.get("title") == "MTE Platform"
-        ]
-        if isinstance(folders, list)
-        else []
-    )
-    search_path = "/api/serviceaccounts/search?" + urllib.parse.urlencode(
-        {
-            "query": "mte-observability-prober",
-            "perpage": 100,
-        }
-    )
-    _, accounts = grafana_call("GET", search_path, auth)
-    exact_accounts = (
-        [
-            {"id": row.get("id"), "name": row.get("name"), "role": row.get("role")}
-            for row in accounts.get("serviceAccounts", [])
-            if row.get("name") == "mte-observability-prober"
-        ]
-        if isinstance(accounts, dict)
-        else []
-    )
-    if len(exact_folders) > 1 or len(exact_accounts) > 1:
-        raise CanaryError("indexed_inventory_duplicate", "Grafana identity duplicated")
-    return {
-        "datasources": datasources,
-        "folders": exact_folders,
-        "serviceAccounts": exact_accounts,
-    }
-
-
-def indexed_inventory(
-    config: dict[str, Any],
-    values: dict[str, str],
-    expected_hash: str,
-) -> dict[str, Any]:
-    gate = exact_hash_gate(expected_hash, config, load_json(MANIFEST))
-    data_content_contract = postgres_notion_contract(config, values)
-    components = sorted(
-        str(row["id"])
-        for row in config.get("spec", {}).get("components", [])
-        if isinstance(row, dict) and row.get("compose")
-    )
-    ids = load_json(SECRET_ROOT / "dokploy-mte-ids.json")
-    state = load_json(SECRET_ROOT / "dokploy-mte-state.json")
-    if set(ids) != set(components) or len(set(ids.values())) != len(ids):
-        raise CanaryError(
-            "indexed_inventory_duplicate", "Dokploy IDs missing or duplicated"
-        )
-    dokploy_status = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-dokploy.py"),
-            "status",
-        ]
-    )
-    status_ids = [row.get("composeId") for row in dokploy_status]
-    if len(dokploy_status) != len(components) or len(set(status_ids)) != len(
-        status_ids
-    ):
-        raise CanaryError(
-            "indexed_inventory_duplicate", "Dokploy runtime inventory drift"
-        )
-    provisioner = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-provision.py"),
-            "status",
-        ]
-    )
-    toolhive = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-toolhive.py"),
-            "status",
-        ]
-    )
-    assert_no_list_duplicates(dokploy_status, "dokploy")
-    assert_no_list_duplicates(provisioner, "provisioner")
-    assert_no_list_duplicates(toolhive, "toolhive")
-    identity = {
-        "componentIds": components,
-        "dokployIds": ids,
-        "dokployState": stable_projection(state),
-        "dokployRuntime": stable_projection(dokploy_status),
-        "provisioner": stable_projection(provisioner),
-        "toolhive": stable_projection(toolhive),
-        "grafana": grafana_inventory(basic_auth(values)),
-        "dataContentContract": data_content_contract,
-    }
-    identity_sha = hashlib.sha256(
-        json.dumps(
-            identity,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-    return {
-        "sourceGate": gate,
-        "identity": identity,
-        "identitySha256": identity_sha,
-        "noDuplicates": True,
-    }
-
-
-def indexed_reconcile_pass(expected_hash: str, pass_number: int) -> dict[str, Any]:
-    if pass_number not in INDEX_PASS:
-        raise CanaryError("invalid_reconcile_pass", str(pass_number))
-    config, values = load_json(CONFIG), dotenv(PLATFORM_ENV)
-    before = indexed_inventory(config, values, expected_hash)
-    components = before["identity"]["componentIds"]
-    dokploy = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-dokploy.py"),
-            "deploy",
-            *components,
-        ]
-    )
-    provisioner = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-provision.py"),
-            "provision",
-        ]
-    )
-    declarative = profile_declarative_reconcile(config, values)
-    toolhive = run_json_command(
-        [
-            "python3",
-            str(SERVER_BIN / "server-toolhive.py"),
-            "provision",
-        ]
-    )
-    grafana = reconcile_grafana_once(basic_auth(values))
-    # A provisioner that adds a new canonical value invalidates FINAL-STABLE.
-    config = load_json(CONFIG)
-    after = indexed_inventory(config, dotenv(PLATFORM_ENV), expected_hash)
-    actions = {str(row.get("component")): row.get("action") for row in dokploy}
-    if set(actions) != set(components):
-        raise CanaryError("indexed_reconcile_incomplete", "Dokploy result incomplete")
-    if pass_number == 2 and set(actions.values()) != {"unchanged"}:
-        raise CanaryError(
-            "indexed_second_pass_changed", json.dumps(actions, sort_keys=True)
-        )
-    control_plane = dokploy_control_plane_proof(components)
-    engine = docker_engine_proof(control_plane["resources"])
-    host_acceptance = host_dokploy_acceptance(
-        expected_hash,
-        after["sourceGate"],
-        execute=pass_number == 1,
-    )
-    host_evidence_sha = hashlib.sha256(
-        HOST_DOKPLOY_EVIDENCE.read_bytes(),
-    ).hexdigest()
-    payload = {
-        "apiVersion": "micro-task-engine/v1alpha1",
-        "kind": "IndexedReconcilePass",
-        "pass": pass_number,
-        "status": "passed",
-        "completedAt": utcnow(),
-        "producerSha256": producer_sha256(),
-        "producerHashes": producer_hashes(),
-        "sourceGate": after["sourceGate"],
-        "before": before,
-        "after": after,
-        "dokployActions": actions,
-        "hostDokployEvidence": str(HOST_DOKPLOY_EVIDENCE),
-        "hostDokployEvidenceSha256": host_evidence_sha,
-        "C061": {
-            "status": "pass",
-            **control_plane,
-            **host_acceptance["C061"],
-            "managedInventory": control_plane,
-        },
-        "C062": {
-            "status": "pass",
-            "dokployActions": actions,
-            **engine,
-            **host_acceptance["C062"],
-            "managedRuntime": engine,
-        },
-        "provisionerIdentitySha256": hashlib.sha256(
-            json.dumps(
-                stable_projection(provisioner),
-                sort_keys=True,
-            ).encode()
-        ).hexdigest(),
-        "toolhiveIdentitySha256": hashlib.sha256(
-            json.dumps(
-                stable_projection(toolhive),
-                sort_keys=True,
-            ).encode()
-        ).hexdigest(),
-        "dataContentProfile": POSTGRES_NOTION_PROFILE,
-        "dataContentDeclarativeEvidence": declarative["summary"],
-        "dataContentIdentitySha256": declarative["identitySha256"],
-        "grafanaFingerprint": grafana["sha256"],
-    }
-    scan_for_secrets(payload, values)
-    atomic_json(INDEX_PASS[pass_number], payload)
-    return payload
-
-
-def finalize_indexed_idempotency(expected_hash: str) -> dict[str, Any]:
-    gate = exact_hash_gate(expected_hash, load_json(CONFIG), load_json(MANIFEST))
-    first, second = load_json(INDEX_PASS[1]), load_json(INDEX_PASS[2])
-    if first.get("sourceGate") != gate or second.get("sourceGate") != gate:
-        raise CanaryError("indexed_source_gate_drift", "reconcile pass hash differs")
-    current_producers = producer_hashes()
-    if (
-        first.get("producerHashes") != current_producers
-        or second.get("producerHashes") != current_producers
-    ):
-        raise CanaryError("indexed_producer_drift", "reconcile producer hash differs")
-    validate_host_dokploy_acceptance(gate)
-    host_evidence_sha = hashlib.sha256(
-        HOST_DOKPLOY_EVIDENCE.read_bytes(),
-    ).hexdigest()
-    if (
-        first.get("hostDokployEvidenceSha256") != host_evidence_sha
-        or second.get("hostDokployEvidenceSha256") != host_evidence_sha
-    ):
-        raise CanaryError(
-            "host_dokploy_acceptance_drift",
-            "host lifecycle evidence changed",
-        )
-    first_after = first.get("after", {})
-    second_before = second.get("before", {})
-    second_after = second.get("after", {})
-    if first_after.get("identitySha256") != second_before.get("identitySha256"):
-        raise CanaryError(
-            "indexed_between_pass_drift", "identity changed between passes"
-        )
-    if second_before.get("identitySha256") != second_after.get("identitySha256"):
-        raise CanaryError(
-            "indexed_second_pass_changed", "second pass changed inventory"
-        )
-    if set(second.get("dokployActions", {}).values()) != {"unchanged"}:
-        raise CanaryError("indexed_second_pass_changed", "Dokploy was not no-op")
-    before_ids = first.get("before", {}).get("identity", {}).get("dokployIds")
-    after_ids = second_after.get("identity", {}).get("dokployIds")
-    if before_ids != after_ids:
-        raise CanaryError("indexed_identity_changed", "Dokploy IDs changed")
-    if first.get("provisionerIdentitySha256") != second.get(
-        "provisionerIdentitySha256"
-    ):
-        raise CanaryError("indexed_identity_changed", "provisioner identities changed")
-    if first.get("toolhiveIdentitySha256") != second.get("toolhiveIdentitySha256"):
-        raise CanaryError("indexed_identity_changed", "ToolHive identities changed")
-    if (
-        first.get("dataContentProfile") != POSTGRES_NOTION_PROFILE
-        or second.get("dataContentProfile") != POSTGRES_NOTION_PROFILE
-        or first.get("dataContentIdentitySha256")
-        != second.get("dataContentIdentitySha256")
-    ):
-        raise CanaryError("indexed_identity_changed", "data/content identities changed")
-    payload = {
-        "apiVersion": "micro-task-engine/v1alpha1",
-        "kind": "IndexedDeployIdempotencyEvidence",
-        "status": "passed",
-        "completedAt": utcnow(),
-        "producerSha256": producer_sha256(),
-        "producerHashes": current_producers,
-        "sourceGate": gate,
-        "componentCount": len(after_ids),
-        "stableDokployIds": True,
-        "noDuplicateResources": True,
-        "secondPassNoChange": True,
-        "inventoryIdentitySha256": second_after["identitySha256"],
-        "dataContentProfile": POSTGRES_NOTION_PROFILE,
-        "dataContentIdentitySha256": second["dataContentIdentitySha256"],
-        "dataContentDeclarativeEvidence": second["dataContentDeclarativeEvidence"],
-        "passes": [str(INDEX_PASS[1]), str(INDEX_PASS[2])],
-        "hostDokployEvidence": str(HOST_DOKPLOY_EVIDENCE),
-        "hostDokployEvidenceSha256": host_evidence_sha,
-        "checks": {"C061": second["C061"], "C062": second["C062"]},
-        "coverage": [
-            "dokploy-all-indexed-components",
-            "server-provision-all-adapters",
-            "toolhive-provisioning",
-            "grafana-provisioning",
-            "dedicated-dokploy-api-key",
-            "dokploy-docker-engine-binding",
-        ],
-        "profileCoverage": [
-            "postgres-ssot-postgrest-provisioning",
-            "notion-external-connector-provisioning",
-            "activepieces-declarative-resources",
-        ],
-    }
-    atomic_json(INDEX_FINAL, payload)
-    return payload
-
-
 def grafana_queries(
     auth: dict[str, str],
     run_id: str,
     trace_id: str,
+    runtime: ObservabilityRuntime,
 ) -> dict[str, Any]:
     health: dict[str, str] = {}
-    for uid in DATASOURCES:
+    for uid in runtime.datasources:
         status, body = grafana_call(
             "GET",
             f"/api/datasources/uid/{uid}/health",
             auth,
+            runtime,
         )
         if status != 200:
             raise CanaryError("grafana_datasource_unhealthy", uid)
@@ -2137,16 +1919,17 @@ def grafana_queries(
             }
         )
     )
-    _, metric = grafana_call("GET", metric_path, auth)
+    _, metric = grafana_call("GET", metric_path, auth, runtime)
     log_path = (
         "/api/datasources/proxy/uid/victorialogs/select/logsql/query?"
         + urllib.parse.urlencode({"query": f'run_id:="{run_id}"'})
     )
-    log_status, logs = grafana_call("GET", log_path, auth)
+    log_status, logs = grafana_call("GET", log_path, auth, runtime)
     trace_status, trace = grafana_call(
         "GET",
         f"/api/datasources/proxy/uid/victoriatraces/api/traces/{trace_id}",
         auth,
+        runtime,
     )
     metric_rows = (
         metric.get("data", {}).get("result", []) if isinstance(metric, dict) else []
@@ -2175,8 +1958,6 @@ def postgres_path_specs(
         )
     expected_apps = {
         "mattermost",
-        "activepieces-app",
-        "activepieces-worker",
         "firecrawl-api",
         "kestra",
         "searxng",
@@ -2195,27 +1976,11 @@ def postgres_path_specs(
         ),
         (
             "mattermost",
-            None,
-            None,
+            "MATTERMOST_DB_HOST",
+            "MATTERMOST_DB_PORT",
             "MATTERMOST_DB_USER",
             "MATTERMOST_DB_NAME",
             "MATTERMOST_DB_PASSWORD",
-        ),
-        (
-            "activepieces-app",
-            "MTE_ACTIVEPIECES_APP_ENV_AP_POSTGRES_HOST",
-            "MTE_ACTIVEPIECES_APP_ENV_AP_POSTGRES_PORT",
-            "AP_POSTGRES_USERNAME",
-            "AP_POSTGRES_DATABASE",
-            "AP_POSTGRES_PASSWORD",
-        ),
-        (
-            "activepieces-worker",
-            "MTE_ACTIVEPIECES_WORKER_ENV_AP_POSTGRES_HOST",
-            "MTE_ACTIVEPIECES_WORKER_ENV_AP_POSTGRES_PORT",
-            "AP_POSTGRES_USERNAME",
-            "AP_POSTGRES_DATABASE",
-            "AP_POSTGRES_PASSWORD",
         ),
         (
             "firecrawl-api",
@@ -2225,57 +1990,28 @@ def postgres_path_specs(
             "FIRECRAWL_DB_NAME",
             "FIRECRAWL_DB_PASSWORD",
         ),
-        ("kestra", None, None, None, None, "KESTRA_DB_PASSWORD"),
-    ]
-    provider = {
-        "baserow": (
-            "baserow",
-            "BASEROW_DB_HOST",
-            "BASEROW_DB_PORT",
-            "BASEROW_DB_USER",
-            "BASEROW_DB_NAME",
-            "BASEROW_DB_PASSWORD",
-        ),
-        "wikijs": (
-            "wikijs",
-            "WIKIJS_DB_HOST",
-            "WIKIJS_DB_PORT",
-            "WIKIJS_DB_USER",
-            "WIKIJS_DB_NAME",
-            "WIKIJS_DB_PASSWORD",
-        ),
-        "nocodb": (
-            "nocodb",
-            "NOCODB_DB_HOST",
-            "NOCODB_DB_PORT",
-            "NOCODB_META_DB_USER",
-            "NOCODB_META_DB_NAME",
-            "NOCODB_META_DB_PASSWORD",
-        ),
-    }
-    raw = [
-        *common,
-        *(
-            provider[component]
-            for component in contract["componentIds"]
-            if component in provider
+        (
+            "kestra",
+            "KESTRA_DB_HOST",
+            "KESTRA_DB_PORT",
+            "KESTRA_DB_USER",
+            "KESTRA_DB_NAME",
+            "KESTRA_DB_PASSWORD",
         ),
     ]
+    raw = common
     specs: list[dict[str, str]] = []
     for role, host_ref, port_ref, user_ref, db_ref, password_ref in raw:
-        host = (
-            values.get(host_ref, "")
-            if host_ref
-            else {
-                "mattermost": "mte-mattermost-postgres",
-                "kestra": "mte-kestra-postgres",
-            }[role]
-        )
-        port = values.get(port_ref, "") if port_ref else "5432"
-        user = values.get(user_ref, "") if user_ref else "kestra"
-        database = values.get(db_ref, "") if db_ref else "kestra"
+        host = values.get(host_ref, "")
+        port = values.get(port_ref, "")
+        user = values.get(user_ref, "")
+        database = values.get(db_ref, "")
         password = values.get(password_ref, "")
-        if not all((apps.get(role), host, port, user, database, password)):
+        if (
+            not all((apps.get(role), host, port, user, database, password))
+            or not port.isdigit()
+            or not (1 <= int(port) <= 65535)
+        ):
             raise CanaryError("postgres_path_config_missing", role)
         specs.append(
             {
@@ -2296,6 +2032,7 @@ def postgres_rw_delete(
     values: dict[str, str],
     apps: dict[str, str],
     marker: str,
+    runtime: ObservabilityRuntime,
 ) -> list[dict[str, Any]]:
     if not re.fullmatch(r"[a-z0-9-]+", marker):
         raise CanaryError("invalid_run_id", "unsafe PostgreSQL marker")
@@ -2316,12 +2053,13 @@ def postgres_rw_delete(
         child_env = {
             **os.environ,
             "PGPASSWORD": spec["password"],
-            "PGCONNECT_TIMEOUT": "10",
+            "PGCONNECT_TIMEOUT": str(runtime.http_timeout_seconds),
         }
         result = run(
             [
                 "docker",
                 "run",
+                "-i",
                 "--rm",
                 "--pull=never",
                 "--network",
@@ -2347,6 +2085,7 @@ def postgres_rw_delete(
             ],
             stdin=sql,
             env=child_env,
+            timeout=runtime.command_timeout_seconds,
         )
         rows = [
             line.strip()
@@ -2382,8 +2121,6 @@ def redis_path_specs(
         )
     expected_apps = {
         "mattermost",
-        "activepieces-app",
-        "activepieces-worker",
         "firecrawl-api",
         "kestra",
         "searxng",
@@ -2392,8 +2129,6 @@ def redis_path_specs(
     if set(apps) != expected_apps:
         raise CanaryError("application_path_profile_mismatch", profile)
     raw = [
-        ("activepieces-app", "AP_REDIS_URL"),
-        ("activepieces-worker", "AP_REDIS_URL"),
         ("firecrawl-api", "FIRECRAWL_REDIS_URL"),
         ("searxng", "SEARXNG_VALKEY_URL"),
     ]
@@ -2401,46 +2136,26 @@ def redis_path_specs(
     for role, url_ref in raw:
         url = values.get(url_ref, "")
         parsed = urllib.parse.urlsplit(url)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise CanaryError("redis_path_auth_missing", role) from exc
         if (
             not apps.get(role)
             or parsed.scheme not in {"redis", "rediss"}
             or not parsed.hostname
             or not parsed.password
+            or port is None
         ):
             raise CanaryError("redis_path_auth_missing", role)
         specs.append(
             {
                 "role": role,
                 "container": apps[role],
-                "url": url,
                 "urlRef": url_ref,
                 "host": parsed.hostname,
-                "port": str(parsed.port or 6379),
-            }
-        )
-    if "baserow" in contract["componentIds"]:
-        password = values.get("BASEROW_REDIS_PASSWORD", "")
-        host = values.get("BASEROW_REDIS_HOST", "")
-        port = values.get("BASEROW_REDIS_PORT", "")
-        database = values.get("BASEROW_REDIS_DB", "")
-        if (
-            not apps.get("baserow")
-            or not password
-            or not host
-            or not port.isdigit()
-            or not database.isdigit()
-        ):
-            raise CanaryError("redis_path_auth_missing", "baserow")
-        specs.append(
-            {
-                "role": "baserow",
-                "container": apps["baserow"],
-                "url": "redis://:"
-                + urllib.parse.quote(password, safe="")
-                + f"@{host}:{port}/{database}",
-                "urlRef": "BASEROW_REDIS_PASSWORD",
-                "host": host,
-                "port": port,
+                "port": str(port),
+                "password": urllib.parse.unquote(parsed.password),
             }
         )
     return specs
@@ -2449,8 +2164,9 @@ def redis_path_specs(
 def redis_authenticated_paths(
     values: dict[str, str],
     apps: dict[str, str],
+    runtime: ObservabilityRuntime,
 ) -> list[dict[str, Any]]:
-    image = values.get("MTE_ACTIVEPIECES_DATA_REDIS_IMAGE", "")
+    image = values.get("MTE_SEARXNG_VALKEY_IMAGE", "")
     if not image:
         raise CanaryError("redis_client_image_missing", "image ref missing")
     proof: list[dict[str, Any]] = []
@@ -2471,11 +2187,12 @@ def redis_authenticated_paths(
                 spec["port"],
                 "PING",
             ],
+            timeout=runtime.command_timeout_seconds,
             allow_failure=True,
         )
         if "NOAUTH" not in (unauth.stdout + unauth.stderr).upper():
             raise CanaryError("redis_auth_not_enforced", spec["role"])
-        child_env = {**os.environ, "MTE_CANARY_REDIS_URL": spec["url"]}
+        child_env = {**os.environ, "REDISCLI_AUTH": spec["password"]}
         authenticated = run(
             [
                 "docker",
@@ -2485,13 +2202,18 @@ def redis_authenticated_paths(
                 "--network",
                 f"container:{spec['container']}",
                 "-e",
-                "MTE_CANARY_REDIS_URL",
+                "REDISCLI_AUTH",
                 image,
-                "sh",
-                "-ec",
-                'redis-cli --no-auth-warning -u "$MTE_CANARY_REDIS_URL" PING',
+                "redis-cli",
+                "--no-auth-warning",
+                "-h",
+                spec["host"],
+                "-p",
+                spec["port"],
+                "PING",
             ],
             env=child_env,
+            timeout=runtime.command_timeout_seconds,
         )
         if authenticated.stdout.strip() != "PONG":
             raise CanaryError("redis_authenticated_ping_failed", spec["role"])
@@ -2509,6 +2231,7 @@ def redis_authenticated_paths(
 
 def runtime_alert_config(
     values: dict[str, str],
+    runtime: ObservabilityRuntime,
     config_root: Path | None = None,
 ) -> dict[str, Any]:
     if config_root is None:
@@ -2520,7 +2243,8 @@ def runtime_alert_config(
                 "mte-observability-config",
                 "--format",
                 "{{.Mountpoint}}",
-            ]
+            ],
+            timeout=runtime.command_timeout_seconds,
         ).stdout.strip()
         config_root = Path(mountpoint)
     try:
@@ -2530,10 +2254,28 @@ def runtime_alert_config(
         raise CanaryError(
             "alert_runtime_config_missing", "alert config unreadable"
         ) from exc
-    webhook = values.get("MATTERMOST_ALERT_WEBHOOK_URL", "")
+    canonical_webhook = values.get("MATTERMOST_ALERT_WEBHOOK_URL", "").strip()
+    try:
+        parsed_webhook = urllib.parse.urlsplit(canonical_webhook)
+    except ValueError as exc:
+        raise CanaryError(
+            "mattermost_receiver_not_deployed", "canonical webhook is invalid"
+        ) from exc
+    if (
+        parsed_webhook.scheme not in {"http", "https"}
+        or not parsed_webhook.hostname
+        or parsed_webhook.username
+        or parsed_webhook.password
+        or parsed_webhook.query
+        or parsed_webhook.fragment
+        or not parsed_webhook.path.startswith("/hooks/")
+    ):
+        raise CanaryError(
+            "mattermost_receiver_not_deployed", "canonical webhook is invalid"
+        )
+    deployed_webhook = f"http://mattermost:8065{parsed_webhook.path}"
     receiver_ready = (
-        bool(webhook)
-        and webhook in alertmanager
+        deployed_webhook in alertmanager
         and "receiver: mattermost" in alertmanager
         and "send_resolved: true" in alertmanager
     )
@@ -2551,28 +2293,45 @@ def runtime_alert_config(
             "vmalert_selector_not_deployed",
             "runtime rule does not select OTel service.name label",
         )
-    fingerprint = hashlib.sha256(webhook.encode()).hexdigest()
+    canonical_fingerprint = hashlib.sha256(canonical_webhook.encode()).hexdigest()
+    deployed_fingerprint = hashlib.sha256(deployed_webhook.encode()).hexdigest()
     return {
         "mattermostReceiverReady": True,
         "webhookCredentialRef": "MATTERMOST_ALERT_WEBHOOK_URL",
-        "canonicalWebhookFingerprintSha256": fingerprint,
-        "deployedWebhookFingerprintSha256": fingerprint,
-        "webhookFingerprintMatch": True,
+        "canonicalWebhookFingerprintSha256": canonical_fingerprint,
+        "deployedWebhookFingerprintSha256": deployed_fingerprint,
+        "webhookPathPreserved": (
+            urllib.parse.urlsplit(deployed_webhook).path == parsed_webhook.path
+        ),
         "sendResolved": True,
         "otelLabelSelectorReady": True,
     }
 
 
-def alertmanager_matches(run_id: str) -> list[dict[str, Any]]:
-    _, body = request_json("GET", ALERTMANAGER + "/api/v2/alerts")
+def alertmanager_matches(
+    run_id: str,
+    runtime: ObservabilityRuntime,
+) -> list[dict[str, Any]]:
+    _, body = request_json(
+        "GET",
+        runtime.alertmanager_url + "/api/v2/alerts",
+        timeout=runtime.http_timeout_seconds,
+    )
     if not isinstance(body, list):
         raise CanaryError("alertmanager_invalid", "alerts response invalid")
     instance = f"mte-canary:{run_id}"
     return [item for item in body if item.get("labels", {}).get("instance") == instance]
 
 
-def vmalert_matches(run_id: str) -> list[dict[str, Any]]:
-    _, body = request_json("GET", VMALERT + "/api/v1/alerts")
+def vmalert_matches(
+    run_id: str,
+    runtime: ObservabilityRuntime,
+) -> list[dict[str, Any]]:
+    _, body = request_json(
+        "GET",
+        runtime.vmalert_url + "/api/v1/alerts",
+        timeout=runtime.http_timeout_seconds,
+    )
     alerts = body.get("data", {}).get("alerts", []) if isinstance(body, dict) else []
     instance = f"mte-canary:{run_id}"
     return [
@@ -2580,23 +2339,27 @@ def vmalert_matches(run_id: str) -> list[dict[str, Any]]:
     ]
 
 
-def mattermost_post_state(container: str, run_id: str) -> dict[str, Any]:
+def mattermost_post_state(
+    container: str,
+    run_id: str,
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z0-9-]+", run_id):
         raise CanaryError("invalid_run_id", "unsafe Mattermost marker")
     sql = (
         "SELECT count(*),"
-        'coalesce(bool_or(lower("Message" || \' \' || "Props"::text) '
+        "coalesce(bool_or(lower(p.message || ' ' || p.props::text) "
         "LIKE '%firing%'),false),"
-        'coalesce(bool_or(lower("Message" || \' \' || "Props"::text) '
+        "coalesce(bool_or(lower(p.message || ' ' || p.props::text) "
         "LIKE '%resolved%'),false),"
-        "coalesce(min(nullif(u.\"Username\",'')),"
-        "min(nullif(p.\"Props\"::jsonb->>'override_username','')),'incoming-webhook'),"
-        "coalesce(min(c.\"Name\"),''),"
-        'count(distinct p."UserId"),count(distinct p."ChannelId") '
-        'FROM "Posts" p '
-        'LEFT JOIN "Users" u ON u."Id"=p."UserId" '
-        'LEFT JOIN "Channels" c ON c."Id"=p."ChannelId" '
-        'WHERE lower(p."Message" || \' \' || p."Props"::text) '
+        "coalesce(min(nullif(u.username,'')),"
+        "min(nullif(p.props::jsonb->>'override_username','')),'incoming-webhook'),"
+        "coalesce(min(c.name),''),"
+        "count(distinct p.userid),count(distinct p.channelid) "
+        "FROM public.posts p "
+        "LEFT JOIN public.users u ON u.id=p.userid "
+        "LEFT JOIN public.channels c ON c.id=p.channelid "
+        "WHERE lower(p.message || ' ' || p.props::text) "
         f"LIKE '%{run_id}%';"
     )
     result = run(
@@ -2610,6 +2373,7 @@ def mattermost_post_state(container: str, run_id: str) -> dict[str, Any]:
             'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
         ],
         stdin=sql,
+        timeout=runtime.command_timeout_seconds,
     )
     fields = result.stdout.strip().split("|")
     if len(fields) != 7:
@@ -2625,15 +2389,19 @@ def mattermost_post_state(container: str, run_id: str) -> dict[str, Any]:
     }
 
 
-def mattermost_cleanup_posts(container: str, run_id: str) -> dict[str, Any]:
+def mattermost_cleanup_posts(
+    container: str,
+    run_id: str,
+    runtime: ObservabilityRuntime,
+) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z0-9-]+", run_id):
         raise CanaryError("invalid_run_id", "unsafe Mattermost marker")
     sql = (
-        'WITH deleted AS (DELETE FROM "Posts" '
-        'WHERE lower("Message" || \' \' || "Props"::text) '
+        "WITH deleted AS (DELETE FROM public.posts "
+        "WHERE lower(message || ' ' || props::text) "
         f"LIKE '%{run_id}%' RETURNING 1) SELECT count(*) FROM deleted;"
-        'SELECT count(*) FROM "Posts" '
-        'WHERE lower("Message" || \' \' || "Props"::text) '
+        "SELECT count(*) FROM public.posts "
+        "WHERE lower(message || ' ' || props::text) "
         f"LIKE '%{run_id}%';"
     )
     result = run(
@@ -2647,6 +2415,7 @@ def mattermost_cleanup_posts(container: str, run_id: str) -> dict[str, Any]:
             'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
         ],
         stdin=sql,
+        timeout=runtime.command_timeout_seconds,
     )
     fields = result.stdout.strip().splitlines()
     if len(fields) != 2 or not all(field.isdigit() for field in fields):
@@ -2664,27 +2433,28 @@ def mattermost_cleanup_posts(container: str, run_id: str) -> dict[str, Any]:
 def fire_and_resolve_alert(
     run_id: str,
     mattermost_db: str,
+    runtime: ObservabilityRuntime,
 ) -> dict[str, Any]:
     def emit(value: int) -> None:
-        send_otlp("metrics", probe_metric_payload(run_id, value))
+        send_otlp("metrics", probe_metric_payload(run_id, value), runtime)
 
     emit(0)
     started = time.monotonic()
 
     def firing() -> dict[str, Any] | bool:
         emit(0)
-        vm = vmalert_matches(run_id)
-        am = alertmanager_matches(run_id)
-        mm = mattermost_post_state(mattermost_db, run_id)
+        vm = vmalert_matches(run_id, runtime)
+        am = alertmanager_matches(run_id, runtime)
+        mm = mattermost_post_state(mattermost_db, run_id, runtime)
         if vm and am and mm["firing"]:
             return {"vmalert": len(vm), "alertmanager": len(am), "mattermost": mm}
         return False
 
     def resolved() -> dict[str, Any] | bool:
         emit(1)
-        vm = vmalert_matches(run_id)
-        am = alertmanager_matches(run_id)
-        mm = mattermost_post_state(mattermost_db, run_id)
+        vm = vmalert_matches(run_id, runtime)
+        am = alertmanager_matches(run_id, runtime)
+        mm = mattermost_post_state(mattermost_db, run_id, runtime)
         if not vm and not am and mm["resolved"]:
             return {"vmalert": 0, "alertmanager": 0, "mattermost": mm}
         return False
@@ -2693,10 +2463,18 @@ def fire_and_resolve_alert(
     # including timeout/error paths.
     try:
         try:
-            fired = wait_for(firing, timeout=300, interval=20)
+            fired = wait_for(
+                firing,
+                timeout=runtime.alert_fire_timeout_seconds,
+                interval=runtime.alert_poll_interval_seconds,
+            )
         finally:
             emit(1)
-        cleared = wait_for(resolved, timeout=420, interval=20)
+        cleared = wait_for(
+            resolved,
+            timeout=runtime.alert_resolve_timeout_seconds,
+            interval=runtime.alert_poll_interval_seconds,
+        )
         if (
             cleared["mattermost"].get("channel") != "mte-alerts"
             or not cleared["mattermost"].get("author")
@@ -2705,7 +2483,7 @@ def fire_and_resolve_alert(
             raise CanaryError(
                 "mattermost_post_identity_invalid", "author/channel mismatch"
             )
-        cleanup = mattermost_cleanup_posts(mattermost_db, run_id)
+        cleanup = mattermost_cleanup_posts(mattermost_db, run_id, runtime)
         return {
             "firing": fired,
             "resolved": cleared,
@@ -2716,7 +2494,7 @@ def fire_and_resolve_alert(
     except BaseException:
         # The zero is already cleared in the inner finally. Remove any canary
         # posts even when the semantic acceptance later fails.
-        mattermost_cleanup_posts(mattermost_db, run_id)
+        mattermost_cleanup_posts(mattermost_db, run_id, runtime)
         raise
 
 
@@ -2743,11 +2521,11 @@ def scan_for_secrets(payload: dict[str, Any], values: dict[str, str]) -> None:
 def preflight(expected_hash: str | None = None) -> dict[str, Any]:
     config, manifest = load_json(CONFIG), load_json(MANIFEST)
     values = runtime_values(dotenv(PLATFORM_ENV), config, manifest)
+    runtime = observability_runtime(values)
     profile = runtime_profile(config, values)
     refs = {
         "GRAFANA_ADMIN_USER",
         "GRAFANA_ADMIN_PASSWORD",
-        "AP_REDIS_PASSWORD",
         "MATTERMOST_ALERT_WEBHOOK_URL",
     }
     missing = sorted(key for key in refs if not values.get(key))
@@ -2761,13 +2539,13 @@ def preflight(expected_hash: str | None = None) -> dict[str, Any]:
     }
     if expected_hash:
         state = exact_hash_gate(expected_hash, config, manifest)
-    inventory = docker_inventory()
+    inventory = docker_inventory(runtime)
     containers = require_containers(inventory)
     emitters = require_otlp_emitters(inventory)
     apps = application_paths(config, inventory, values)
     postgres_specs = postgres_path_specs(values, apps)
     redis_specs = redis_path_specs(values, apps)
-    alert_config = runtime_alert_config(values)
+    alert_config = runtime_alert_config(values, runtime)
     return {
         "status": "ready",
         "mutationPerformed": False,
@@ -2793,6 +2571,7 @@ def telemetry_evidence_checks(
     runner_run_id: str,
     app_trace_id: str,
     runner_trace_id: str,
+    app_network: dict[str, Any],
     runner_network: dict[str, Any],
     app_correlated: dict[str, Any],
     runner_correlated: dict[str, Any],
@@ -2817,6 +2596,7 @@ def telemetry_evidence_checks(
                     "otlpHttpStatus": app_statuses,
                     "runId": app_run_id,
                     "traceId": app_trace_id,
+                    "networkLifecycle": app_network,
                     "backendProof": backend(app_correlated),
                 },
                 "runner": {
@@ -2843,19 +2623,15 @@ def apply(expected_hash: str) -> dict[str, Any]:
     producer_hash = producer_sha256()
     config, manifest = load_json(CONFIG), load_json(MANIFEST)
     values = runtime_values(dotenv(PLATFORM_ENV), config, manifest)
+    runtime = observability_runtime(values)
     profile = runtime_profile(config, values)
     gate = exact_hash_gate(expected_hash, config, manifest)
-    indexed = load_json(INDEX_FINAL)
-    if indexed.get("status") != "passed" or indexed.get("sourceGate") != gate:
-        raise CanaryError(
-            "indexed_idempotency_missing",
-            "C069 final evidence is missing or belongs to another source hash",
-        )
-    inventory = docker_inventory()
+    inventory = docker_inventory(runtime)
+    compose = direct_compose_proof(inventory)
     containers = require_containers(inventory)
     emitters = require_otlp_emitters(inventory)
     apps = application_paths(config, inventory, values)
-    alert_config = runtime_alert_config(values)
+    alert_config = runtime_alert_config(values, runtime)
     app_run_id = "otel-app-" + secrets.token_hex(6)
     runner_run_id = "otel-runner-" + secrets.token_hex(6)
     app_trace_id, app_span_id = secrets.token_hex(16), secrets.token_hex(8)
@@ -2876,20 +2652,18 @@ def apply(expected_hash: str) -> dict[str, Any]:
         service_name=emitters["runner"]["service"],
         container_name=emitters["runner"]["container"],
     )
-    app_statuses = {
-        kind: send_otlp_from_container(
-            emitters["application"]["container"],
-            kind,
-            payload,
-        )
-        for kind, payload in app_payloads.items()
-    }
+    app_statuses, app_network = container_otlp_bundle(
+        emitters["application"]["container"],
+        app_payloads,
+        runtime,
+    )
     runner_statuses, runner_network = runner_otlp_bundle(
         emitters["runner"]["container"],
         runner_payloads,
+        runtime,
     )
-    app_correlated = query_correlated_data(app_run_id, app_trace_id)
-    runner_correlated = query_correlated_data(runner_run_id, runner_trace_id)
+    app_correlated = query_correlated_data(app_run_id, app_trace_id, runtime)
+    runner_correlated = query_correlated_data(runner_run_id, runner_trace_id, runtime)
     run_id, trace_id = app_run_id, app_trace_id
     checks: dict[str, Any] = {
         **telemetry_evidence_checks(
@@ -2900,15 +2674,17 @@ def apply(expected_hash: str) -> dict[str, Any]:
             runner_run_id=runner_run_id,
             app_trace_id=app_trace_id,
             runner_trace_id=runner_trace_id,
+            app_network=app_network,
             runner_network=runner_network,
             app_correlated=app_correlated,
             runner_correlated=runner_correlated,
         ),
         "C041": {
             "status": "pass",
-            "host": series_freshness('node_uname_info{service.name="node"}'),
+            "host": series_freshness('node_uname_info{service.name="node"}', runtime),
             "containers": series_freshness(
-                'container_cpu_usage_seconds_total{service.name="containers"}'
+                'container_cpu_usage_seconds_total{service.name="containers"}',
+                runtime,
             ),
         },
         "C042": {
@@ -2923,12 +2699,15 @@ def apply(expected_hash: str) -> dict[str, Any]:
         },
     }
     auth = basic_auth(values)
-    checks["C050"] = {"status": "pass", **grafana_reconcile_twice(auth)}
+    checks["C050"] = {
+        "status": "pass",
+        **grafana_reconcile_twice(auth, runtime),
+    }
     checks["C045"] = {
         "status": "pass",
-        **grafana_queries(auth, run_id, trace_id),
+        **grafana_queries(auth, run_id, trace_id, runtime),
     }
-    alert = fire_and_resolve_alert(run_id, containers["mattermost"])
+    alert = fire_and_resolve_alert(run_id, containers["mattermost"], runtime)
     checks["C047"] = {
         "status": "pass",
         **alert_config,
@@ -2945,7 +2724,7 @@ def apply(expected_hash: str) -> dict[str, Any]:
         "deployedWebhookFingerprintSha256": alert_config[
             "deployedWebhookFingerprintSha256"
         ],
-        "webhookFingerprintMatch": alert_config["webhookFingerprintMatch"],
+        "webhookPathPreserved": alert_config["webhookPathPreserved"],
         "mattermostFiringObserved": alert["firing"]["mattermost"]["firing"],
         "mattermostResolvedObserved": alert["resolved"]["mattermost"]["resolved"],
         "matchingPosts": alert["resolved"]["mattermost"]["matchingPosts"],
@@ -2955,32 +2734,29 @@ def apply(expected_hash: str) -> dict[str, Any]:
         "postChannelIdentityCount": alert["resolved"]["mattermost"]["distinctChannels"],
         "cleanup": alert["cleanup"],
     }
-    checks["C049"] = {"status": "pass", **blackbox_proof(config)}
-    postgres_paths = postgres_rw_delete(values, apps, run_id)
+    checks["C049"] = {"status": "pass", **blackbox_proof(config, runtime)}
+    postgres_paths = postgres_rw_delete(values, apps, run_id, runtime)
     checks["C063"] = {
         "status": "pass",
         "dataContentProfile": profile["profile"],
         "expectedPathCount": len(postgres_paths),
         "applicationPaths": postgres_paths,
     }
-    redis_paths = redis_authenticated_paths(values, apps)
+    redis_paths = redis_authenticated_paths(values, apps, runtime)
     checks["C064"] = {
         "status": "pass",
         "dataContentProfile": profile["profile"],
         "expectedPathCount": len(redis_paths),
         "applicationPaths": redis_paths,
     }
-    checks["C061"] = {"status": "pass", **indexed["checks"]["C061"]}
-    checks["C062"] = {"status": "pass", **indexed["checks"]["C062"]}
     checks["C069"] = {
         "status": "pass",
-        "stableDokployIds": indexed["stableDokployIds"],
-        "noDuplicateResources": indexed["noDuplicateResources"],
-        "secondPassNoChange": indexed["secondPassNoChange"],
-        "componentCount": indexed["componentCount"],
-        "inventoryIdentitySha256": indexed["inventoryIdentitySha256"],
-        "coverage": indexed["coverage"],
-        "evidence": str(INDEX_FINAL),
+        "contract": compose["contract"],
+        "project": compose["project"],
+        "noDuplicateResources": compose["noDuplicateServices"],
+        "componentCount": compose["serviceCount"],
+        "inventoryIdentitySha256": compose["runtimeIdentitySha256"],
+        "coverage": ["canonical-aggregate-compose", "live-runtime-labels"],
     }
     checks["C070"] = {"status": "pass", **secret_permissions_proof(manifest)}
     evidence = {
@@ -3008,17 +2784,14 @@ def main() -> int:
         choices=["preflight", "reconcile-pass", "finalize-idempotency", "apply"],
     )
     parser.add_argument("--expected-source-hash")
-    parser.add_argument("--pass-number", type=int, choices=[1, 2])
+    parser.add_argument("--pass-number", type=int, choices=(1, 2))
     args = parser.parse_args()
     try:
         if args.command in {"apply", "reconcile-pass", "finalize-idempotency"}:
             if not args.expected_source_hash:
                 raise CanaryError("hash_gate_required", "mutation requires final hash")
-        if args.command == "apply":
-            result = apply(args.expected_source_hash)
-            output = {"status": result["status"], "evidence": str(EVIDENCE)}
-        elif args.command == "reconcile-pass":
-            if not args.pass_number:
+        if args.command == "reconcile-pass":
+            if args.pass_number is None:
                 raise CanaryError(
                     "reconcile_pass_required", "--pass-number is required"
                 )
@@ -3028,12 +2801,14 @@ def main() -> int:
             )
             output = {
                 "status": result["status"],
-                "pass": args.pass_number,
                 "evidence": str(INDEX_PASS[args.pass_number]),
             }
         elif args.command == "finalize-idempotency":
             result = finalize_indexed_idempotency(args.expected_source_hash)
             output = {"status": result["status"], "evidence": str(INDEX_FINAL)}
+        elif args.command == "apply":
+            result = apply(args.expected_source_hash)
+            output = {"status": result["status"], "evidence": str(EVIDENCE)}
         else:
             output = preflight(args.expected_source_hash)
         print(json.dumps(output, sort_keys=True))

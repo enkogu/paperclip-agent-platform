@@ -28,8 +28,12 @@ def load_module(name: str, path: Path):
 
 
 platform = load_module("mte_platform", ROOT / "tools/platform-cli/platform.py")
-server_config = load_module("mte_server_config", ROOT / "tools/platform-cli/server-config.py")
-server_secrets = load_module("mte_server_secrets", ROOT / "tools/platform-cli/server-secrets.py")
+server_config = load_module(
+    "mte_server_config", ROOT / "tools/platform-cli/server-config.py"
+)
+server_secrets = load_module(
+    "mte_server_secrets", ROOT / "tools/platform-cli/server-secrets.py"
+)
 experimental = load_module(
     "mte_paperclip_experimental",
     ROOT / "tools/platform-cli/server-paperclip-experimental.py",
@@ -39,6 +43,50 @@ experimental = load_module(
 class PlatformOrchestratorTests(unittest.TestCase):
     def tearDown(self):
         platform.OPERATOR_ENV_OVERRIDE = None
+
+    def test_server_config_cli_render_reuses_its_outer_lock(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", ["server-config.py", "render"]),
+            mock.patch.object(
+                server_config, "config_lock", return_value=nullcontext(9)
+            ) as lock,
+            mock.patch.object(
+                server_config, "render", return_value={"ok": True}
+            ) as render,
+            redirect_stdout(output),
+        ):
+            server_config.main()
+
+        lock.assert_called_once_with()
+        render.assert_called_once_with(lock_fd=9)
+        self.assertEqual(json.loads(output.getvalue()), {"ok": True})
+
+    def test_profile_apply_uses_provider_canonical_workspace(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/mte-platform",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                    "excluded": [],
+                }
+            }
+        }
+        with (
+            mock.patch.object(platform, "render_profiles"),
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(platform, "ssh") as ssh,
+        ):
+            platform.apply_profiles(cfg)
+        command = ssh.call_args.args[1]
+        render = command.index("server-config.py render")
+        audit = command.index("server-config.py audit")
+        bootstrap = command.index("bootstrap-paperclip.py")
+        self.assertLess(render, audit)
+        self.assertLess(audit, bootstrap)
+        self.assertIn("--workspace-root /home/daytona/paperclip-workspace", command)
+        self.assertNotIn("/home/daytona/workspaces", command)
 
     def test_operator_env_is_explicit_and_private(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -59,6 +107,22 @@ class PlatformOrchestratorTests(unittest.TestCase):
             with self.assertRaisesRegex(platform.PlatformError, "--operator-env"):
                 platform.operator_env_path(required=True)
 
+    def test_operator_env_rejects_two_different_selected_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            first = Path(temp) / "first.env"
+            second = Path(temp) / "second.env"
+            for path in (first, second):
+                path.write_text("MTE_SSH_TARGET=root@example.test\n")
+                path.chmod(0o600)
+            platform.OPERATOR_ENV_OVERRIDE = first
+            with mock.patch.dict(
+                os.environ, {"MTE_OPERATOR_ENV": str(second)}, clear=True
+            ):
+                with self.assertRaisesRegex(
+                    platform.PlatformError, "multiple operator env files"
+                ):
+                    platform.operator_env_path(required=True)
+
     def operator_input_values(self) -> dict[str, str]:
         return {
             "MTE_SSH_TARGET": "root@198.51.100.20",
@@ -66,15 +130,27 @@ class PlatformOrchestratorTests(unittest.TestCase):
             "MTE_EXCLUDED_HOST_1": "192.0.2.20",
             "MTE_EXCLUDED_HOST_2": "192.0.2.30",
             "PLATFORM_BASE_DOMAIN": "agents.example.net",
+            "MTE_PAPERCLIP_IMAGE": "ghcr.io/example/paperclip-mte@sha256:" + "a" * 64,
+            "MTE_PAPERCLIP_FORK_SOURCE_URL": "https://github.com/example/paperclip-mte",
+            "MTE_PAPERCLIP_FORK_REVISION": "b" * 40,
+            "MTE_DAYTONA_SANDBOX_IMAGE": "ghcr.io/example/daytona@sha256:"
+            + "c" * 64,
+            "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL": "https://github.com/example/platform",
+            "MTE_DAYTONA_SANDBOX_IMAGE_REVISION": "d" * 40,
             "CLOUDFLARE_ACCOUNT_ID": "account-id-placeholder",
             "CLOUDFLARE_EMAIL": "operator@example.test",
             "CLOUDFLARE_GLOBAL_API_KEY": "global-key-placeholder",
+            "E2E_GITHUB_BASE_BRANCH": "main",
+            "E2E_GITHUB_OWNER": "example-org",
+            "E2E_GITHUB_REPOSITORY": "agent-canary",
             "GITHUB_TOKEN": "github-token-placeholder",
             "MINIMAX_API_KEY": "minimax-key-placeholder",
             "MINIMAX_BASE_URL": "https://minimax.example.test/v1",
             "MINIMAX_MODEL": "minimax-model-placeholder",
+            "MTE_ENABLE_OPERATOR_PROVIDED_PROPRIETARY_HARNESSES": "false",
             "NOTION_TOKEN": "notion-token-placeholder",
             "NOTION_ROOT_PAGE_ID": "00000000-0000-4000-8000-000000000001",
+            "CONTEXT7_API_KEY": "context7-key-must-not-be-rendered",
         }
 
     def test_single_environment_schema_is_compact_and_operator_owned(self):
@@ -85,11 +161,31 @@ class PlatformOrchestratorTests(unittest.TestCase):
             schema["canonicalRuntimeSource"],
             "/root/.config/mte-secrets/platform.env",
         )
-        self.assertTrue(schema["fillOnly"])
-        self.assertIn("CLOUDFLARE_GLOBAL_API_KEY", schema["localOnlyBootstrapKeys"])
-        self.assertNotIn(
-            "MTE_ACTIVEPIECES_WORKER_ENV_AP_FRONTEND_URL", schema["requiredKeys"]
+        self.assertEqual(schema["operatorInputs"], "reconciled")
+        self.assertIn("fill-only", schema["generatedValues"])
+        self.assertTrue(
+            {
+                "E2E_GITHUB_BASE_BRANCH",
+                "E2E_GITHUB_OWNER",
+                "E2E_GITHUB_REPOSITORY",
+            }
+            <= set(schema["requiredKeys"])
         )
+        self.assertIn("CONTEXT7_API_KEY", schema["optionalKeys"])
+        self.assertEqual(
+            set(server_config.RESOURCE_PREFLIGHT_KEYS),
+            set(schema["optionalKeys"]) & set(server_config.RESOURCE_PREFLIGHT_KEYS),
+        )
+        documented = platform.parse_dotenv(platform.CANONICAL_ENV_EXAMPLE)
+        self.assertEqual(
+            server_config.resource_preflight_values({}),
+            {key: documented[key] for key in server_config.RESOURCE_PREFLIGHT_KEYS},
+        )
+        self.assertEqual(
+            documented["CONTEXT7_API_KEY"],
+            "",
+        )
+        self.assertIn("CLOUDFLARE_GLOBAL_API_KEY", schema["localOnlyBootstrapKeys"])
 
     def test_config_check_validates_without_printing_values(self):
         values = self.operator_input_values()
@@ -104,6 +200,137 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertNotIn(values["GITHUB_TOKEN"], output.getvalue())
         self.assertNotIn(values["CLOUDFLARE_GLOBAL_API_KEY"], output.getvalue())
+        self.assertNotIn(values["CONTEXT7_API_KEY"], output.getvalue())
+
+    def test_deploy_resource_preflight_runs_after_os_proof(self):
+        args = platform.parser().parse_args(["preflight"])
+        values = self.operator_input_values()
+        cfg = {"spec": {"host": {"ssh": "root@example.test", "excluded": []}}}
+        events: list[str] = []
+
+        def ssh(_cfg, command, **_kwargs):
+            self.assertIn("/etc/os-release", command)
+            events.append("os-proof")
+            return mock.Mock(stdout='{"ssh":"ready","os":"ubuntu"}\n')
+
+        with (
+            mock.patch.object(platform, "operator_values", return_value=values),
+            mock.patch.object(platform, "validate_public_harness_enablement"),
+            mock.patch.object(platform, "config", return_value=cfg),
+            mock.patch.object(platform, "ensure_safe_target"),
+            mock.patch.object(platform, "ssh", side_effect=ssh),
+            mock.patch.object(
+                platform,
+                "run_resource_preflight",
+                side_effect=lambda _cfg, mode, **_kwargs: events.append(mode),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            platform.cmd_preflight(args)
+
+        self.assertEqual(events, ["os-proof", "deploy"])
+
+    def test_resource_preflight_streams_only_canonical_non_secret_thresholds(self):
+        cfg = {"spec": {"host": {"ssh": "root@example.test", "excluded": []}}}
+        values = self.operator_input_values()
+        with mock.patch.object(platform, "ssh") as ssh:
+            platform.run_resource_preflight(cfg, "deploy", values=values)
+
+        command = ssh.call_args.args[1]
+        self.assertIn("bash -s -- deploy", command)
+        for key in server_config.RESOURCE_PREFLIGHT_KEYS:
+            self.assertEqual(command.count(f"{key}="), 1)
+        self.assertNotIn("GITHUB_TOKEN", command)
+        self.assertEqual(
+            ssh.call_args.kwargs["input_text"],
+            platform.RESOURCE_PREFLIGHT_STEP.read_text(),
+        )
+
+    def test_daytona_e2e_resource_preflight_uses_the_same_threshold_contract(self):
+        cfg = {"spec": {"host": {"ssh": "root@example.test", "excluded": []}}}
+        values = self.operator_input_values()
+        with mock.patch.object(platform, "ssh") as ssh:
+            platform.run_resource_preflight(cfg, "daytona-e2e", values=values)
+
+        command = ssh.call_args.args[1]
+        self.assertIn("bash -s -- daytona-e2e", command)
+        for key in server_config.RESOURCE_PREFLIGHT_KEYS:
+            self.assertEqual(command.count(f"{key}="), 1)
+        self.assertNotIn("GITHUB_TOKEN", command)
+
+    def test_config_check_requires_digest_pinned_paperclip_image(self):
+        for value in ("", "ghcr.io/example/paperclip-mte:latest"):
+            with self.subTest(value=value):
+                values = self.operator_input_values()
+                values["MTE_PAPERCLIP_IMAGE"] = value
+                with self.assertRaisesRegex(
+                    platform.PlatformError,
+                    "MTE_PAPERCLIP_IMAGE|missing required keys",
+                ):
+                    platform.validate_operator_environment(
+                        values, reject_documentation_values=True
+                    )
+
+    def test_paperclip_fork_provenance_is_canonical_before_bootstrap(self):
+        valid_source = "https://github.com/example/paperclip-mte"
+        valid_revision = "b" * 40
+        server_config.validate_paperclip_fork_evidence(valid_source, valid_revision)
+
+        invalid = (
+            ("MTE_PAPERCLIP_FORK_SOURCE_URL", "http://github.com/example/paperclip-mte"),
+            ("MTE_PAPERCLIP_FORK_SOURCE_URL", "HTTPS://github.com/example/paperclip-mte"),
+            ("MTE_PAPERCLIP_FORK_SOURCE_URL", "https://operator@github.com/example/paperclip-mte"),
+            ("MTE_PAPERCLIP_FORK_SOURCE_URL", "https://github.com/example/paperclip-mte#release"),
+            ("MTE_PAPERCLIP_FORK_REVISION", "B" * 40),
+            ("MTE_PAPERCLIP_FORK_REVISION", "b" * 39),
+        )
+        for key, value in invalid:
+            with self.subTest(key=key, value=value):
+                values = self.operator_input_values()
+                values[key] = value
+                with self.assertRaisesRegex(platform.PlatformError, key):
+                    platform.validate_operator_environment(
+                        values, reject_documentation_values=True
+                    )
+
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            bootstrap_values = {
+                "MTE_PAPERCLIP_IMAGE": "ghcr.io/example/paperclip-mte@sha256:"
+                + "a" * 64,
+                "MTE_PAPERCLIP_FORK_SOURCE_URL": "http://github.com/example/paperclip-mte",
+                "MTE_PAPERCLIP_FORK_REVISION": valid_revision,
+            }
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=({"MTE_PAPERCLIP_IMAGE"}, {}, {}),
+                ),
+                self.assertRaisesRegex(
+                    server_config.ConfigError, "MTE_PAPERCLIP_FORK_SOURCE_URL"
+                ),
+            ):
+                server_config.init_source(bootstrap_values)
+            self.assertFalse(canonical.exists())
+
+        args = platform.parser().parse_args(["bootstrap"])
+        values = self.operator_input_values()
+        values["MTE_PAPERCLIP_FORK_REVISION"] = "B" * 40
+        with (
+            mock.patch.object(platform, "operator_values", return_value=values),
+            mock.patch.object(platform, "run_host_bootstrap") as host_bootstrap,
+            mock.patch.object(platform, "sync") as sync,
+            self.assertRaisesRegex(platform.PlatformError, "MTE_PAPERCLIP_FORK_REVISION"),
+        ):
+            platform.cmd_bootstrap(args)
+        host_bootstrap.assert_not_called()
+        sync.assert_not_called()
 
     def test_config_check_rejects_missing_or_unchanged_documentation_inputs(self):
         values = self.operator_input_values()
@@ -126,6 +353,27 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 documented, reject_documentation_values=True
             )
 
+    def test_operator_env_rejects_unsafe_github_e2e_target(self):
+        invalid_values = (
+            ("E2E_GITHUB_OWNER", "-unsafe-owner"),
+            ("E2E_GITHUB_REPOSITORY", "unsafe/repository"),
+            ("E2E_GITHUB_BASE_BRANCH", "release/../unsafe"),
+            ("E2E_GITHUB_BASE_BRANCH", "release branch"),
+            ("E2E_GITHUB_BASE_BRANCH", "HEAD"),
+            ("E2E_GITHUB_BASE_BRANCH", "release/-unsafe"),
+        )
+        for key, value in invalid_values:
+            with self.subTest(key=key, value=value):
+                values = self.operator_input_values()
+                values[key] = value
+                with self.assertRaisesRegex(platform.PlatformError, "E2E_GITHUB"):
+                    platform.validate_operator_environment(
+                        values, reject_documentation_values=False
+                    )
+
+        target = server_config.validate_e2e_github_target(self.operator_input_values())
+        self.assertEqual(target["E2E_GITHUB_BASE_BRANCH"], "main")
+
     def test_dotenv_parser_does_not_merge_ambient_secrets(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "platform.env"
@@ -135,6 +383,173 @@ class PlatformOrchestratorTests(unittest.TestCase):
             ):
                 values = platform.local_dotenv(path)
         self.assertEqual(values, {"MTE_SSH_TARGET": "root@example.test"})
+
+    def test_selected_dotenv_replaces_conflicting_ambient_operator_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operator.env"
+            path.write_text(
+                "MTE_SSH_TARGET=root@selected.example.test\n"
+                "PLATFORM_BASE_DOMAIN=selected.example.test\n"
+                "GITHUB_TOKEN=selected-token\n"
+            )
+            path.chmod(0o600)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MTE_SSH_TARGET": "root@ambient.example.test",
+                    "PLATFORM_BASE_DOMAIN": "ambient.example.test",
+                    "GITHUB_TOKEN": "ambient-token",
+                    "CONTEXT7_API_KEY": "ambient-only-token",
+                },
+                clear=True,
+            ):
+                platform.activate_operator_environment(path)
+                self.assertEqual(
+                    os.environ["MTE_SSH_TARGET"], "root@selected.example.test"
+                )
+                self.assertEqual(
+                    os.environ["PLATFORM_BASE_DOMAIN"], "selected.example.test"
+                )
+                self.assertEqual(os.environ["GITHUB_TOKEN"], "selected-token")
+                self.assertNotIn("CONTEXT7_API_KEY", os.environ)
+
+    def test_selected_dotenv_clears_ambient_domain_aliases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operator.env"
+            path.write_text("PLATFORM_BASE_DOMAIN=selected.example.test\n")
+            path.chmod(0o600)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MTE_DOMAIN": "ambient.example.test",
+                    "PLATFORM_DOMAIN": "ambient.example.test",
+                    "CLOUDFLARE_BASE_DOMAIN": "ambient.example.test",
+                },
+                clear=True,
+            ):
+                platform.activate_operator_environment(path)
+                self.assertEqual(
+                    os.environ["PLATFORM_BASE_DOMAIN"], "selected.example.test"
+                )
+                for alias in platform.server_config_contract().DOMAIN_INPUT_ALIASES:
+                    self.assertNotIn(alias, os.environ)
+
+    def test_operator_env_rejects_legacy_domain_aliases(self):
+        values = self.operator_input_values()
+        values["MTE_DOMAIN"] = values["PLATFORM_BASE_DOMAIN"]
+        with self.assertRaisesRegex(
+            platform.PlatformError, "legacy domain aliases are not accepted"
+        ):
+            platform.validate_operator_environment(
+                values, reject_documentation_values=False
+            )
+
+    def test_domain_override_rejects_selected_dotenv_conflict_without_values(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operator.env"
+            path.write_text(
+                "MTE_SSH_TARGET=root@selected.example.test\n"
+                "MTE_EXCLUDED_HOST_1=192.0.2.10\n"
+                "MTE_EXCLUDED_HOST_2=192.0.2.11\n"
+                "PLATFORM_BASE_DOMAIN=selected.example.test\n"
+            )
+            path.chmod(0o600)
+            platform.OPERATOR_ENV_OVERRIDE = path
+            raw = {
+                "spec": {
+                    "host": {
+                        "sshRef": "MTE_SSH_TARGET",
+                        "rootRef": "MTE_PLATFORM_ROOT",
+                        "secretsRootRef": "MTE_SECRETS_ROOT",
+                        "excludedRefs": [
+                            "MTE_EXCLUDED_HOST_1",
+                            "MTE_EXCLUDED_HOST_2",
+                        ],
+                    },
+                    "domainRef": "PLATFORM_BASE_DOMAIN",
+                }
+            }
+            seeds = {
+                "MTE_PLATFORM_ROOT": "/opt/mte-platform",
+                "MTE_SECRETS_ROOT": "/root/.config/mte-secrets",
+            }
+            with (
+                mock.patch.object(platform, "load_yaml", return_value=raw),
+                mock.patch.object(platform, "bootstrap_seeds", return_value=seeds),
+            ):
+                with self.assertRaisesRegex(
+                    platform.PlatformError, "--domain conflicts"
+                ) as raised:
+                    platform.config("different.example.test")
+        self.assertNotIn("selected.example.test", str(raised.exception))
+        self.assertNotIn("different.example.test", str(raised.exception))
+
+    def test_selected_dotenv_uses_canonical_roots_and_ports_not_ambient(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "operator.env"
+            path.write_text(
+                "MTE_SSH_TARGET=root@selected.example.test\n"
+                "MTE_EXCLUDED_HOST_1=192.0.2.10\n"
+                "MTE_EXCLUDED_HOST_2=192.0.2.11\n"
+                "PLATFORM_BASE_DOMAIN=selected.example.test\n"
+            )
+            path.chmod(0o600)
+            platform.OPERATOR_ENV_OVERRIDE = path
+            raw = {
+                "spec": {
+                    "host": {
+                        "sshRef": "MTE_SSH_TARGET",
+                        "rootRef": "MTE_PLATFORM_ROOT",
+                        "secretsRootRef": "MTE_SECRETS_ROOT",
+                        "excludedRefs": [
+                            "MTE_EXCLUDED_HOST_1",
+                            "MTE_EXCLUDED_HOST_2",
+                        ],
+                    },
+                    "domainRef": "PLATFORM_BASE_DOMAIN",
+                }
+            }
+            seeds = {
+                "MTE_PLATFORM_ROOT": "/opt/mte-platform",
+                "MTE_SECRETS_ROOT": "/root/.config/mte-secrets",
+                "POSTGREST_PORT_1_MAPPING": "127.0.0.1:13000:3000",
+            }
+            observed_values = {}
+            data_contract = mock.Mock()
+
+            def resolve_from_paths(_raw, _lock, values, **_kwargs):
+                observed_values.update(values)
+                return {}
+
+            data_contract.resolve_from_paths.side_effect = resolve_from_paths
+            with (
+                mock.patch.object(platform, "load_yaml", side_effect=[raw, {}]),
+                mock.patch.object(platform, "bootstrap_seeds", return_value=seeds),
+                mock.patch.object(
+                    platform, "data_content_contract", return_value=data_contract
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "MTE_PLATFORM_ROOT": "/ambient/platform",
+                        "MTE_SECRETS_ROOT": "/ambient/secrets",
+                        "POSTGREST_PORT_1_MAPPING": "0.0.0.0:9999:3000",
+                    },
+                    clear=False,
+                ),
+            ):
+                cfg = platform.config()
+
+        self.assertEqual(cfg["spec"]["host"]["root"], "/opt/mte-platform")
+        self.assertEqual(
+            cfg["spec"]["host"]["secretsRoot"],
+            "/root/.config/mte-secrets",
+        )
+        self.assertEqual(
+            observed_values["POSTGREST_PORT_1_MAPPING"],
+            "127.0.0.1:13000:3000",
+        )
+        self.assertNotIn("/ambient/", json.dumps(cfg))
 
     def test_standalone_bootstrap_imports_operator_env_before_finish(self):
         args = platform.parser().parse_args(["bootstrap"])
@@ -167,6 +582,164 @@ class PlatformOrchestratorTests(unittest.TestCase):
         ):
             platform.cmd_bootstrap(args)
         self.assertEqual(events, ["host", "config-init", "finish"])
+
+    def test_finish_bootstrap_only_initializes_canonical_compose_configuration(self):
+        cfg = {
+            "spec": {"host": {"ssh": "root@example.test", "root": "/opt/mte-platform"}}
+        }
+        commands: list[str] = []
+        with (
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(
+                platform,
+                "ssh",
+                side_effect=lambda _cfg, command, **_kwargs: commands.append(command),
+            ),
+        ):
+            platform.finish_platform_bootstrap(cfg)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("server-config.py", commands[0])
+        self.assertNotIn("server-dokploy.py", commands[0])
+        self.assertNotIn("settings.isCloud", commands[0])
+
+    def test_host_bootstrap_seed_allowlist_exactly_matches_host_installer(self):
+        source = (ROOT / "deployment/steps/host.sh").read_text().splitlines()
+        consumed = {
+            line.split("canonical_value ", 1)[1].split(")", 1)[0]
+            for line in source
+            if "=$(canonical_value " in line
+        }
+        self.assertEqual(consumed, set(platform.HOST_BOOTSTRAP_SEED_KEYS))
+        seeds = platform.host_bootstrap_seeds()
+        self.assertEqual(set(seeds), consumed)
+        self.assertTrue(all(seeds.values()))
+        self.assertFalse(
+            set(seeds)
+            & (
+                set(server_config.REQUIRED_OPERATOR_ENV_KEYS)
+                | set(server_config.OPTIONAL_OPERATOR_INPUT_KEYS)
+                | set(server_config.OPTIONAL_EMPTY_KEYS)
+            )
+        )
+        self.assertFalse(
+            [key for key in seeds if server_config.SENSITIVE_KEY_PATTERN.search(key)]
+        )
+
+    def test_host_bootstrap_env_is_stdin_only_fill_only_and_private(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                }
+            }
+        }
+        with mock.patch.object(platform, "ssh") as ssh:
+            platform.materialize_host_bootstrap_env(cfg)
+
+        command = ssh.call_args.args[1]
+        payload = ssh.call_args.kwargs["input_text"]
+        values = dict(line.split("=", 1) for line in payload.splitlines())
+        self.assertEqual(values, platform.host_bootstrap_seeds())
+        self.assertNotIn("GITHUB_TOKEN", payload)
+        self.assertNotIn("MINIMAX_API_KEY", payload)
+        self.assertTrue(all(not key.startswith("DOKPLOY_") for key in values))
+        self.assertNotIn("DOKPLOY_", command)
+        self.assertIn('if (current == "") print key "=" incoming[key]', command)
+        self.assertIn("else print $0", command)
+        self.assertIn("for (position = 1; position <= count; position++)", command)
+        self.assertIn('chmod 0700 "$secret_root"', command)
+        self.assertIn('chmod 0600 "$canonical"', command)
+        self.assertNotIn('cat "$canonical"', command)
+        subprocess.run(["/bin/sh", "-n", "-c", command], check=True)
+
+    def test_host_bootstrap_merge_awk_is_portable(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                }
+            }
+        }
+        command = platform.host_bootstrap_env_command(cfg)
+        start = command.index("awk -F= '\n    NR == FNR {") + len("awk -F= '")
+        end = command.index('\' "$incoming" "$existing" >"$merged"', start)
+        merge_program = command[start:end]
+        self.assertNotIn("for (index", merge_program)
+        subprocess.run(
+            ["awk", "-F=", merge_program, "/dev/null", "/dev/null"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_host_bootstrap_materializes_frozen_contract_before_script(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                    "excluded": [],
+                }
+            }
+        }
+        source = Path("/tmp/frozen-host.sh")
+        contract = Path("/tmp/frozen-server-config.py")
+        events: list[str] = []
+        with (
+            mock.patch.object(platform, "ensure_safe_target"),
+            mock.patch.object(
+                platform,
+                "materialize_host_bootstrap_env",
+                side_effect=lambda _cfg, *, contract_source: events.append(
+                    f"env:{contract_source}"
+                ),
+            ),
+            mock.patch.object(
+                platform,
+                "scp",
+                side_effect=lambda _cfg, local, remote: events.append(
+                    f"scp:{local}:{remote}"
+                ),
+            ),
+            mock.patch.object(
+                platform,
+                "ssh",
+                side_effect=lambda *_args, **_kwargs: events.append("execute"),
+            ),
+        ):
+            platform.run_host_bootstrap(
+                cfg,
+                source=source,
+                contract_source=contract,
+            )
+        self.assertEqual(
+            events,
+            [
+                f"env:{contract}",
+                f"scp:{source}:/tmp/mte-platform-host.sh",
+                "execute",
+            ],
+        )
+
+    def test_host_bootstrap_seeds_are_loaded_from_requested_contract(self):
+        contract = mock.Mock()
+        contract.ONE_TIME_MIGRATION_SEEDS = {
+            key: f"value-{index}"
+            for index, key in enumerate(sorted(platform.HOST_BOOTSTRAP_SEED_KEYS), 1)
+        }
+        contract.REQUIRED_OPERATOR_ENV_KEYS = set()
+        contract.OPTIONAL_OPERATOR_INPUT_KEYS = set()
+        contract.OPTIONAL_EMPTY_KEYS = set()
+        contract.SENSITIVE_KEY_PATTERN = server_config.SENSITIVE_KEY_PATTERN
+        source = Path("/tmp/frozen-server-config.py")
+        with mock.patch.object(
+            platform, "server_config_contract", return_value=contract
+        ) as loader:
+            seeds = platform.host_bootstrap_seeds(contract_source=source)
+        loader.assert_called_once_with(source)
+        self.assertEqual(seeds, contract.ONE_TIME_MIGRATION_SEEDS)
 
     def test_config_init_materializes_one_canonical_source_before_render(self):
         cfg = {
@@ -244,6 +817,47 @@ class PlatformOrchestratorTests(unittest.TestCase):
             with self.assertRaisesRegex(platform.PlatformError, "cannot be combined"):
                 platform.cmd_verify(mixed)
 
+    def test_acceptance_cli_exports_registry_and_checks_remote_acceptance(self):
+        exported = platform.parser().parse_args(["acceptance", "export"])
+        with (
+            mock.patch.object(
+                platform,
+                "load_yaml",
+                return_value={"kind": "ReleaseEvidenceRegistry", "requirements": []},
+            ),
+            mock.patch("sys.stdout"),
+        ):
+            platform.cmd_acceptance(exported)
+
+        checked = platform.parser().parse_args(["acceptance", "check"])
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/agent-platform",
+                }
+            }
+        }
+        with (
+            mock.patch.object(platform, "load_yaml"),
+            mock.patch.object(platform, "config", return_value=cfg),
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(platform, "ssh") as ssh,
+        ):
+            platform.cmd_acceptance(checked)
+        self.assertIn("server-verify.py acceptance", ssh.call_args.args[1])
+
+    def test_removed_full_deploy_flags_are_rejected(self):
+        for arguments in (
+            ["deploy"],
+            ["deploy", "postgres"],
+            ["deploy", "--all"],
+            ["deploy", "--resume", "run-12345678"],
+            ["plan", "--all"],
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                platform.parser().parse_args(arguments)
+
     def provider_manifest(self, profile: str = "postgres-notion") -> dict:
         manifest = yaml.safe_load((ROOT / "config/platform.yaml").read_text())
         manifest["_resolvedDataContentPlane"] = {
@@ -270,26 +884,21 @@ class PlatformOrchestratorTests(unittest.TestCase):
         active = platform.components(manifest)
         active_ids = {row["id"] for row in active}
         self.assertIn("postgrest", active_ids)
-        self.assertNotIn("baserow", active_ids)
-        self.assertNotIn("wikijs", active_ids)
-        self.assertNotIn("nocodb", active_ids)
-        self.assertTrue(
-            next(row for row in active if row["id"] == "postgrest")["required"]
+        self.assertEqual(
+            {
+                row["id"]
+                for row in manifest["spec"]["components"]
+                if "enabledForProfiles" in row
+            },
+            {"postgrest"},
         )
         self.assertTrue(
-            next(
-                row for row in manifest["spec"]["components"] if row["id"] == "nocodb"
-            )["required"]
+            next(row for row in active if row["id"] == "postgrest")["required"]
         )
         ordered_ids = [row["id"] for row in platform.component_order(manifest, None)]
         self.assertEqual(active_ids, set(ordered_ids))
 
     def test_provider_manifest_rejects_missing_and_ambiguous_mappings(self):
-        missing_profile = self.provider_manifest()
-        del missing_profile["spec"]["providerProfiles"]["baserow-wikijs"]
-        with self.assertRaisesRegex(platform.PlatformError, "missing=baserow-wikijs"):
-            platform.provider_profile_catalog(missing_profile)
-
         missing = self.provider_manifest()
         missing["spec"]["providerProfiles"]["postgres-notion"]["providerIds"].remove(
             "notion"
@@ -318,9 +927,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
         postgrest = next(
             row for row in incomplete["spec"]["components"] if row["id"] == "postgrest"
         )
-        postgrest["enabledForProfiles"].remove("baserow-wikijs")
+        postgrest["enabledForProfiles"].remove("postgres-notion")
         with self.assertRaisesRegex(
-            platform.PlatformError, "enabledForProfiles mapping is incomplete"
+            platform.PlatformError, "enabledForProfiles must be a unique non-empty"
         ):
             platform.provider_profile_catalog(incomplete)
 
@@ -332,14 +941,14 @@ class PlatformOrchestratorTests(unittest.TestCase):
             platform.components(unknown)
 
         incompatible = self.provider_manifest()
-        activepieces = next(
+        postgrest = next(
             row
             for row in incompatible["spec"]["components"]
-            if row["id"] == "activepieces"
+            if row["id"] == "postgrest"
         )
-        activepieces["dependsOn"].append("nocodb")
+        postgrest["dependsOn"].append("unknown-component")
         with self.assertRaisesRegex(
-            platform.PlatformError, "unavailable dependencies: nocodb"
+            platform.PlatformError, "unavailable dependencies: unknown-component"
         ):
             platform.provider_profile_catalog(incompatible)
 
@@ -370,7 +979,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertEqual(rsync[:2], ["rsync", "-e"])
         self.assertEqual(shlex.split(rsync[2]), ["ssh", *expected_options])
 
-    def test_ssh_scp_and_deploy_lock_use_shared_keepalive_transport(self):
+    def test_ssh_and_scp_use_shared_keepalive_transport(self):
         cfg = {
             "spec": {
                 "host": {
@@ -393,19 +1002,6 @@ class PlatformOrchestratorTests(unittest.TestCase):
             expected_scp_prefix,
         )
 
-        process = mock.Mock()
-        process.stdout.readline.return_value = "MTE_DEPLOY_LOCKED\n"
-        process.wait.return_value = 0
-        with mock.patch.object(
-            platform.subprocess, "Popen", return_value=process
-        ) as popen:
-            with platform.remote_deploy_lock(cfg):
-                pass
-        self.assertEqual(
-            popen.call_args.args[0][: len(expected_prefix)],
-            expected_prefix,
-        )
-
     def test_ssh_exports_no_bytecode_environment_for_child_python(self):
         cfg = {"spec": {"host": {"ssh": "root@example.test"}}}
         child = "import os; print(os.environ['PYTHONDONTWRITEBYTECODE'])"
@@ -416,9 +1012,10 @@ class PlatformOrchestratorTests(unittest.TestCase):
 
         command = run.call_args.args[0]
         wrapped = command[-1]
+        expected_script = f"export PYTHONDONTWRITEBYTECODE=1;\n{original}"
         self.assertEqual(
             wrapped,
-            f"export PYTHONDONTWRITEBYTECODE=1;\n{original}",
+            f"bash -c {shlex.quote(expected_script)}",
         )
         result = subprocess.run(
             ["/bin/sh", "-c", wrapped],
@@ -429,148 +1026,12 @@ class PlatformOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "1")
 
-    def test_nocodocs_license_gate_uses_canonical_presence_only(self):
-        command_env = dict(os.environ)
-
-        def local_ssh(
-            _cfg,
-            command,
-            *,
-            check=True,
-            input_text=None,
-            capture_output=False,
-        ):
-            return subprocess.run(
-                command,
-                shell=True,
-                check=check,
-                text=True,
-                input=input_text,
-                capture_output=capture_output,
-                env=command_env,
-            )
-
-        with tempfile.TemporaryDirectory() as temp:
-            fake_bin = Path(temp) / "bin"
-            fake_bin.mkdir()
-            stat = fake_bin / "stat"
-            stat.write_text(
-                "#!/usr/bin/env python3\n"
-                "import os, sys\n"
-                "value = os.stat(sys.argv[3])\n"
-                "if sys.argv[2] == '%u':\n"
-                "    print(value.st_uid)\n"
-                "elif sys.argv[2] == '%a':\n"
-                "    print(format(value.st_mode & 0o777, 'o'))\n"
-                "else:\n"
-                "    raise SystemExit(2)\n"
-            )
-            stat.chmod(0o700)
-            command_env["PATH"] = str(fake_bin) + os.pathsep + command_env["PATH"]
-            secret_root = Path(temp) / "secrets"
-            secret_root.mkdir()
-            canonical = secret_root / "platform.env"
-
-            def fixture(profile=platform.NOCODOCS_LICENSED_PROFILE):
-                return {
-                    "_resolvedDataContentPlane": {"profile": profile},
-                    "spec": {
-                        "host": {
-                            "ssh": "root@example.test",
-                            "root": "/opt/mte-platform",
-                            "secretsRoot": str(secret_root),
-                            "excluded": [],
-                        }
-                    },
-                }
-
-            with mock.patch.object(platform, "ssh", side_effect=local_ssh):
-                # Missing canonical source and a canonical source with neither
-                # selector nor key both resolve to the reviewed source default.
-                with self.assertRaises(platform.PreMutationGateError) as absent:
-                    platform.pre_mutation_license_gate(fixture())
-                self.assertEqual(absent.exception.code, "business_license_required")
-                self.assertEqual(
-                    absent.exception.result,
-                    {
-                        "profile": platform.NOCODOCS_LICENSED_PROFILE,
-                        "licenseKey": "missing",
-                    },
-                )
-
-                canonical.write_text("# no selector and no license\n")
-                canonical.chmod(0o600)
-                with self.assertRaises(platform.PreMutationGateError) as defaulted:
-                    platform.pre_mutation_license_gate(fixture())
-                self.assertEqual(defaulted.exception.code, "business_license_required")
-
-                canonical.write_text(
-                    "DATA_CONTENT_PROFILE="
-                    + platform.NOCODOCS_LICENSED_PROFILE
-                    + "\nNOCODB_LICENSE_KEY=   \n"
-                )
-                canonical.chmod(0o600)
-                with self.assertRaises(platform.PreMutationGateError) as empty:
-                    platform.pre_mutation_license_gate(fixture())
-                self.assertEqual(empty.exception.code, "business_license_required")
-
-                canonical.write_text(
-                    "DATA_CONTENT_PROFILE="
-                    + platform.NOCODOCS_LICENSED_PROFILE
-                    + "\nNOCODB_LICENSE_KEY=''\n"
-                )
-                canonical.chmod(0o600)
-                with self.assertRaises(platform.PreMutationGateError) as quoted_empty:
-                    platform.pre_mutation_license_gate(fixture())
-                self.assertEqual(
-                    quoted_empty.exception.code, "business_license_required"
-                )
-
-                sentinel = "unit-license-value-must-never-cross-ssh"
-                canonical.write_text(
-                    "DATA_CONTENT_PROFILE="
-                    + platform.NOCODOCS_LICENSED_PROFILE
-                    + "\nNOCODB_LICENSE_KEY="
-                    + sentinel
-                    + "\n"
-                )
-                canonical.chmod(0o600)
-                result = platform.pre_mutation_license_gate(fixture())
-                self.assertEqual(
-                    result,
-                    {
-                        "profile": platform.NOCODOCS_LICENSED_PROFILE,
-                        "licenseKey": "present",
-                    },
-                )
-                self.assertNotIn(sentinel, json.dumps(result))
-
-                # An exact, explicitly selected rollback profile does not need
-                # the NocoDB Business key.
-                canonical.write_text("DATA_CONTENT_PROFILE=baserow-wikijs\n")
-                canonical.chmod(0o600)
-                self.assertEqual(
-                    platform.pre_mutation_license_gate(fixture("baserow-wikijs")),
-                    {"profile": "baserow-wikijs", "licenseKey": "not-required"},
-                )
-
-                canonical.write_text(
-                    "DATA_CONTENT_PROFILE=postgres-postgrest-nocodb-nocodocs\n"
-                )
-                self.assertEqual(
-                    platform.pre_mutation_license_gate(
-                        fixture(platform.DEFAULT_DATA_CONTENT_PROFILE)
-                    ),
-                    {
-                        "profile": platform.DEFAULT_DATA_CONTENT_PROFILE,
-                        "licenseKey": "not-required",
-                    },
-                )
-
     def test_existing_install_imports_reviewed_operator_and_notion_values(self):
         token = "unit-prin7r-notion-token-must-not-appear-in-commands"
         generic_token = "unit-generic-notion-token-must-not-cross-ssh"
         api_key_fallback = "unit-prin7r-api-key-must-not-cross-ssh"
+        context7_key = "unit-context7-key-must-not-appear-in-command"
+        telegram_token = "unit-telegram-token-must-not-appear-in-command"
         commands = []
 
         def fake_ssh(
@@ -604,6 +1065,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
             "NOTION_TABLE_DATA_SOURCE_ID": "managed-data-source",
             "NOTION_WORKSPACE_ID": "managed-workspace",
             "NOTION_BOT_ID": "managed-bot",
+            "CONTEXT7_API_KEY": context7_key,
+            "PRIN7R_HERMES_TELEGRAM_BOT_TOKEN": telegram_token,
+            "HERMES_TELEGRAM_ALLOWED_USERS": "123456789",
             "PRIN7R_NOTION_PAGE_ID": "broad-parent-must-not-be-upgrade-imported",
             "MTE_OPERATOR_SSH_CIDRS": "203.0.113.9/32",
             "PLATFORM_BASE_DOMAIN": "example.test",
@@ -613,10 +1077,13 @@ class PlatformOrchestratorTests(unittest.TestCase):
         with (
             mock.patch.object(platform, "ssh", side_effect=fake_ssh),
             mock.patch.object(platform, "sync"),
-            mock.patch.object(platform, "operator_values", return_value=local_values),
+            mock.patch.object(
+                platform, "operator_values", return_value=local_values
+            ) as operator_values,
         ):
             platform.ensure_config_initialized(cfg)
 
+        operator_values.assert_called_once_with(required=True)
         imported = json.loads(commands[1][1])
         self.assertEqual(
             imported,
@@ -627,6 +1094,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "NOTION_TABLE_DATA_SOURCE_ID": "managed-data-source",
                 "NOTION_WORKSPACE_ID": "managed-workspace",
                 "NOTION_BOT_ID": "managed-bot",
+                "CONTEXT7_API_KEY": context7_key,
+                "HERMES_TELEGRAM_BOT_TOKEN": telegram_token,
+                "HERMES_TELEGRAM_ALLOWED_USERS": "123456789",
                 "MTE_OPERATOR_SSH_CIDRS": "203.0.113.9/32",
                 "PLATFORM_BASE_DOMAIN": "example.test",
             },
@@ -634,6 +1104,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertNotIn(token, "\n".join(command for command, _ in commands))
         self.assertNotIn(generic_token, json.dumps(commands))
         self.assertNotIn(api_key_fallback, json.dumps(commands))
+        self.assertNotIn(context7_key, "\n".join(command for command, _ in commands))
+        self.assertNotIn(telegram_token, "\n".join(command for command, _ in commands))
+        self.assertNotIn("PRIN7R_HERMES_TELEGRAM_BOT_TOKEN", json.dumps(commands))
         self.assertNotIn("UNRELATED_SECRET", json.dumps(commands))
         self.assertNotIn("CLOUDFLARE_GLOBAL_API_KEY", json.dumps(commands))
 
@@ -680,6 +1153,9 @@ class PlatformOrchestratorTests(unittest.TestCase):
                     "declared_keys",
                     return_value=(required, {}, seeds),
                 ),
+                mock.patch.object(
+                    server_config, "compose_seed_catalog", return_value={}
+                ),
                 mock.patch.object(Path, "stat", root_owned_stat),
             ):
                 result = server_config.init_source(
@@ -717,14 +1193,162 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertNotIn("PRIN7R_NOTION_API_KEY", values)
         self.assertNotIn(token, json.dumps(result))
 
-    def test_nonempty_canonical_notion_token_is_never_overwritten(self):
-        canonical_token = "unit-canonical-token-preserved"
+    def test_fresh_config_initialization_materializes_daytona_nonsecret_contract(self):
+        keys = {
+            "DAYTONA_DB_USER",
+            "MTE_DAYTONA_API_IMAGE",
+            "MTE_DAYTONA_CODING_SNAPSHOT",
+            "MTE_DAYTONA_NETWORK",
+            "MTE_CODEX_VERSION",
+            "MTE_CONTEXT7_MCP_URL",
+            "MTE_DOCKER_LOG_MAX_FILES",
+            "MTE_DOCKER_LOG_MAX_SIZE",
+            "MTE_GITHUB_CLI_VERSION",
+            "MTE_TOOLHIVE_VERSION",
+        }
+        seeds = {key: server_config.ONE_TIME_MIGRATION_SEEDS[key] for key in keys}
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=(keys, {}, seeds),
+                ),
+                mock.patch.object(
+                    server_config, "compose_seed_catalog", return_value={}
+                ),
+            ):
+                result = server_config.init_source({})
+                values = server_config.parse_env(canonical)
+
+        self.assertEqual({key: values[key] for key in keys}, seeds)
+        self.assertEqual(result["missingKeys"], [])
+        self.assertNotIn("MTE_DAYTONA_SANDBOX_IMAGE", values)
+        self.assertNotIn("MTE_DAYTONA_CODING_IMAGE", values)
+
+    def test_optional_context7_input_reconciles_and_results_are_redacted(self):
+        first_key = "unit-context7-first-key"
+        replacement_key = "unit-context7-replacement"
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            github_target = {
+                "E2E_GITHUB_BASE_BRANCH": "main",
+                "E2E_GITHUB_OWNER": "example-org",
+                "E2E_GITHUB_REPOSITORY": "agent-canary",
+            }
+            required = {"CONTEXT7_API_KEY", *github_target}
+            seeds = {
+                "CONTEXT7_API_KEY": "",
+                **github_target,
+            }
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=(required, {}, seeds),
+                ),
+                mock.patch.object(
+                    server_config, "compose_seed_catalog", return_value={}
+                ),
+                mock.patch.object(Path, "stat", root_owned_stat),
+            ):
+                anonymous = server_config.init_source(
+                    {"CONTEXT7_API_KEY": "", **github_target}
+                )
+                self.assertEqual(
+                    server_config.parse_env(canonical)["CONTEXT7_API_KEY"], ""
+                )
+                configured = server_config.init_source(
+                    {"CONTEXT7_API_KEY": first_key, **github_target}
+                )
+                self.assertEqual(
+                    server_config.parse_env(canonical)["CONTEXT7_API_KEY"], first_key
+                )
+                repeated = server_config.init_source(
+                    {"CONTEXT7_API_KEY": replacement_key, **github_target}
+                )
+                final_values = server_config.parse_env(canonical)
+
+        self.assertEqual(final_values["CONTEXT7_API_KEY"], replacement_key)
+        self.assertEqual(repeated["reconciledOperatorKeys"], ["CONTEXT7_API_KEY"])
+        rendered_results = json.dumps([anonymous, configured, repeated])
+        self.assertNotIn(first_key, rendered_results)
+        self.assertNotIn(replacement_key, rendered_results)
+
+    def test_operator_ssh_allowlist_reconciles_from_explicit_normalized_input(self):
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            canonical.write_text("MTE_OPERATOR_SSH_CIDRS=203.0.113.10/32\n")
+            canonical.chmod(0o600)
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=({"MTE_OPERATOR_SSH_CIDRS"}, {}, {}),
+                ),
+                mock.patch.object(
+                    server_config, "compose_seed_catalog", return_value={}
+                ),
+                mock.patch.object(Path, "stat", root_owned_stat),
+            ):
+                result = server_config.init_source(
+                    {"MTE_OPERATOR_SSH_CIDRS": "203.0.113.10/32,203.0.113.11/32"}
+                )
+                values = server_config.parse_env(canonical)
+
+        self.assertEqual(
+            values["MTE_OPERATOR_SSH_CIDRS"],
+            "203.0.113.10/32,203.0.113.11/32",
+        )
+        self.assertEqual(result["reconciledOperatorKeys"], ["MTE_OPERATOR_SSH_CIDRS"])
+
+    def test_operator_credentials_reconcile_but_provisioned_and_generated_stay_fill_only(
+        self,
+    ):
+        canonical_token = "unit-canonical-token"
+        replacement_token = "unit-replacement-token"
+        generated_secret = "unit-generated-secret-preserved"
+        provisioned_id = "unit-provisioned-id-preserved"
         with tempfile.TemporaryDirectory() as temp:
             canonical = Path(temp) / "platform.env"
             canonical.write_text(
                 "DATA_CONTENT_PROFILE=postgres-notion\n"
                 f"NOTION_TOKEN={canonical_token}\n"
                 "NOTION_ROOT_PAGE_ID=unit-root\n"
+                f"NOTION_DOCUMENTS_PAGE_ID={provisioned_id}\n"
+                f"PAPERCLIP_AUTH_SECRET={generated_secret}\n"
             )
             canonical.chmod(0o600)
             original_stat = Path.stat
@@ -739,6 +1363,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "DATA_CONTENT_PROFILE",
                 "NOTION_ROOT_PAGE_ID",
                 "NOTION_TOKEN",
+                "NOTION_DOCUMENTS_PAGE_ID",
+                "PAPERCLIP_AUTH_SECRET",
             }
             with (
                 mock.patch.object(server_config, "SOURCE", canonical),
@@ -755,17 +1381,23 @@ class PlatformOrchestratorTests(unittest.TestCase):
             ):
                 result = server_config.init_source(
                     {
-                        "NOTION_TOKEN": "unit-wrong-generic",
-                        "PRIN7R_NOTION_API_KEY": "unit-wrong-api-key",
-                        "PRIN7R_NOTION_TOKEN": "unit-wrong-preferred",
+                        "NOTION_TOKEN": "unit-generic-token",
+                        "PRIN7R_NOTION_API_KEY": "unit-api-key",
+                        "PRIN7R_NOTION_TOKEN": replacement_token,
+                        "NOTION_DOCUMENTS_PAGE_ID": "unit-replacement-id",
+                        "PAPERCLIP_AUTH_SECRET": "unit-replacement-generated-secret",
                     }
                 )
                 values = server_config.parse_env(canonical)
 
-        self.assertEqual(values["NOTION_TOKEN"], canonical_token)
+        self.assertEqual(values["NOTION_TOKEN"], replacement_token)
+        self.assertEqual(values["NOTION_DOCUMENTS_PAGE_ID"], provisioned_id)
+        self.assertEqual(values["PAPERCLIP_AUTH_SECRET"], generated_secret)
         self.assertNotIn("PRIN7R_NOTION_TOKEN", values)
         self.assertNotIn("PRIN7R_NOTION_API_KEY", values)
         self.assertNotIn(canonical_token, json.dumps(result))
+        self.assertNotIn(replacement_token, json.dumps(result))
+        self.assertNotIn(generated_secret, json.dumps(result))
 
     def test_renderer_hardens_registered_secret_projections_and_lock_aliases(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
@@ -801,7 +1433,208 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(secret_root.stat().st_mode & 0o777, 0o700)
             self.assertEqual(service_root.stat().st_mode & 0o777, 0o700)
 
-    def test_default_profile_excludes_dormant_provider_service_projections(self):
+    def test_renderer_removes_only_unregistered_legacy_secret_projections(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            secret_root = Path(temporary) / "secrets"
+            secret_root.mkdir()
+            canonical = secret_root / "platform.env"
+            canonical.write_text("canonical-test-only\n")
+            registered = secret_root / "claude.env"
+            unregistered = {
+                secret_root / "activepieces-admin.env",
+                secret_root / "orloj.env",
+            }
+            unrelated = secret_root / "keep.env"
+            for path in {registered, unrelated, *unregistered}:
+                path.write_text("projection-test-only\n")
+
+            original_lstat = Path.lstat
+
+            def root_owned_lstat(path, *args, **kwargs):
+                value = original_lstat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                fields[5] = 0
+                return os.stat_result(fields)
+
+            manifest = {"projections": [{"path": str(registered)}]}
+            with (
+                mock.patch.object(server_config, "SECRET_ROOT", secret_root),
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(Path, "lstat", root_owned_lstat),
+            ):
+                removed = server_config.remove_unregistered_legacy_secret_projections(
+                    manifest
+                )
+
+            self.assertEqual(set(removed), unregistered)
+            self.assertTrue(canonical.is_file())
+            self.assertTrue(registered.is_file())
+            self.assertTrue(unrelated.is_file())
+            self.assertTrue(all(not path.exists() for path in unregistered))
+
+    def test_renderer_removes_exact_empty_legacy_secret_directory(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            secret_root = Path(temporary) / "secrets"
+            legacy = secret_root / "services/daytona-runtime.env"
+            unrelated = secret_root / "services/keep.env"
+            legacy.mkdir(parents=True)
+            unrelated.mkdir()
+            canonical = secret_root / "platform.env"
+            canonical.write_text("canonical-test-only\n")
+
+            original_lstat = Path.lstat
+
+            def root_owned_lstat(path, *args, **kwargs):
+                value = original_lstat(path, *args, **kwargs)
+                if Path(path) == legacy:
+                    fields = list(value)
+                    fields[4] = 0
+                    fields[5] = 0
+                    return os.stat_result(fields)
+                return value
+
+            with (
+                mock.patch.object(server_config, "SECRET_ROOT", secret_root),
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(Path, "lstat", root_owned_lstat),
+            ):
+                removed = server_config.remove_unregistered_legacy_secret_projections(
+                    {"projections": []}
+                )
+
+            self.assertEqual(removed, [legacy])
+            self.assertFalse(legacy.exists())
+            self.assertTrue(unrelated.is_dir())
+            self.assertTrue(canonical.is_file())
+
+    def test_renderer_refuses_nonempty_legacy_secret_directory(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            secret_root = Path(temporary) / "secrets"
+            legacy = secret_root / "services/daytona-runtime.env"
+            legacy.mkdir(parents=True)
+            legacy.joinpath("unexpected").write_text("preserve-me\n")
+            canonical = secret_root / "platform.env"
+            canonical.write_text("canonical-test-only\n")
+
+            original_lstat = Path.lstat
+
+            def root_owned_lstat(path, *args, **kwargs):
+                value = original_lstat(path, *args, **kwargs)
+                if Path(path) == legacy:
+                    fields = list(value)
+                    fields[4] = 0
+                    fields[5] = 0
+                    return os.stat_result(fields)
+                return value
+
+            with (
+                mock.patch.object(server_config, "SECRET_ROOT", secret_root),
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(Path, "lstat", root_owned_lstat),
+                self.assertRaisesRegex(
+                    server_config.ConfigError, "artifact directory is not empty"
+                ),
+            ):
+                server_config.remove_unregistered_legacy_secret_projections(
+                    {"projections": []}
+                )
+
+            self.assertTrue(legacy.joinpath("unexpected").is_file())
+            self.assertTrue(canonical.is_file())
+
+    def test_renderer_legacy_secret_cleanup_fails_closed_for_symlink(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            secret_root = Path(temporary) / "secrets"
+            secret_root.mkdir()
+            canonical = secret_root / "platform.env"
+            canonical.write_text("canonical-test-only\n")
+            safe_candidate = secret_root / "activepieces-admin.env"
+            safe_candidate.write_text("projection-test-only\n")
+            unsafe_candidate = secret_root / "claude.env"
+            unsafe_candidate.symlink_to(canonical)
+
+            original_lstat = Path.lstat
+
+            def root_owned_lstat(path, *args, **kwargs):
+                value = original_lstat(path, *args, **kwargs)
+                if Path(path) == safe_candidate:
+                    fields = list(value)
+                    fields[4] = 0
+                    fields[5] = 0
+                    return os.stat_result(fields)
+                return value
+
+            with (
+                mock.patch.object(server_config, "SECRET_ROOT", secret_root),
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(Path, "lstat", root_owned_lstat),
+                self.assertRaisesRegex(server_config.ConfigError, "not a regular file"),
+            ):
+                server_config.remove_unregistered_legacy_secret_projections(
+                    {"projections": []}
+                )
+
+            self.assertTrue(safe_candidate.is_file())
+            self.assertTrue(unsafe_candidate.is_symlink())
+            self.assertTrue(canonical.is_file())
+
+    def test_renderer_legacy_secret_cleanup_rejects_non_root_owner(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            secret_root = Path(temporary) / "secrets"
+            secret_root.mkdir()
+            canonical = secret_root / "platform.env"
+            canonical.write_text("canonical-test-only\n")
+            candidate = secret_root / "activepieces-admin.env"
+            candidate.write_text("projection-test-only\n")
+
+            original_lstat = Path.lstat
+
+            def non_root_lstat(path, *args, **kwargs):
+                value = original_lstat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 1000
+                fields[5] = 1000
+                return os.stat_result(fields)
+
+            with (
+                mock.patch.object(server_config, "SECRET_ROOT", secret_root),
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(Path, "lstat", non_root_lstat),
+                self.assertRaisesRegex(server_config.ConfigError, "not root-owned"),
+            ):
+                server_config.remove_unregistered_legacy_secret_projections(
+                    {"projections": []}
+                )
+
+            self.assertTrue(candidate.is_file())
+            self.assertTrue(canonical.is_file())
+
+    def test_renderer_legacy_secret_cleanup_never_removes_canonical_source(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            secret_root = Path(temporary) / "secrets"
+            secret_root.mkdir()
+            canonical = secret_root / "platform.env"
+            canonical.write_text("canonical-test-only\n")
+            with (
+                mock.patch.object(server_config, "SECRET_ROOT", secret_root),
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(
+                    server_config,
+                    "LEGACY_SECRET_PROJECTION_RELATIVE_PATHS",
+                    ("platform.env",),
+                ),
+                self.assertRaisesRegex(
+                    server_config.ConfigError, "allowlist is unsafe"
+                ),
+            ):
+                server_config.remove_unregistered_legacy_secret_projections(
+                    {"projections": []}
+                )
+
+            self.assertTrue(canonical.is_file())
+
+    def test_default_profile_declares_active_provider_service_projection(self):
         cfg = {
             "spec": {
                 "components": [
@@ -819,9 +1652,6 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertIn("NOTION_TOKEN", required)
         self.assertIn("NOTION_ROOT_PAGE_ID", required)
         self.assertIn("notion", service_keys)
-        self.assertNotIn("baserow", service_keys)
-        self.assertNotIn("wikijs", service_keys)
-        self.assertNotIn("nocodb", service_keys)
 
     def test_template_sync_render_template_sync_keeps_runtime_projections_clean(self):
         """A repeated source sync must never overwrite a rendered projection."""
@@ -829,10 +1659,11 @@ class PlatformOrchestratorTests(unittest.TestCase):
             root = Path(temp) / "platform"
             secret_root = Path(temp) / "secrets"
             config_source = root / "templates/platform.json"
-            compose_source = root / "templates/deploy/demo.compose.yaml"
+            compose_source = root / "deployment/services/demo/compose.yaml"
+            aggregate_compose = root / "deployment/compose.yaml"
             profile_source = root / "templates/profiles/profiles.yaml"
             runtime_config = root / "config/platform.json"
-            runtime_compose = root / "runtime/deploy/demo.compose.yaml"
+            runtime_compose = root / "runtime/deploy/demo.yaml"
             runtime_profile = root / "runtime/profiles/profiles.yaml"
             data_content_projection = root / "config/data-content-plane.json"
             platform_lock_source = root / "templates/platform.lock.yaml"
@@ -851,7 +1682,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
                             "components": [
                                 {
                                     "id": "demo",
-                                    "compose": "deploy/demo.compose.yaml",
+                                    "compose": "deployment/services/demo/compose.yaml",
                                     "exposure": {
                                         "subdomainRef": "DEMO_SUBDOMAIN",
                                         "originPortRef": "DEMO_PORT",
@@ -873,6 +1704,13 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 sort_keys=False,
             )
             compose_source.write_text(compose_text)
+            aggregate_compose.write_text(
+                "services:\n"
+                "  demo:\n"
+                "    extends:\n"
+                "      file: services/demo/compose.yaml\n"
+                "      service: demo\n"
+            )
             profile_source.write_text(profile_text)
             platform_lock_source.write_text("spec: {}\n")
 
@@ -881,6 +1719,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "SECRET_ROOT": secret_root,
                 "SOURCE": canonical,
                 "MANIFEST": manifest,
+                "COMPOSE_ENV": secret_root / "compose.env",
+                "AGGREGATE_COMPOSE": aggregate_compose,
                 "LOCK": secret_root / ".platform-env.lock",
                 "CONFIG_SOURCE": config_source,
                 "CONFIG": runtime_config,
@@ -940,18 +1780,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
                         "DEMO_IMAGE": "example/demo@sha256:" + "1" * 64,
                         "DEMO_PORT": "12345",
                         "DEMO_SUBDOMAIN": "demo",
-                        "AP_REDIS_PASSWORD": "unit-test-only",
-                        "BASEROW_DB_HOST": "mte-postgres",
-                        "BASEROW_DB_NAME": "baserow",
-                        "BASEROW_DB_PASSWORD": "unit-test-only",
-                        "BASEROW_DB_PORT": "5432",
-                        "BASEROW_DB_USER": "baserow",
-                        "BASEROW_REDIS_DB": "8",
-                        "BASEROW_REDIS_HOST": "redis",
-                        "BASEROW_REDIS_PASSWORD": "unit-test-only",
-                        "BASEROW_REDIS_PORT": "6379",
                         "CLOUDFLARE_API_TOKEN": "unit-test-only",
-                        "PLATFORM_BASE_DOMAIN": "prin7r.com",
+                        "PLATFORM_BASE_DOMAIN": "agents.example.test",
                     }
                 )
                 server_config.write_env(canonical, values)
@@ -1008,7 +1838,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             rendered = json.loads(runtime_config.read_text())
             self.assertEqual(
                 rendered["spec"]["components"][0]["compose"],
-                "runtime/deploy/demo.compose.yaml",
+                "runtime/deploy/demo.yaml",
             )
             self.assertTrue(
                 {
@@ -1034,10 +1864,35 @@ class PlatformOrchestratorTests(unittest.TestCase):
             }
         }
         commands = []
+        uploaded_paths = []
+        uploaded_manifests = []
         remote_commands = []
+
+        def capture_upload(command, **_kwargs):
+            commands.append(command)
+            source = Path(command[-2])
+            uploaded_paths.append(
+                {
+                    path.relative_to(source).as_posix()
+                    for path in source.rglob("*")
+                    if path.is_file()
+                }
+            )
+            uploaded_manifests.append(
+                (source / platform.SYNC_MANIFEST_NAME).read_text()
+            )
+
         with (
             tempfile.TemporaryDirectory() as temp,
-            mock.patch.object(platform, "ROOT", Path(temp)),
+            mock.patch.object(
+                platform, "local_evidence_root", return_value=Path(temp) / "evidence"
+            ),
+            mock.patch.object(
+                platform.uuid,
+                "uuid4",
+                side_effect=[mock.Mock(hex="first"), mock.Mock(hex="second")],
+            ),
+            mock.patch.object(platform.fcntl, "flock") as local_locks,
             mock.patch.object(
                 platform,
                 "ssh",
@@ -1048,78 +1903,67 @@ class PlatformOrchestratorTests(unittest.TestCase):
             mock.patch.object(
                 platform,
                 "run",
-                side_effect=lambda command, **_kwargs: commands.append(command),
+                side_effect=capture_upload,
             ),
         ):
             platform.sync(cfg)
             platform.sync(cfg)
-        destinations = "\n".join(
-            item
-            for command in commands
-            for item in command
-            if isinstance(item, str) and "root@example.test:" in item
-        )
-        stage = "/opt/mte-platform/.sync-staging"
-        self.assertIn(stage + "/templates/deploy/", destinations)
-        self.assertIn(stage + "/templates/profiles/", destinations)
-        self.assertIn(stage + "/templates/platform.json", destinations)
-        self.assertIn(stage + "/templates/compose-seeds.lock.json", destinations)
-        self.assertIn(stage + "/steps/", destinations)
-        self.assertIn(
-            stage + "/runtime/paperclip/scripts/bootstrap-paperclip.py",
-            destinations,
-        )
-        self.assertIn(
-            stage + "/runtime/paperclip/scripts/profile_catalog.py",
-            destinations,
-        )
-        self.assertIn(
-            stage + "/runtime/paperclip/profiles/instructions/",
-            destinations,
-        )
-        self.assertIn(
-            stage + "/runtime/paperclip/scripts/integration_canary.py",
-            destinations,
-        )
-        self.assertIn(
-            stage + "/bin/server-observability-canary.py",
-            destinations,
-        )
-        self.assertIn(
-            stage + "/bin/server-host-dokploy-acceptance.py",
-            destinations,
-        )
-        self.assertIn(
-            stage + "/bin/server-integration-canaries.py",
-            destinations,
-        )
-        self.assertNotIn("/opt/mte-platform/runtime/deploy/", destinations)
-        self.assertNotIn("/opt/mte-platform/runtime/profiles/", destinations)
-        self.assertNotIn("/opt/mte-platform/config/platform.json", destinations)
-        self.assertNotIn("projections-manifest.json", destinations)
-        pushes = [
-            command
-            for command in commands
-            if command
-            and command[0] == "rsync"
-            and any(
-                isinstance(item, str) and item.startswith("root@example.test:")
-                for item in command
-            )
+        stages = [
+            "/opt/mte-platform/.sync-staging-first",
+            "/opt/mte-platform/.sync-staging-second",
         ]
-        self.assertTrue(pushes)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(
+            [call.args[1] for call in local_locks.call_args_list],
+            [
+                platform.fcntl.LOCK_EX,
+                platform.fcntl.LOCK_UN,
+                platform.fcntl.LOCK_EX,
+                platform.fcntl.LOCK_UN,
+            ],
+        )
+        self.assertTrue(
+            [command[-1] for command in commands]
+            == [f"root@example.test:{stage}/" for stage in stages]
+        )
+        self.assertTrue(all("--delete" in command for command in commands))
+        expected_paths = {
+            "deployment/compose.yaml",
+            "templates/profiles/profiles.yaml",
+            "runtime/paperclip/profiles/skills/verification-before-completion/SKILL.md",
+            "templates/platform.json",
+            "templates/compose-seeds.lock.json",
+            "config/acceptance-requirements.yaml",
+            "runtime/paperclip/scripts/bootstrap-paperclip.py",
+            "runtime/paperclip/scripts/profile_catalog.py",
+            "runtime/paperclip/scripts/integration_canary.py",
+            "bin/server-observability-canary.py",
+            "bin/server-integration-canaries.py",
+            platform.SYNC_MANIFEST_NAME,
+        }
+        self.assertTrue(all(expected_paths.issubset(paths) for paths in uploaded_paths))
         self.assertTrue(
             all(
-                any(
-                    isinstance(item, str)
-                    and item.startswith("root@example.test:" + stage + "/")
-                    for item in command
-                )
-                for command in pushes
+                "templates/profiles/catalog.yaml" not in paths
+                for paths in uploaded_paths
             )
         )
-        self.assertTrue(all("--chown=root:root" not in command for command in pushes))
-        self.assertTrue(all("-rtz" in command for command in pushes))
+        self.assertTrue(
+            all(
+                not any(path.startswith("runtime/deploy/") for path in paths)
+                for paths in uploaded_paths
+            )
+        )
+        self.assertTrue(
+            all("config/platform.json" not in paths for paths in uploaded_paths)
+        )
+        self.assertTrue(
+            all("projections-manifest.json" not in paths for paths in uploaded_paths)
+        )
+        self.assertTrue(all("-rtz" in command for command in commands))
+        for manifest in uploaded_manifests:
+            manifest_paths = [line.split("  ", 1)[1] for line in manifest.splitlines()]
+            self.assertEqual(manifest_paths, sorted(manifest_paths))
         ownership_gates = [
             command for command in remote_commands if "chown -R root:root" in command
         ]
@@ -1137,7 +1981,16 @@ class PlatformOrchestratorTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            all('rm -rf "$root/patches"' in command for command in ownership_gates)
+            all(
+                "deployment/scripts/support" not in command
+                for command in ownership_gates
+            )
+        )
+        self.assertTrue(
+            all('"$root/patches"' not in command for command in ownership_gates)
+        )
+        self.assertTrue(
+            all('rm -rf "$root/patches"' not in command for command in ownership_gates)
         )
         self.assertTrue(
             all(
@@ -1147,184 +2000,102 @@ class PlatformOrchestratorTests(unittest.TestCase):
             )
         )
         self.assertTrue(
+            all(
+                'lock="$root/.sync.lock"; : > "$lock"; chown root:root "$lock"; '
+                'chmod 0600 "$lock"; exec 9>"$lock"; flock -x 9' in command
+                for command in ownership_gates
+            )
+        )
+        self.assertTrue(
             all('rm -rf "$stage"' in command for command in ownership_gates)
         )
+        self.assertTrue(
+            all(
+                command.index("sha256sum -c") < command.index("chown -R root:root")
+                and f"rm -f {platform.SYNC_MANIFEST_NAME}" in command
+                for command in ownership_gates
+            )
+        )
+        self.assertTrue(
+            all(
+                "support/paperclip/package-lock.json" not in command
+                and "support/daytona/package-lock.json" not in command
+                for command in ownership_gates
+            )
+        )
 
-    def test_active_full_deploy_sync_only_verifies_frozen_transaction(self):
-        transaction = mock.Mock()
-        original = platform.ACTIVE_DEPLOY_TRANSACTION
-        platform.ACTIVE_DEPLOY_TRANSACTION = transaction
-        try:
-            with (
-                mock.patch.object(platform, "run") as run,
-                mock.patch.object(platform, "ssh") as ssh,
-            ):
-                platform.sync({})
-                platform.sync({}, render_projections=False)
-        finally:
-            platform.ACTIVE_DEPLOY_TRANSACTION = original
-        self.assertEqual(transaction.ensure_synced.call_count, 2)
-        run.assert_not_called()
-        ssh.assert_not_called()
-
-    def _transaction_fixture(self, root):
-        source = root / "source"
-        helper = source / "bin/server-deploy-transaction.py"
-        helper.parent.mkdir(parents=True)
-        helper.write_text("# governed helper\n")
-        snapshot = mock.Mock()
-        snapshot.source = source
-        snapshot.source_sha256 = "a" * 64
-        snapshot.release_id = "release-12345678"
-        snapshot.verify = mock.Mock()
-        cfg = {
-            "spec": {
-                "host": {
-                    "ssh": "root@example.test",
-                    "root": "/opt/agent-platform",
+    def test_sync_manifest_failure_prevents_live_tree_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "platform"
+            cfg = {
+                "spec": {
+                    "host": {
+                        "ssh": "root@example.test",
+                        "root": str(root),
+                        "excluded": [],
+                    }
                 }
             }
-        }
-        return platform.DeployTransaction(cfg, snapshot, "run-12345678", attempt=1)
+            remote_commands = []
+            with (
+                mock.patch.object(
+                    platform,
+                    "local_evidence_root",
+                    return_value=Path(temp) / "evidence",
+                ),
+                mock.patch.object(
+                    platform,
+                    "ssh",
+                    side_effect=lambda _cfg, command, **_kwargs: remote_commands.append(
+                        command
+                    ),
+                ),
+                mock.patch.object(
+                    platform.uuid, "uuid4", return_value=mock.Mock(hex="test-stage")
+                ),
+                mock.patch.object(platform, "run"),
+            ):
+                platform.sync(cfg)
 
-    @staticmethod
-    def _remote_json(**payload):
-        return subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=json.dumps({"ok": True, **payload}) + "\n",
-            stderr="",
-        )
+            live = root / "bin/proof.txt"
+            live.parent.mkdir(parents=True)
+            live.write_text("live\n")
+            stage = root / ".sync-staging-test-stage"
+            stage.mkdir()
+            (stage / "proof.txt").write_text("tampered\n")
+            expected = hashlib.sha256(b"expected\n").hexdigest()
+            (stage / platform.SYNC_MANIFEST_NAME).write_text(f"{expected}  proof.txt\n")
+            result = subprocess.run(
+                ["bash", "-c", remote_commands[-1]], capture_output=True, text=True
+            )
 
-    def test_promotion_lost_ack_accepts_authoritative_current_activation(self):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(live.read_text(), "live\n")
+
+            (stage / platform.SYNC_MANIFEST_NAME).write_text("")
+            omitted_result = subprocess.run(
+                ["bash", "-c", remote_commands[-1]], capture_output=True, text=True
+            )
+            self.assertNotEqual(omitted_result.returncode, 0)
+            self.assertEqual(live.read_text(), "live\n")
+
+    def test_sync_bundle_rejects_symlinks_and_special_files(self):
         with tempfile.TemporaryDirectory() as temp:
-            transaction = self._transaction_fixture(Path(temp))
-            observed = []
+            root = Path(temp)
+            source = root / "source"
+            source.mkdir()
+            regular = source / "regular.txt"
+            regular.write_text("regular\n")
+            link = source / "link.txt"
+            link.symlink_to(regular)
+            with self.assertRaisesRegex(platform.PlatformError, "special file"):
+                platform._copy_sync_tree(source, root / "link-bundle")
 
-            def remote(_cfg, command, **_kwargs):
-                observed.append(command)
-                if " promote " in command:
-                    raise subprocess.CalledProcessError(255, command)
-                if " inspect-activation " in command:
-                    return self._remote_json(
-                        status="current",
-                        activationId=transaction.activation_id,
-                        current=True,
-                        currentActivationId=transaction.activation_id,
-                        currentStatus="active",
-                        journalStatus="active",
-                        releaseId=transaction.release_id,
-                        sourceSha256="a" * 64,
-                    )
-                if " verify-current " in command:
-                    return self._remote_json(
-                        status="active",
-                        sourceSha256="a" * 64,
-                        fileCount=1,
-                    )
-                self.fail(f"unexpected remote command: {command}")
-
-            with mock.patch.object(platform, "ssh", side_effect=remote):
-                result = transaction.promote()
-
-        self.assertTrue(transaction.promoted)
-        self.assertTrue(result["current"])
-        self.assertEqual(sum(" inspect-activation " in row for row in observed), 1)
-        self.assertEqual(sum(" verify-current " in row for row in observed), 1)
-
-    def test_interrupted_rollback_retries_while_activation_is_current(self):
-        with tempfile.TemporaryDirectory() as temp:
-            transaction = self._transaction_fixture(Path(temp))
-            transaction.promoted = True
-            rollback_attempts = 0
-
-            def remote(_cfg, command, **_kwargs):
-                nonlocal rollback_attempts
-                if " rollback-if-current " in command:
-                    rollback_attempts += 1
-                    if rollback_attempts == 1:
-                        raise subprocess.CalledProcessError(255, command)
-                    return self._remote_json(
-                        action="rolledBack",
-                        status="rolledBack",
-                        activationId=transaction.activation_id,
-                        sourceSha256="a" * 64,
-                    )
-                if " inspect-activation " in command:
-                    return self._remote_json(
-                        status="current",
-                        activationId=transaction.activation_id,
-                        current=True,
-                        currentActivationId=transaction.activation_id,
-                        currentStatus="active",
-                        journalStatus="active",
-                        releaseId=transaction.release_id,
-                        sourceSha256="a" * 64,
-                    )
-                self.fail(f"unexpected remote command: {command}")
-
-            with mock.patch.object(platform, "ssh", side_effect=remote):
-                result = transaction.rollback()
-
-        self.assertEqual(rollback_attempts, 2)
-        self.assertEqual(result["action"], "rolledBack")
-        self.assertFalse(transaction.promoted)
-
-    def test_lost_rollback_ack_is_proved_by_remote_journal(self):
-        with tempfile.TemporaryDirectory() as temp:
-            transaction = self._transaction_fixture(Path(temp))
-
-            def remote(_cfg, command, **_kwargs):
-                if " rollback-if-current " in command:
-                    raise subprocess.CalledProcessError(255, command)
-                if " inspect-activation " in command:
-                    return self._remote_json(
-                        status="notCurrent",
-                        activationId=transaction.activation_id,
-                        current=False,
-                        currentActivationId="previous-12345678",
-                        currentStatus="active",
-                        journalStatus="rolledBack",
-                        releaseId=transaction.release_id,
-                        sourceSha256="a" * 64,
-                    )
-                self.fail(f"unexpected remote command: {command}")
-
-            with mock.patch.object(platform, "ssh", side_effect=remote):
-                result = transaction.rollback()
-
-        self.assertEqual(result["action"], "alreadyRolledBack")
-
-    def test_failed_checkpoint_does_not_skip_authoritative_rollback(self):
-        transaction = mock.Mock()
-        transaction.checkpoint.side_effect = platform.PlatformError(
-            "checkpoint unavailable"
-        )
-        transaction.rollback.return_value = {
-            "action": "rolledBack",
-            "status": "rolledBack",
-            "activationId": "run-12345678-a1",
-        }
-
-        checkpoint, rollback = platform.best_effort_transaction_failure(
-            transaction,
-            failed_step="daytona",
-            live_mutation_possible=True,
-        )
-
-        transaction.rollback.assert_called_once_with()
-        self.assertEqual(checkpoint["status"], "failed")
-        self.assertEqual(checkpoint["errorType"], "PlatformError")
-        self.assertEqual(rollback["status"], "completed")
-        self.assertEqual(rollback["authoritativeState"], "rolled-back")
-
-    def test_non_current_activation_never_claims_completed_rollback(self):
-        evidence = platform.authoritative_source_rollback_evidence(
-            {"action": "notCurrent", "current": False},
-            live_mutation_possible=False,
-        )
-        self.assertEqual(evidence["status"], "not-required")
-        self.assertEqual(evidence["authoritativeState"], "not-current")
+            link.unlink()
+            fifo = source / "pipe"
+            os.mkfifo(fifo)
+            with self.assertRaisesRegex(platform.PlatformError, "special file"):
+                platform._copy_sync_tree(source, root / "fifo-bundle")
 
     def test_sync_rsync_flags_are_supported_by_local_client(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1343,7 +2114,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(copied, "portable\n")
 
-    def test_secret_mutation_paths_render_and_audit_before_dokploy(self):
+    def test_secret_mutation_renders_and_audits_without_deployment(self):
         cfg = {
             "spec": {
                 "host": {
@@ -1369,20 +2140,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertIn("server-config.py render", calls[1])
         self.assertIn("server-config.py audit", calls[1])
 
-        calls.clear()
-        with (
-            mock.patch.object(platform, "sync"),
-            mock.patch.object(
-                platform,
-                "ssh",
-                side_effect=lambda _cfg, command, **_kwargs: calls.append(command),
-            ),
-        ):
-            platform.deploy_components(cfg, None)
-        self.assertIn("server-secrets.py init", calls[0])
-        self.assertIn("server-config.py render", calls[1])
-        self.assertIn("server-config.py audit", calls[2])
-        self.assertIn("server-dokploy.py deploy demo", calls[3])
+        self.assertFalse(hasattr(platform, "deploy_components"))
+        self.assertFalse(hasattr(platform, "cmd_deploy"))
 
     def test_integration_canary_orchestrator_accepts_c029_persistence_probe(self):
         cfg = {
@@ -1450,21 +2209,127 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertIn("cloudflare-token-bootstrap.py", " ".join(observed[1][1]))
         ssh.assert_not_called()
 
+    def test_cloudflare_dns_reconciler_uses_canonical_inputs_and_tunnel_output(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/mte-platform",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                    "excluded": [],
+                }
+            }
+        }
+        with mock.patch.object(platform, "tofu_command", return_value="tofu-output"):
+            command = platform.cloudflare_dns_command(
+                cfg,
+                "/root/.config/mte-secrets/cloudflare/iac",
+                "/root/.config/mte-secrets/cloudflare/api.env",
+                "verify",
+            )
+        self.assertIn('tunnel_id=$(tofu-output); test -n "$tunnel_id"', command)
+        self.assertIn(
+            "python3 /opt/mte-platform/bin/server-cloudflare-dns.py verify", command
+        )
+        self.assertIn("--env-file /root/.config/mte-secrets/platform.env", command)
+        self.assertIn(
+            "--tfvars /root/.config/mte-secrets/cloudflare/iac/terraform.tfvars.json",
+            command,
+        )
+        self.assertIn('--tunnel-id "$tunnel_id"', command)
+        self.assertIn(
+            "--output /opt/mte-platform/evidence/cloudflare-dns-reconcile.json",
+            command,
+        )
+
+    def test_cloudflare_apply_runs_the_edge_reconciler_after_iac(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/mte-platform",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                    "excluded": [],
+                }
+            }
+        }
+        commands = []
+        tofu_calls = []
+
+        def record_tofu(*arguments):
+            tofu_calls.append(arguments)
+            return "tofu"
+
+        with (
+            mock.patch.object(platform, "cloudflare_preflight"),
+            mock.patch.object(
+                platform,
+                "prepare_cloudflare_remote",
+                return_value=(
+                    "/root/.config/mte-secrets/cloudflare",
+                    "/root/.config/mte-secrets/cloudflare/iac",
+                    "/root/.config/mte-secrets/cloudflare/api.env",
+                ),
+            ),
+            mock.patch.object(platform, "tofu_command", side_effect=record_tofu),
+            mock.patch.object(platform, "cloudflare_dns_command", return_value="dns"),
+            mock.patch.object(
+                platform,
+                "ssh",
+                side_effect=lambda _cfg, command, **_kwargs: commands.append(command),
+            ),
+        ):
+            platform.run_cloudflare(cfg, "apply")
+
+        self.assertEqual(len(commands), 2)
+        apply_call = next(call for call in tofu_calls if "apply" in call)
+        self.assertIn("-auto-approve", apply_call)
+        self.assertIn("server-cloudflare-access.py", commands[-1])
+        self.assertLess(
+            commands[-1].index("server-cloudflare-access.py"),
+            commands[-1].index("dns"),
+        )
+
+    def test_cloudflare_access_failure_never_publishes_dns(self):
+        cfg = {"spec": {}}
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "dns-published"
+            with (
+                mock.patch.object(
+                    platform, "cloudflare_access_command", return_value="false"
+                ),
+                mock.patch.object(
+                    platform,
+                    "cloudflare_dns_command",
+                    return_value=f"touch {shlex.quote(str(marker))}",
+                ),
+            ):
+                command = platform.cloudflare_edge_command(
+                    cfg, "/iac", "/api.env", "apply"
+                )
+            completed = subprocess.run(["sh", "-c", "set -e; " + command], check=False)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertFalse(marker.exists())
+
     def test_compose_seed_catalog_is_used_once_and_never_reapplied(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "platform"
             secret_root = Path(temp) / "secrets"
             config_source = root / "templates/platform.json"
-            compose_source = root / "templates/deploy/demo.compose.yaml"
+            compose_source = root / "deployment/services/demo/compose.yaml"
             catalog_source = root / "templates/compose-seeds.lock.json"
             canonical = secret_root / "platform.env"
             compose_source.parent.mkdir(parents=True)
+            config_source.parent.mkdir(parents=True)
             config_source.write_text(
                 json.dumps(
                     {
                         "spec": {
                             "components": [
-                                {"id": "demo", "compose": "deploy/demo.compose.yaml"}
+                                {
+                                    "id": "demo",
+                                    "compose": "deployment/services/demo/compose.yaml",
+                                }
                             ]
                         }
                     }
@@ -1569,15 +2434,16 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "http://toolhive:19013",
             )
 
-    def test_reviewed_compose_upgrade_fills_missing_without_overwriting(self):
+    def test_host_bootstrap_source_imports_compose_catalog_once(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "platform"
             secret_root = Path(temp) / "secrets"
             config_source = root / "templates/platform.json"
-            compose_source = root / "templates/deploy/demo.compose.yaml"
+            compose_source = root / "deployment/services/demo/compose.yaml"
             catalog_source = root / "templates/compose-seeds.lock.json"
             canonical = secret_root / "platform.env"
             compose_source.parent.mkdir(parents=True)
+            config_source.parent.mkdir(parents=True)
             secret_root.mkdir(parents=True)
             config_source.write_text(
                 json.dumps(
@@ -1586,7 +2452,294 @@ class PlatformOrchestratorTests(unittest.TestCase):
                             "components": [
                                 {
                                     "id": "demo",
-                                    "compose": "deploy/demo.compose.yaml",
+                                    "compose": "deployment/services/demo/compose.yaml",
+                                }
+                            ]
+                        }
+                    }
+                )
+            )
+            compose_source.write_text(
+                "services:\n  demo:\n    image: ${DEMO_IMAGE:?required}\n"
+            )
+            catalog_source.write_text(
+                json.dumps(
+                    {
+                        "apiVersion": "micro-task-engine/v1alpha1",
+                        "kind": "ComposeSeedCatalog",
+                        "metadata": {"contractVersion": 1, "source": "unit-test"},
+                        "seeds": {"DEMO_IMAGE": "example/demo@sha256:" + "1" * 64},
+                    }
+                )
+            )
+            canonical.write_text("MTE_DOCKER_CE_VERSION=unit-host-seed\n")
+            canonical.chmod(0o600)
+            replacements = {
+                "ROOT": root,
+                "SECRET_ROOT": secret_root,
+                "SOURCE": canonical,
+                "LOCK": secret_root / ".platform-env.lock",
+                "CONFIG_SOURCE": config_source,
+                "PROFILE_SOURCE": root / "templates/profiles/missing.json",
+                "COMPOSE_SEED_SOURCE": catalog_source,
+            }
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with ExitStack() as stack:
+                for name, value in replacements.items():
+                    stack.enter_context(mock.patch.object(server_config, name, value))
+                stack.enter_context(mock.patch.object(Path, "stat", root_owned_stat))
+                result = server_config.init_source({})
+
+            values = server_config.parse_env(canonical)
+            self.assertEqual(values["DATA_CONTENT_PROFILE"], "postgres-notion")
+            self.assertEqual(values["DEMO_IMAGE"], "example/demo@sha256:" + "1" * 64)
+            self.assertIn("DEMO_IMAGE", result["createdKeys"])
+
+    def test_existing_install_migrates_reviewed_nested_ports_through_docker_config(
+        self,
+    ):
+        daytona_upgrade_keys = {
+            "MTE_DAYTONA_API_ENV_DB_HOST",
+            "MTE_DAYTONA_API_ENV_OTEL_ENABLED",
+            "MTE_DAYTONA_API_ENV_REDIS_HOST",
+            "MTE_DAYTONA_API_PORT_1_MAPPING",
+            "MTE_DAYTONA_DEX_PORT_1_MAPPING",
+            "MTE_DAYTONA_PROXY_ENV_PREVIEW_WARNING_ENABLED",
+            "MTE_DAYTONA_PROXY_ENV_REDIS_HOST",
+            "MTE_DAYTONA_PROXY_ENV_TOOLBOX_ONLY_MODE",
+            "MTE_DAYTONA_PROXY_PORT_1_MAPPING",
+            "MTE_DAYTONA_REGISTRY_ENV_REGISTRY_STORAGE_DELETE_ENABLED",
+            "MTE_DAYTONA_RUNNER_ENV_INTER_SANDBOX_NETWORK_ENABLED",
+            "MTE_DAYTONA_RUNNER_ENV_RUNNER_DOMAIN",
+            "MTE_DAYTONA_SSH_GATEWAY_PORT_1_MAPPING",
+        }
+        self.assertEqual(len(daytona_upgrade_keys), 13)
+
+        operator_values = {
+            "MTE_DAYTONA_SANDBOX_IMAGE": "ghcr.io/example/daytona@sha256:"
+            + "c" * 64,
+            "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL": "https://github.com/example/platform",
+            "MTE_DAYTONA_SANDBOX_IMAGE_REVISION": "d" * 40,
+            "CLOUDFLARE_ACCESS_ALLOWED_EMAILS": "operator@example.test",
+            "CLOUDFLARE_ACCOUNT_ID": "unit-account",
+            "CLOUDFLARE_API_TOKEN": "unit-cloudflare-token-must-stay-redacted",
+            "CLOUDFLARE_ZONE_ID": "unit-zone",
+            "E2E_GITHUB_BASE_BRANCH": "main",
+            "E2E_GITHUB_OWNER": "example-org",
+            "E2E_GITHUB_REPOSITORY": "agent-canary",
+            "GITHUB_TOKEN": "unit-github-token-must-stay-redacted",
+            "MINIMAX_API_KEY": "unit-minimax-token-must-stay-redacted",
+            "MINIMAX_BASE_URL": "https://llm.example.test/v1",
+            "MINIMAX_MODEL": "unit-model",
+            "MTE_EXCLUDED_HOST_1": "192.0.2.10",
+            "MTE_EXCLUDED_HOST_2": "192.0.2.11",
+            "MTE_OPERATOR_SSH_CIDRS": "198.51.100.0/24",
+            "MTE_SSH_TARGET": "root@198.51.100.10",
+            "NOTION_ROOT_PAGE_ID": "00000000-0000-4000-8000-000000000001",
+            "NOTION_TOKEN": "unit-notion-token-must-stay-redacted",
+            "PLATFORM_BASE_DOMAIN": "upgrade.example.test",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            temporary = Path(temp)
+            platform_root = temporary / "platform"
+            secret_root = temporary / "secrets"
+            shutil.copytree(ROOT / "deployment", platform_root / "deployment")
+            template_root = platform_root / "templates"
+            (template_root / "profiles").mkdir(parents=True)
+            config_source = template_root / "platform.json"
+            config_source.write_text(
+                json.dumps(yaml.safe_load((ROOT / "config/platform.yaml").read_text()))
+                + "\n"
+            )
+            shutil.copy2(
+                ROOT / "config/platform.lock.yaml",
+                template_root / "platform.lock.yaml",
+            )
+            shutil.copy2(
+                ROOT / "config/compose-seeds.lock.json",
+                template_root / "compose-seeds.lock.json",
+            )
+            shutil.copy2(
+                ROOT / "config/profiles/catalog.yaml",
+                template_root / "profiles/profiles.yaml",
+            )
+            canonical = secret_root / "platform.env"
+            replacements = {
+                "ROOT": platform_root,
+                "SECRET_ROOT": secret_root,
+                "SOURCE": canonical,
+                "MANIFEST": secret_root / "projections-manifest.json",
+                "COMPOSE_ENV": secret_root / "compose.env",
+                "AGGREGATE_COMPOSE": platform_root / "deployment/compose.yaml",
+                "LOCK": secret_root / ".platform-env.lock",
+                "CONFIG_SOURCE": config_source,
+                "CONFIG": platform_root / "config/platform.json",
+                "SERVICE_ROOT": secret_root / "services",
+                "PROFILE_SOURCE": template_root / "profiles/profiles.yaml",
+                "PROFILE_RUNTIME": platform_root / "runtime/profiles/profiles.yaml",
+                "COMPOSE_SEED_SOURCE": template_root / "compose-seeds.lock.json",
+                "PLATFORM_LOCK_SOURCE": template_root / "platform.lock.yaml",
+                "PUBLIC_URLS": platform_root / "config/public-urls.json",
+                "DATA_CONTENT_PLANE": platform_root / "config/data-content-plane.json",
+                "CLOUDFLARE_APPS": secret_root / "cloudflare/apps.json",
+                "CLOUDFLARE_API_ENV": secret_root / "cloudflare/api.env",
+                "CLOUDFLARE_TUNNEL_TOKEN": secret_root / "cloudflare/tunnel-token",
+                "CLOUDFLARE_ACCESS_TOKEN": secret_root
+                / "cloudflare/access-service-token.json",
+            }
+            secret_replacements = {
+                "ROOT": platform_root,
+                "SECRET_ROOT": secret_root,
+                "PLATFORM_ENV": canonical,
+                "SERVICE_ROOT": secret_root / "services",
+                "INTEGRATION_ROOT": secret_root / "integrations",
+                "CONFIG": platform_root / "config/platform.json",
+                "CONFIG_TEMPLATE": config_source,
+                "LOCK": secret_root / ".platform-env.lock",
+            }
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with ExitStack() as stack:
+                for name, value in replacements.items():
+                    stack.enter_context(mock.patch.object(server_config, name, value))
+                for name, value in secret_replacements.items():
+                    if hasattr(server_secrets, name):
+                        stack.enter_context(
+                            mock.patch.object(server_secrets, name, value)
+                        )
+                stack.enter_context(mock.patch.object(Path, "stat", root_owned_stat))
+
+                server_config.init_source(operator_values)
+                with redirect_stdout(io.StringIO()):
+                    server_secrets.init()
+                old_values = server_config.parse_env(canonical)
+                for key in daytona_upgrade_keys:
+                    self.assertIn(key, old_values)
+                    old_values.pop(key)
+                old_values.update(
+                    server_config.REVIEWED_LEGACY_COMPOSE_VALUE_MIGRATIONS
+                )
+                for key in server_config.DERIVED_VALUE_KEYS:
+                    old_values.pop(key, None)
+                server_config.write_env(canonical, old_values)
+
+                upgraded = server_config.init_source({})
+                canonical_values = server_config.parse_env(canonical)
+                migrated_canonical = dict(canonical_values)
+                rendered = server_config.render()
+                audited = server_config.audit()
+                docker_config = None
+                if shutil.which("docker"):
+                    version = subprocess.run(
+                        ["docker", "compose", "version"],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if version.returncode == 0:
+                        docker_config = subprocess.run(
+                            [
+                                "docker",
+                                "compose",
+                                "--env-file",
+                                str(replacements["COMPOSE_ENV"]),
+                                "--file",
+                                str(replacements["AGGREGATE_COMPOSE"]),
+                                "config",
+                                "--quiet",
+                            ],
+                            env={
+                                "HOME": os.environ.get("HOME", "/tmp"),
+                                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                            },
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                        )
+                unknown_key = "MTE_FIRECRAWL_API_PORT_1_MAPPING"
+                unknown_value = "127.0.0.1:${UNREVIEWED_HOST_PORT:-13002}:3002"
+                canonical_values[unknown_key] = unknown_value
+                server_config.write_env(canonical, canonical_values)
+                unknown_upgrade = server_config.init_source({})
+                unknown_values = server_config.parse_env(canonical)
+                with self.assertRaisesRegex(
+                    server_config.ConfigError,
+                    f"aggregate Compose ref is invalid: {unknown_key}",
+                ):
+                    server_config.render()
+
+            self.assertEqual(
+                daytona_upgrade_keys,
+                daytona_upgrade_keys & set(upgraded["createdKeys"]),
+            )
+            self.assertTrue(
+                all(migrated_canonical[key] for key in daytona_upgrade_keys)
+            )
+            locked = json.loads((ROOT / "config/compose-seeds.lock.json").read_text())[
+                "seeds"
+            ]
+            legacy_keys = set(server_config.REVIEWED_LEGACY_COMPOSE_VALUE_MIGRATIONS)
+            self.assertEqual(
+                {key: migrated_canonical[key] for key in legacy_keys},
+                {key: locked[key] for key in legacy_keys},
+            )
+            self.assertTrue(legacy_keys <= set(upgraded["migratedKeys"]))
+            self.assertTrue(
+                (
+                    server_config.DERIVED_VALUE_KEYS - {"MTE_DAYTONA_PROXY_DOMAIN"}
+                ).isdisjoint(migrated_canonical)
+            )
+            self.assertEqual(
+                migrated_canonical["MTE_DAYTONA_PROXY_DOMAIN"],
+                "mte-daytona-proxy:4000",
+            )
+            for key, value in operator_values.items():
+                self.assertEqual(migrated_canonical[key], value, key)
+            self.assertGreater(rendered["projectionCount"], 0)
+            self.assertTrue(audited["ok"])
+            self.assertEqual(unknown_values[unknown_key], unknown_value)
+            self.assertNotIn(unknown_key, unknown_upgrade["migratedKeys"])
+            if docker_config is not None:
+                self.assertEqual(docker_config.returncode, 0, docker_config.stderr)
+            output = json.dumps(
+                {"init": upgraded, "render": rendered, "audit": audited}
+            )
+            for value in operator_values.values():
+                if "token" in value:
+                    self.assertNotIn(value, output)
+
+    def test_reviewed_compose_upgrade_fills_missing_without_overwriting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "platform"
+            secret_root = Path(temp) / "secrets"
+            config_source = root / "templates/platform.json"
+            compose_source = root / "deployment/services/demo/compose.yaml"
+            catalog_source = root / "templates/compose-seeds.lock.json"
+            canonical = secret_root / "platform.env"
+            compose_source.parent.mkdir(parents=True)
+            config_source.parent.mkdir(parents=True)
+            secret_root.mkdir(parents=True)
+            config_source.write_text(
+                json.dumps(
+                    {
+                        "spec": {
+                            "components": [
+                                {
+                                    "id": "demo",
+                                    "compose": "deployment/services/demo/compose.yaml",
                                     "secrets": ["DEMO_API_TOKEN"],
                                 }
                             ]
@@ -1668,18 +2821,87 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertNotIn("DEMO_IMAGE", second["createdKeys"])
             self.assertNotIn("DEMO_PORT_1_MAPPING", second["createdKeys"])
 
-    def test_reviewed_postgrest_compose_migrations_cover_catalog_prefixes(self):
+    def test_existing_env_backfills_daytona_static_compose_refs(self):
         catalog = json.loads((ROOT / "config/compose-seeds.lock.json").read_text())[
             "seeds"
         ]
+        daytona_seeds = {
+            key: value
+            for key, value in catalog.items()
+            if key.startswith("MTE_DAYTONA_")
+        }
+        self.assertEqual(len(daytona_seeds), 13)
+        required = set(daytona_seeds) | {"DATA_CONTENT_PROFILE"}
+
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            canonical.write_text("DATA_CONTENT_PROFILE=postgres-notion\n")
+            canonical.chmod(0o600)
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=(required, {}, {}),
+                ),
+                mock.patch.object(
+                    server_config,
+                    "compose_seed_catalog",
+                    return_value=daytona_seeds,
+                ),
+                mock.patch.object(Path, "stat", root_owned_stat),
+            ):
+                first = server_config.init_source({})
+                values = server_config.parse_env(canonical)
+                self.assertEqual(set(first["createdKeys"]), set(daytona_seeds))
+                self.assertEqual(first["missingKeys"], [])
+                self.assertEqual(
+                    {key: values[key] for key in daytona_seeds}, daytona_seeds
+                )
+
+                custom_key = "MTE_DAYTONA_RUNNER_ENV_RUNNER_DOMAIN"
+                missing_key = "MTE_DAYTONA_API_ENV_DB_HOST"
+                values[custom_key] = "operator-runner.example.test"
+                values.pop(missing_key)
+                server_config.write_env(canonical, values)
+                second = server_config.init_source({})
+
+            upgraded = server_config.parse_env(canonical)
+            self.assertEqual(second["createdKeys"], [missing_key])
+            self.assertEqual(upgraded[missing_key], daytona_seeds[missing_key])
+            self.assertEqual(upgraded[custom_key], "operator-runner.example.test")
+
+    def test_reviewed_compose_migrations_cover_catalog_prefixes(self):
+        catalog = json.loads((ROOT / "config/compose-seeds.lock.json").read_text())[
+            "seeds"
+        ]
+        daytona_keys = {key for key in catalog if key.startswith("MTE_DAYTONA_")}
         postgrest_keys = {
             key
             for key in catalog
             if key.startswith("MTE_POSTGREST_") or key.startswith("POSTGREST_")
         }
+        self.assertEqual(len(daytona_keys), 13)
         self.assertEqual(
             server_config.REVIEWED_COMPOSE_SEED_MIGRATIONS,
-            postgrest_keys,
+            daytona_keys
+            | postgrest_keys
+            | {
+                "MTE_FIRECRAWL_VALKEY_IMAGE",
+                "MTE_OBSERVABILITY_OTEL_COLLECTOR_PORT_1_MAPPING",
+            },
         )
 
     def test_reviewed_toolhive_runtime_values_migrate_without_overwriting_custom_value(
@@ -1760,6 +2982,46 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "TOOLHIVE_MEMORY_LIMIT",
             ],
         )
+
+    def test_retired_paperclip_installer_hash_is_removed(self):
+        old = "fec4dda76d6924bd50ddd3fbf07e8dc2d6986a70cda6b5562e101930e9a49854"
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            canonical.write_text(
+                "DATA_CONTENT_PROFILE=postgres-notion\n"
+                f"MTE_PAPERCLIP_INSTALLER_SHA256={old}\n"
+            )
+            canonical.chmod(0o600)
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=(
+                        {"DATA_CONTENT_PROFILE"},
+                        {},
+                        {},
+                    ),
+                ),
+                mock.patch.object(Path, "stat", root_owned_stat),
+            ):
+                result = server_config.init_source({})
+                values = server_config.parse_env(canonical)
+
+        self.assertNotIn("MTE_PAPERCLIP_INSTALLER_SHA256", values)
+        self.assertEqual(result["migratedKeys"], ["MTE_PAPERCLIP_INSTALLER_SHA256"])
 
     def test_notion_provision_updates_are_fill_only_and_idempotent(self):
         notion_ids = {
@@ -1962,85 +3224,86 @@ class PlatformOrchestratorTests(unittest.TestCase):
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         )
 
-    def test_full_deploy_indexes_experimental_steps_in_dependency_order(self):
-        steps = list(platform.FULL_DEPLOY_STEPS)
+    def test_projection_provision_immediately_verifies_and_persists_evidence(self):
+        class Contract:
+            @staticmethod
+            def projection_consumer_commands(_plane, action):
+                return [("server-notion-sync.py", action)]
+
+        remote_command = mock.Mock()
+        with (
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(
+                platform, "data_content_contract", return_value=Contract()
+            ),
+            mock.patch.object(platform, "resolved_data_content", return_value={}),
+            mock.patch.object(
+                platform,
+                "remote_script",
+                side_effect=lambda _cfg, name: "/opt/mte-platform/bin/" + name,
+            ),
+            mock.patch.object(platform, "ssh", remote_command),
+        ):
+            platform.run_data_content_projections({}, "provision")
+
+        command = remote_command.call_args.args[1]
+        provision = "python3 /opt/mte-platform/bin/server-notion-sync.py provision"
+        verify = "python3 /opt/mte-platform/bin/server-notion-sync.py verify"
+        self.assertEqual(command.count(provision), 1)
+        self.assertEqual(command.count(verify), 1)
+        self.assertLess(command.index(provision), command.index(verify))
+        self.assertTrue(command.startswith("set -eu; "))
+
+    def test_projection_verify_does_not_repeat_consumer_verification(self):
+        class Contract:
+            @staticmethod
+            def projection_consumer_commands(_plane, action):
+                return [("server-notion-sync.py", action)]
+
+        remote_command = mock.Mock()
+        with (
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(
+                platform, "data_content_contract", return_value=Contract()
+            ),
+            mock.patch.object(platform, "resolved_data_content", return_value={}),
+            mock.patch.object(
+                platform,
+                "remote_script",
+                side_effect=lambda _cfg, name: "/opt/mte-platform/bin/" + name,
+            ),
+            mock.patch.object(platform, "ssh", remote_command),
+        ):
+            platform.run_data_content_projections({}, "verify")
+
+        command = remote_command.call_args.args[1]
+        self.assertEqual(command.count("server-notion-sync.py verify"), 1)
+
+    def test_notion_projection_canary_is_public_and_canonical_hash_bound(self):
+        args = platform.parser().parse_args(["notion-projection", "canary"])
+        self.assertEqual(args.action, "canary")
+        commands = []
+        cfg = {"spec": {"host": {"root": "/opt/mte-platform"}}}
+        with (
+            mock.patch.object(platform, "sync") as sync,
+            mock.patch.object(
+                platform,
+                "run_canonical_hash_bound",
+                side_effect=lambda _cfg, command: commands.append(command),
+            ),
+        ):
+            platform.run_notion_projection(cfg, "canary")
+        sync.assert_called_once_with(cfg)
         self.assertEqual(
-            steps[:4],
+            commands,
             [
-                "config-initialize",
-                "config-render",
-                "config-audit",
-                "bootstrap",
+                [
+                    "python3",
+                    "/opt/mte-platform/bin/server-notion-sync.py",
+                    "canary",
+                ]
             ],
         )
-        self.assertLess(
-            steps.index("paperclip-runtime-config"), steps.index("paperclip-runtime")
-        )
-        self.assertLess(
-            steps.index("dokploy-foundation"), steps.index("application-databases")
-        )
-        self.assertLess(
-            steps.index("application-databases"), steps.index("dokploy-components")
-        )
-        self.assertLess(steps.index("paperclip-runtime"), steps.index("profiles"))
-        self.assertLess(steps.index("profiles"), steps.index("paperclip-environments"))
-        self.assertLess(
-            steps.index("paperclip-environments"), steps.index("paperclip-secrets")
-        )
-        self.assertLess(steps.index("paperclip-secrets"), steps.index("provision"))
-        self.assertLess(steps.index("provision"), steps.index("provision-idempotency"))
-        self.assertLess(
-            steps.index("provision-idempotency"),
-            steps.index("data-content-projections"),
-        )
-        self.assertLess(
-            steps.index("data-content-projections"), steps.index("kestra-control")
-        )
-        self.assertLess(steps.index("kestra-control"), steps.index("tool-bundles"))
-        self.assertLess(
-            steps.index("tool-bundles"), steps.index("tool-bundles-idempotency")
-        )
-        self.assertLess(steps.index("tool-bundles-idempotency"), steps.index("hermes"))
-        self.assertLess(steps.index("hermes"), steps.index("daytona"))
-        self.assertLess(steps.index("daytona"), steps.index("harness-auth"))
-        self.assertLess(steps.index("daytona"), steps.index("kestra-e2e-canary"))
-        self.assertLess(
-            steps.index("kestra-e2e-canary"), steps.index("profile-acceptance")
-        )
-        self.assertLess(
-            steps.index("profile-acceptance"), steps.index("integration-canaries")
-        )
-        self.assertLess(
-            steps.index("integration-canaries"), steps.index("hermes-acceptance")
-        )
-        self.assertLess(
-            steps.index("host-dokploy-acceptance"),
-            steps.index("observability-reconcile-pass-1"),
-        )
-        self.assertLess(
-            steps.index("observability-reconcile-pass-2"),
-            steps.index("observability-idempotency"),
-        )
-        self.assertLess(
-            steps.index("observability-acceptance"), steps.index("cloudflare-plan")
-        )
-        self.assertLess(steps.index("cloudflare-plan"), steps.index("cloudflare-apply"))
-        self.assertLess(
-            steps.index("cloudflare-apply"),
-            steps.index("cloudflare-origin-firewall"),
-        )
-        self.assertLess(
-            steps.index("cloudflare-origin-firewall"),
-            steps.index("post-cloudflare-evidence-rebind"),
-        )
-        self.assertLess(
-            steps.index("post-cloudflare-evidence-rebind"),
-            steps.index("cloudflare-acceptance"),
-        )
-        self.assertLess(
-            steps.index("cloudflare-acceptance"), steps.index("connections")
-        )
-        self.assertLess(steps.index("connections"), steps.index("verify"))
 
     def test_static_source_layout_is_the_only_orchestrator_input(self):
         self.assertEqual(platform.CONFIG_PATH, ROOT / "config/platform.yaml")
@@ -2052,8 +3315,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertEqual(platform.SERVICES_ROOT, ROOT / "deployment/services")
         self.assertEqual(platform.PROFILES_ROOT, ROOT / "config/profiles")
         self.assertEqual(platform.KESTRA_WORKFLOWS_ROOT, ROOT / "workflows/kestra")
-        self.assertNotIn("config-source-normalize", platform.FULL_DEPLOY_STEPS)
-
+        self.assertEqual(platform.AGENT_RUNTIME_ROOT, ROOT / "deployment/agent-runtime")
         manifest = yaml.safe_load(platform.CONFIG_PATH.read_text())
         compose_paths = [
             Path(row["compose"])
@@ -2069,75 +3331,6 @@ class PlatformOrchestratorTests(unittest.TestCase):
             )
         )
         self.assertTrue(all((ROOT / path).is_file() for path in compose_paths))
-
-    def test_release_snapshot_projects_static_layout_to_stable_server_contract(self):
-        values = platform.parse_dotenv(platform.CANONICAL_ENV_EXAMPLE)
-        values.update(platform.bootstrap_seeds())
-        with mock.patch.dict(os.environ, values, clear=True):
-            cfg = platform.config("agents.example.com")
-            snapshot = platform.ReleaseSnapshot(cfg, "unit-static-layout")
-        try:
-            expected = {
-                "templates/deploy/postgres.yaml",
-                "templates/profiles/profiles.yaml",
-                "runtime/paperclip/scripts/bootstrap-paperclip.py",
-                "runtime/paperclip/scripts/profile_catalog.py",
-                "templates/platform.lock.yaml",
-                "manifests/kestra/application.yaml",
-                "manifests/kestra/flows/control-plane.yaml",
-                "manifests/hermes/config.yaml.template",
-                "manifests/hermes/SOUL.md",
-                "manifests/hermes/hermes.service",
-                "manifests/cloudflare/main.tf",
-                "config/connections.yaml",
-                "steps/10-host.sh",
-                "steps/50-paperclip.sh",
-                "steps/60-daytona.sh",
-                "steps/90-cloudflare-tunnel.sh",
-                "steps/91-origin-firewall.sh",
-            }
-            self.assertTrue(
-                all((snapshot.source / relative).is_file() for relative in expected)
-            )
-            self.assertFalse(
-                (snapshot.source / "templates/profiles/catalog.yaml").exists()
-            )
-            catalog = yaml.safe_load(
-                (snapshot.source / "templates/profiles/profiles.yaml").read_text()
-            )
-            for profile in catalog["profiles"]:
-                relative = Path(profile["instructions"])
-                packaged = snapshot.source / "runtime/paperclip/profiles" / relative
-                canonical = platform.PROFILES_ROOT / relative
-                self.assertTrue(packaged.is_file())
-                self.assertEqual(packaged.read_bytes(), canonical.read_bytes())
-
-            isolated_env = os.environ.copy()
-            isolated_env["MTE_PROFILES_FILE"] = str(
-                snapshot.source / "templates/profiles/profiles.yaml"
-            )
-            isolated_env.pop("PYTHONPATH", None)
-            imported = subprocess.run(
-                [
-                    sys.executable,
-                    "-I",
-                    str(
-                        snapshot.source
-                        / "runtime/paperclip/scripts/bootstrap-paperclip.py"
-                    ),
-                    "--help",
-                ],
-                cwd=snapshot.root,
-                env=isolated_env,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(imported.returncode, 0, imported.stderr)
-            self.assertFalse((snapshot.source / "patches").exists())
-            snapshot.verify()
-        finally:
-            snapshot.close()
 
     def test_origin_firewall_step_applies_then_saves_redacted_status(self):
         cfg = {
@@ -2157,6 +3350,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
             in {
                 "firewallServiceActive",
                 "firewallServiceEnabled",
+                "firewallRecoveryTimerActive",
+                "firewallRecoveryTimerEnabled",
                 "firewallSshCidrsEnforced",
                 "udp443Blocked",
                 "publicTcpDefaultDenied",
@@ -2191,7 +3386,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
 
         synchronize.assert_called_once_with(cfg)
         command = remote.call_args.args[1]
-        self.assertIn("/steps/91-origin-firewall.sh", command)
+        self.assertIn("/steps/origin-firewall.sh", command)
         self.assertLess(command.index(" apply"), command.index(" status"))
         self.assertIn("cloudflare-origin-firewall.json", command)
         self.assertNotIn("MTE_OPERATOR_SSH_CIDRS", command)
@@ -2199,22 +3394,6 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertEqual(evidence_mode, 0o600)
         args = platform.parser().parse_args(["cloudflare", "origin-firewall"])
         self.assertEqual(args.action, "origin-firewall")
-
-    def test_legacy_remote_patch_projection_is_removed_only_after_steps_exist(self):
-        cfg = {
-            "spec": {
-                "host": {
-                    "ssh": "root@example.test",
-                    "root": "/opt/mte-platform",
-                    "excluded": [],
-                }
-            }
-        }
-        with mock.patch.object(platform, "ssh") as remote:
-            platform.remove_legacy_patch_projection(cfg)
-        command = remote.call_args.args[1]
-        self.assertIn("test -d /opt/mte-platform/steps", command)
-        self.assertIn("rm -rf /opt/mte-platform/patches", command)
 
     def test_toolhive_notion_workload_ports_are_unique_from_vmcp_aggregates(self):
         seeds = server_config.ONE_TIME_MIGRATION_SEEDS
@@ -2238,481 +3417,6 @@ class PlatformOrchestratorTests(unittest.TestCase):
             "180a55ce48d1d08888abb9920a6d24ba178929e4131722579466c494eec3d08f",
         )
 
-    def test_legacy_postgres_refs_are_moved_without_duplicate_secret_values(self):
-        with tempfile.TemporaryDirectory() as temp:
-            canonical = Path(temp) / "platform.env"
-            canonical.write_text(
-                "NOCODB_DB_USER=legacy-admin\n"
-                "NOCODB_DB_PASSWORD=move-only-secret\n"
-                "NOCODB_DB_NAME=legacy-database\n"
-            )
-            canonical.chmod(0o600)
-            original_stat = Path.stat
-
-            def root_owned_stat(path, *args, **kwargs):
-                value = original_stat(path, *args, **kwargs)
-                fields = list(value)
-                fields[4] = 0
-                return os.stat_result(fields)
-
-            required = {
-                "POSTGRES_ADMIN_USER",
-                "POSTGRES_ADMIN_PASSWORD",
-                "POSTGRES_ADMIN_DB",
-            }
-            with (
-                mock.patch.object(server_config, "SOURCE", canonical),
-                mock.patch.object(server_config, "config_object", return_value={}),
-                mock.patch.object(
-                    server_config,
-                    "declared_keys",
-                    return_value=(required, {}, {}),
-                ),
-                mock.patch.object(Path, "stat", root_owned_stat),
-            ):
-                result = server_config.init_source({})
-            values = server_config.parse_env(canonical)
-        self.assertEqual(values["POSTGRES_ADMIN_USER"], "legacy-admin")
-        self.assertEqual(values["POSTGRES_ADMIN_PASSWORD"], "move-only-secret")
-        self.assertEqual(values["POSTGRES_ADMIN_DB"], "legacy-database")
-        self.assertFalse(any(key.startswith("NOCODB_") for key in values))
-        self.assertEqual(
-            sorted(result["createdKeys"]),
-            sorted(required),
-        )
-
-    def test_missing_nocodocs_license_blocks_before_any_remote_mutation(self):
-        cfg = {
-            "_resolvedDataContentPlane": {
-                "profile": platform.NOCODOCS_LICENSED_PROFILE
-            },
-            "spec": {
-                "resolvedDomain": "agents.example.test",
-                "host": {
-                    "ssh": "root@example.test",
-                    "root": "/opt/mte-platform",
-                    "secretsRoot": "/root/.config/mte-secrets",
-                    "excluded": [],
-                },
-            },
-        }
-        args = argparse.Namespace(domain=None, components=[], no_wait=False)
-        with ExitStack() as stack:
-            temp = stack.enter_context(tempfile.TemporaryDirectory())
-            root = Path(temp)
-            governed_files = {
-                "platform.yaml": "kind: PlatformDeployment\n",
-                "platform.lock.yaml": "spec: {}\n",
-                "connections.yaml": "connections: []\n",
-                "deploy/demo.compose.yaml": "services:\n  demo:\n    image: before\n",
-                "scripts/demo.py": "VALUE = 'before'\n",
-                "profiles/demo.yaml": "profiles: []\n",
-                "kestra/demo.yaml": "id: demo\n",
-                "hermes/demo.py": "VALUE = 'before'\n",
-                "cloudflare/demo.tf": "# before\n",
-                "adapter/demo.js": "export const value = 'before';\n",
-                "deployment/steps/10-demo.sh": "#!/bin/sh\nexit 0\n",
-            }
-            for relative, content in governed_files.items():
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content)
-                path.chmod(0o700 if path.suffix == ".sh" else 0o600)
-
-            def governed_snapshot():
-                return {
-                    str(path.relative_to(root)): (
-                        hashlib.sha256(path.read_bytes()).hexdigest(),
-                        path.stat().st_mode & 0o777,
-                    )
-                    for path in sorted(root.rglob("*"))
-                    if path.is_file() and "evidence" not in path.relative_to(root).parts
-                }
-
-            before = governed_snapshot()
-
-            gate_result = {
-                "profile": platform.NOCODOCS_LICENSED_PROFILE,
-                "licenseKey": "missing",
-            }
-            deploy_lock = mock.Mock(return_value=nullcontext())
-            release_snapshot = mock.Mock(
-                side_effect=AssertionError("release snapshot must not be created")
-            )
-            host_bootstrap = mock.Mock(
-                side_effect=AssertionError("host bootstrap must not run")
-            )
-            for context in (
-                mock.patch.object(platform, "ROOT", root),
-                mock.patch.object(platform, "config", return_value=cfg),
-                mock.patch.object(platform, "ensure_safe_target"),
-                mock.patch.object(platform, "ReleaseSnapshot", release_snapshot),
-                mock.patch.object(platform, "remote_deploy_lock", deploy_lock),
-                mock.patch.object(
-                    platform,
-                    "pre_mutation_license_gate",
-                    side_effect=platform.PreMutationGateError(
-                        "business_license_required", gate_result
-                    ),
-                ),
-                mock.patch.object(platform, "run_host_bootstrap", host_bootstrap),
-            ):
-                stack.enter_context(context)
-            stdout = io.StringIO()
-            with redirect_stdout(stdout):
-                with self.assertRaisesRegex(
-                    platform.PreMutationGateError, "business_license_required"
-                ):
-                    platform.deploy_all(args)
-            after = governed_snapshot()
-            evidence_files = list(
-                (root / ".runtime/evidence").glob("deploy-all-*.json")
-            )
-            self.assertEqual(len(evidence_files), 1)
-            evidence_text = evidence_files[0].read_text()
-            evidence = json.loads(evidence_text)
-
-        self.assertEqual(after, before)
-        release_snapshot.assert_not_called()
-        deploy_lock.assert_not_called()
-        host_bootstrap.assert_not_called()
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertEqual(evidence["failedStep"], "license-preflight")
-        self.assertEqual(evidence["failureCode"], "business_license_required")
-        self.assertEqual(evidence["licenseGate"], gate_result)
-        self.assertEqual(
-            evidence["rollback"],
-            {
-                "status": "not-required",
-                "scope": "none",
-                "releaseMutation": "none",
-                "serviceMutation": "none",
-                "recovery": "safe-after-gate-remediation",
-            },
-        )
-        self.assertNotIn("unit-license-value-must-never-cross-ssh", evidence_text)
-
-    def test_late_nocodocs_probe_failure_is_explicit_roll_forward_risk(self):
-        cfg = {
-            "spec": {
-                "resolvedDomain": "agents.example.test",
-                "host": {
-                    "ssh": "root@example.test",
-                    "root": "/opt/mte-platform",
-                    "excluded": [],
-                },
-            }
-        }
-        args = argparse.Namespace(domain=None, components=[], no_wait=False)
-        with ExitStack() as stack:
-            temp = stack.enter_context(tempfile.TemporaryDirectory())
-
-            class FakeSnapshot:
-                def __init__(self, _cfg, run_id):
-                    self.source_sha256 = "c" * 64
-                    self.release_id = run_id + "-" + "c" * 16
-                    self.source = Path(temp) / "frozen-source"
-                    self.manifest_path = Path(temp) / "manifest.json"
-                    self.manifest_path.write_text("{}\n")
-
-                def verify(self):
-                    return None
-
-                def close(self):
-                    return None
-
-            class FakeTransaction:
-                def __init__(self, _cfg, snapshot, run_id, *, attempt, release_id=None):
-                    self.release_id = release_id or snapshot.release_id
-                    self.activation_id = f"{run_id}-a{attempt}"
-
-                def ensure_synced(self):
-                    return None
-
-                def verify(self):
-                    return None
-
-                def checkpoint(self, *_args, **_kwargs):
-                    return None
-
-                def rollback(self):
-                    return {
-                        "action": "rolledBack",
-                        "status": "rolledBack",
-                        "activationId": self.activation_id,
-                    }
-
-                def cleanup(self):
-                    return None
-
-            for context in (
-                mock.patch.object(platform, "ROOT", Path(temp)),
-                mock.patch.object(
-                    platform, "FULL_DEPLOY_STEPS", ("integration-canaries",)
-                ),
-                mock.patch.object(platform, "config", return_value=cfg),
-                mock.patch.object(platform, "ensure_safe_target"),
-                mock.patch.object(platform, "ReleaseSnapshot", FakeSnapshot),
-                mock.patch.object(platform, "DeployTransaction", FakeTransaction),
-                mock.patch.object(
-                    platform, "remote_deploy_lock", return_value=nullcontext()
-                ),
-                mock.patch.object(
-                    platform,
-                    "pre_mutation_license_gate",
-                    return_value={
-                        "profile": platform.NOCODOCS_LICENSED_PROFILE,
-                        "licenseKey": "present",
-                    },
-                ),
-                mock.patch.object(platform, "run_host_bootstrap"),
-                mock.patch.object(platform, "remove_legacy_patch_projection"),
-                mock.patch.object(
-                    platform,
-                    "run_integration_canaries",
-                    side_effect=platform.PlatformError(
-                        "synthetic live NocoDocs probe failure"
-                    ),
-                ),
-            ):
-                stack.enter_context(context)
-            with self.assertRaises(platform.PlatformError):
-                platform.deploy_all(args)
-            evidence_path = next(
-                (Path(temp) / ".runtime/evidence").glob("deploy-all-*.json")
-            )
-            evidence_text = evidence_path.read_text()
-            evidence = json.loads(evidence_text)
-
-        self.assertEqual(evidence["failedStep"], "integration-canaries")
-        self.assertEqual(evidence["rollback"]["status"], "completed")
-        self.assertEqual(evidence["rollback"]["coverage"], "source-only")
-        self.assertEqual(evidence["rollback"]["serviceRollback"], "not-performed")
-        self.assertEqual(evidence["rollback"]["liveServiceState"], "may-have-mutated")
-        self.assertEqual(evidence["rollback"]["recovery"], "roll-forward-required")
-        self.assertNotIn("synthetic live NocoDocs probe failure", evidence_text)
-
-    def test_full_deploy_stops_at_failed_daytona_and_writes_redacted_evidence(self):
-        observed = []
-
-        def mark(name):
-            return lambda *args, **kwargs: observed.append(name)
-
-        def experimental_step(_cfg, feature, _action):
-            name = {
-                "environments": "paperclip-environments",
-                "secrets": "paperclip-secrets",
-                "daytona": "daytona",
-            }[feature]
-            observed.append(name)
-            if feature == "daytona":
-                raise platform.PlatformError("synthetic secret-free failure")
-
-        cfg = {
-            "spec": {
-                "resolvedDomain": "agents.example.test",
-                "host": {
-                    "ssh": "root@example.test",
-                    "root": "/opt/mte-platform",
-                    "excluded": [],
-                },
-            }
-        }
-        args = argparse.Namespace(domain=None, components=[], no_wait=False)
-        with ExitStack() as stack:
-            temp = stack.enter_context(tempfile.TemporaryDirectory())
-
-            class FakeSnapshot:
-                def __init__(self, _cfg, run_id):
-                    self.source_sha256 = "a" * 64
-                    self.release_id = run_id + "-" + "a" * 16
-                    self.source = Path(temp) / "frozen-source"
-                    self.manifest_path = Path(temp) / "manifest.json"
-                    self.manifest_path.write_text("{}\n")
-
-                def verify(self):
-                    return None
-
-                def close(self):
-                    return None
-
-            class FakeTransaction:
-                def __init__(self, _cfg, snapshot, run_id, *, attempt, release_id=None):
-                    self.release_id = release_id or snapshot.release_id
-                    self.activation_id = f"{run_id}-a{attempt}"
-
-                def ensure_synced(self):
-                    return None
-
-                def verify(self):
-                    return None
-
-                def checkpoint(self, *_args, **_kwargs):
-                    return None
-
-                def rollback(self):
-                    observed.append("source-rollback")
-                    return {
-                        "action": "rolledBack",
-                        "status": "rolledBack",
-                        "activationId": self.activation_id,
-                    }
-
-                def cleanup(self):
-                    return None
-
-            for context in (
-                mock.patch.object(platform, "ROOT", Path(temp)),
-                mock.patch.object(platform, "config", return_value=cfg),
-                mock.patch.object(platform, "ensure_safe_target"),
-                mock.patch.object(platform, "ReleaseSnapshot", FakeSnapshot),
-                mock.patch.object(platform, "DeployTransaction", FakeTransaction),
-                mock.patch.object(
-                    platform, "remote_deploy_lock", return_value=nullcontext()
-                ),
-                mock.patch.object(
-                    platform,
-                    "pre_mutation_license_gate",
-                    side_effect=lambda _cfg: (
-                        observed.append("license-preflight")
-                        or {
-                            "profile": platform.NOCODOCS_LICENSED_PROFILE,
-                            "licenseKey": "present",
-                        }
-                    ),
-                ),
-                mock.patch.object(
-                    platform, "run_host_bootstrap", mark("host-bootstrap-preflight")
-                ),
-                mock.patch.object(platform, "remove_legacy_patch_projection"),
-                mock.patch.object(
-                    platform, "ensure_config_initialized", mark("config-initialize")
-                ),
-                mock.patch.object(
-                    platform,
-                    "run_config",
-                    lambda _cfg, action: observed.append(f"config-{action}"),
-                ),
-                mock.patch.object(
-                    platform, "finish_platform_bootstrap", mark("bootstrap")
-                ),
-                mock.patch.object(
-                    platform,
-                    "run_tools",
-                    lambda _cfg, action: observed.append(
-                        "toolhive-binary" if action == "install" else "tool-bundles"
-                    ),
-                ),
-                mock.patch.object(
-                    platform,
-                    "deploy_components",
-                    lambda _cfg, selected: observed.append(
-                        "dokploy-foundation"
-                        if selected == ["postgres"]
-                        else "dokploy-components"
-                    ),
-                ),
-                mock.patch.object(
-                    platform,
-                    "run_application_databases",
-                    mark("application-databases"),
-                ),
-                mock.patch.object(
-                    platform,
-                    "run_paperclip_runtime",
-                    lambda _cfg, action: observed.append(
-                        {
-                            "config-migrate": "paperclip-runtime-config",
-                            "install": "paperclip-runtime",
-                        }[action]
-                    ),
-                ),
-                mock.patch.object(platform, "apply_profiles", mark("profiles")),
-                mock.patch.object(
-                    platform, "run_paperclip_experimental", experimental_step
-                ),
-                mock.patch.object(platform, "run_provision", mark("provision")),
-                mock.patch.object(
-                    platform,
-                    "run_data_content_projections",
-                    mark("data-content-projections"),
-                ),
-                mock.patch.object(
-                    platform, "run_kestra_control", mark("kestra-control")
-                ),
-                mock.patch.object(platform, "run_harness_auth", mark("harness-auth")),
-                mock.patch.object(platform, "run_hermes", mark("hermes")),
-                mock.patch.object(platform, "run_cloudflare", mark("cloudflare")),
-                mock.patch.object(
-                    platform, "run_kestra_canary", mark("kestra-e2e-canary")
-                ),
-                mock.patch.object(platform, "cmd_connections", mark("connections")),
-                mock.patch.object(platform, "cmd_verify", mark("verify")),
-            ):
-                stack.enter_context(context)
-            with self.assertRaises(platform.PlatformError):
-                platform.deploy_all(args)
-            evidence_files = list(
-                (Path(temp) / ".runtime/evidence").glob("deploy-all-*.json")
-            )
-            self.assertEqual(len(evidence_files), 1)
-            evidence_text = evidence_files[0].read_text()
-            evidence = json.loads(evidence_text)
-
-        self.assertEqual(
-            observed,
-            [
-                "license-preflight",
-                "license-preflight",
-                "host-bootstrap-preflight",
-                "config-initialize",
-                "config-render",
-                "config-audit",
-                "bootstrap",
-                "toolhive-binary",
-                "dokploy-foundation",
-                "application-databases",
-                "dokploy-components",
-                "paperclip-runtime-config",
-                "paperclip-runtime",
-                "profiles",
-                "paperclip-environments",
-                "paperclip-secrets",
-                "provision",
-                "provision",
-                "data-content-projections",
-                "kestra-control",
-                "tool-bundles",
-                "tool-bundles",
-                "hermes",
-                "daytona",
-                "source-rollback",
-            ],
-        )
-        self.assertEqual(evidence["status"], "failed")
-        self.assertEqual(evidence["failedStep"], "daytona")
-        self.assertEqual(evidence["steps"][-1]["errorType"], "PlatformError")
-        self.assertEqual(evidence["rollback"]["status"], "completed")
-        self.assertEqual(evidence["rollback"]["scope"], "governed-source-tree")
-        self.assertEqual(evidence["rollback"]["coverage"], "source-only")
-        self.assertEqual(evidence["rollback"]["serviceRollback"], "not-performed")
-        self.assertEqual(evidence["rollback"]["liveServiceState"], "may-have-mutated")
-        self.assertEqual(evidence["rollback"]["recovery"], "roll-forward-required")
-        self.assertRegex(evidence["runId"], r"^[0-9T-]+[0-9a-f]{12}$")
-        self.assertTrue(evidence["releaseId"].startswith(evidence["runId"] + "-"))
-        self.assertEqual(evidence["sourceSha256"], "a" * 64)
-        self.assertTrue(
-            evidence["remoteCheckpoint"].endswith(evidence["runId"] + ".json")
-        )
-        self.assertNotIn("synthetic secret-free failure", evidence_text)
-
-    def test_full_deploy_resume_is_explicit_and_scoped_to_all(self):
-        args = platform.parser().parse_args(
-            ["deploy", "--all", "--resume", "20260715T120000-deadbeefcafe"]
-        )
-        self.assertTrue(args.all)
-        self.assertEqual(args.resume, "20260715T120000-deadbeefcafe")
-
     def test_daytona_apply_has_read_only_dependency_guard(self):
         cfg = {
             "spec": {
@@ -2731,7 +3435,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertIn("server-profile-reconcile.py verify", command)
         self.assertNotIn(" provision", command)
 
-    def test_daytona_apply_orders_plugin_before_snapshot_acceptance_and_probes(self):
+    def test_daytona_apply_builds_snapshot_before_first_environment_reconcile(self):
         cfg = {
             "spec": {
                 "host": {
@@ -2747,100 +3451,209 @@ class PlatformOrchestratorTests(unittest.TestCase):
             mock.patch.object(platform, "ssh") as ssh,
             mock.patch.object(platform, "merge_paperclip_experimental_inputs"),
             mock.patch.object(platform, "require_daytona_dependencies") as guard,
+            mock.patch.object(platform, "run_paperclip_runtime") as runtime_verify,
         ):
             platform.run_paperclip_experimental(cfg, "daytona", "apply")
         commands = [call.args[1] for call in ssh.call_args_list]
         self.assertEqual(guard.call_count, 1)
         self.assertEqual(
-            [commands[index].rsplit(" ", 1)[-1] for index in range(3)],
-            ["install", "provision-key", "set-target"],
+            [commands[index].rsplit(" ", 1)[-1] for index in range(2)],
+            ["install", "set-target"],
+        )
+        self.assertFalse(
+            any(command.endswith(" provision-key") for command in commands)
+        )
+        images = next(
+            index
+            for index, command in enumerate(commands)
+            if command.endswith(" images")
         )
         first_plugin_apply = next(
             index
             for index, command in enumerate(commands)
             if "server-paperclip-experimental.py daytona apply" in command
         )
-        acceptance = next(
-            index for index, command in enumerate(commands) if command.endswith(" acceptance")
+        lifecycle = next(
+            index
+            for index, command in enumerate(commands)
+            if command.endswith(" lifecycle")
+        )
+        step_verify = next(
+            index
+            for index, command in enumerate(commands)
+            if command.endswith("daytona.sh verify")
         )
         plugin_verify = next(
             index
             for index, command in enumerate(commands)
             if "server-paperclip-experimental.py daytona verify" in command
         )
-        self.assertLess(first_plugin_apply, acceptance)
-        self.assertLess(acceptance, plugin_verify)
+        self.assertLess(images, first_plugin_apply)
+        self.assertLess(first_plugin_apply, lifecycle)
+        self.assertLess(lifecycle, step_verify)
+        self.assertLess(step_verify, plugin_verify)
         self.assertEqual(
             sum(
                 "server-paperclip-experimental.py daytona apply" in command
                 for command in commands
             ),
-            2,
+            1,
         )
         self.assertFalse(any(command.endswith(" all") for command in commands))
+        runtime_verify.assert_called_once_with(cfg, "verify")
+
+    def test_daytona_verify_finishes_with_strict_paperclip_private_route_verify(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/mte-platform",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                    "excluded": [],
+                }
+            }
+        }
+        with (
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(platform, "ssh"),
+            mock.patch.object(platform, "merge_paperclip_experimental_inputs"),
+            mock.patch.object(platform, "require_daytona_dependencies") as guard,
+            mock.patch.object(platform, "run_paperclip_runtime") as runtime_verify,
+        ):
+            platform.run_paperclip_experimental(cfg, "daytona", "verify")
+        self.assertEqual(guard.call_count, 2)
+        runtime_verify.assert_called_once_with(cfg, "verify")
 
     def test_daytona_gateway_uses_private_tool_runtime_network_with_live_probe(self):
-        daytona_step = (ROOT / "deployment/steps/60-daytona.sh").read_text()
-        self.assertIn(
-            '"MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_UPSTREAM":"http://toolhive:19011"',
-            daytona_step,
+        daytona_step = (ROOT / "deployment/steps/daytona.sh").read_text()
+        daytona_compose = (
+            ROOT / "deployment/services/daytona/compose.yaml"
+        ).read_text()
+        canonical_r1_upstreams = {
+            "MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_UPSTREAM": "http://toolhive:19011",
+            "MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_UPSTREAM": "http://toolhive:19012",
+            "MTE_AGENT_GATEWAY_TOOLHIVE_PI_UPSTREAM": "http://toolhive:19013",
+        }
+        self.assertEqual(
+            {
+                key: server_config.ONE_TIME_MIGRATION_SEEDS[key]
+                for key in canonical_r1_upstreams
+            },
+            canonical_r1_upstreams,
         )
-        self.assertIn(
-            '"MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_UPSTREAM":"http://toolhive:19012"',
-            daytona_step,
-        )
-        self.assertIn(
-            '"MTE_AGENT_GATEWAY_TOOLHIVE_PI_UPSTREAM":"http://toolhive:19013"',
-            daytona_step,
-        )
+        self.assertNotIn("defaults={", daytona_step)
+        self.assertNotIn("profile_defaults={", daytona_step)
+        self.assertNotIn("v.setdefault(", daytona_step)
         self.assertNotIn("http://tool-runtime:19011", daytona_step)
-        self.assertIn("networks: [daytona, agent-plane, tool-runtime]", daytona_step)
+        self.assertIn("networks: [daytona, agent-plane, tool-runtime]", daytona_compose)
+        self.assertIn("name: ${MTE_TOOL_RUNTIME_NETWORK:?required}", daytona_compose)
+        self.assertNotIn("tool-control", daytona_compose)
+        self.assertNotIn("docker.sock", daytona_compose)
+        self.assertIn("network_mode: service:runner", daytona_compose)
         self.assertIn(
-            "tool-runtime: {{name: mte-tool-runtime, external: true}}", daytona_step
+            "command: [python3, /app/agent-plane-gateway.py]", daytona_compose
         )
-        self.assertIn("network_mode: service:runner", daytona_step)
-        self.assertIn("def no_host_bindings(container):", daytona_step)
-        self.assertIn('"noPublishedPorts": True', daytona_step)
-        self.assertIn('"gatewayNetworkMode": gateway_network_mode', daytona_step)
-        self.assertIn('"method":"initialize"', daytona_step)
-        self.assertIn('"agentGateway":gateway', daytona_step)
-        self.assertIn('import http from "node:http";', daytona_step)
-        self.assertIn("const request = http.request(manifestUrl", daytona_step)
+        self.assertIn("MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_UPSTREAM:", daytona_compose)
+        self.assertIn(
+            'command,"/home/daytona/paperclip-workspace",undefined,120',
+            daytona_step,
+        )
         self.assertNotIn(
             "MTE_DAYTONA_REGISTRY_EVIDENCE_URL}/v2/${match[1]}", daytona_step
         )
 
-    def test_activepieces_has_data_plane(self):
-        compose = yaml.safe_load(
-            (ROOT / "deployment/services/activepieces/compose.yaml").read_text()
-        )
-        for service in ("app", "worker"):
-            networks = compose["services"][service]["networks"]
-            names = set(networks if isinstance(networks, list) else networks)
-            self.assertIn("data-plane", names)
+    def test_daytona_step_consumes_canonical_config_and_only_generates_owned_secrets(
+        self,
+    ):
+        source = (ROOT / "deployment/steps/daytona.sh").read_text()
+        current_digest = hashlib.sha256(source.encode()).hexdigest()
         self.assertEqual(
-            compose["networks"]["data-plane"],
-            {
-                "name": "mte-data-plane",
-                "external": True,
-            },
+            server_config.ONE_TIME_MIGRATION_SEEDS["MTE_DAYTONA_INSTALLER_SHA256"],
+            current_digest,
         )
+        self.assertEqual(
+            server_config.REVIEWED_CANONICAL_VALUE_MIGRATIONS[
+                "MTE_DAYTONA_INSTALLER_SHA256"
+            ][-1],
+            current_digest,
+        )
+        self.assertIn(
+            "2a89ffbd67866ad542ba801f7a31c1228780315cc133cf85eb59d8b860d5ad0a",
+            server_config.REVIEWED_CANONICAL_VALUE_MIGRATIONS[
+                "MTE_DAYTONA_INSTALLER_SHA256"
+            ][:-1],
+        )
+        self.assertIn('"MTE_DAYTONA_NETWORK",', source)
+        self.assertIn('"MTE_DAYTONA_PAPERCLIP_NETWORK",', source)
+        self.assertIn('"TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN",', source)
+        self.assertIn('"TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN",', source)
+        self.assertIn('"TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN",', source)
+        self.assertNotIn(
+            '"TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN": lambda',
+            source,
+        )
+        self.assertNotIn('values["DAYTONA_TARGET"] =', source)
+        self.assertNotIn('target: safe("DAYTONA_TARGET")', source)
+        self.assertIn(
+            "Self-hosted Daytona resolves an omitted SDK target through the organization's",
+            source,
+        )
+        self.assertIn("os.replace(temporary, path)", source)
+        self.assertIn("os.O_RDWR | nofollow | cloexec", source)
+        self.assertIn("fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)", source)
+        self.assertIn("fcntl.F_OFD_SETLK", source)
+        self.assertNotIn('9>"$ENV_LOCK"', source)
+        self.assertIn(
+            "DAYTONA_ENV_FILE=/root/.config/mte-secrets/services/daytona.env", source
+        )
+        self.assertIn(
+            'python3 - "$ENV_FILE" "$DAYTONA_ENV_FILE" "$RUNTIME_ENV"', source
+        )
+        self.assertIn("render_daytona_projection", source)
+        compose = (ROOT / "deployment/services/daytona/compose.yaml").read_text()
+        self.assertIn("x-logging: &logging", compose)
+        self.assertIn("max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}", compose)
+        self.assertIn("max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}", compose)
+        self.assertEqual(compose.count("logging: *logging"), 10)
+
+        canonical = server_config.ONE_TIME_MIGRATION_SEEDS
+        for key in (
+            "MTE_DAYTONA_API_IMAGE",
+            "MTE_DAYTONA_API_INTERNAL_PORT",
+            "MTE_DAYTONA_DEFAULT_ORG_TOTAL_CPU",
+            "MTE_DAYTONA_DEFAULT_RUNNER_CPU",
+            "MTE_DAYTONA_NETWORK",
+            "MTE_DAYTONA_RUNNER_START_SCORE_THRESHOLD",
+            "MTE_CODEX_VERSION",
+            "MTE_CONTEXT7_MCP_URL",
+            "MTE_DOCKER_LOG_MAX_FILES",
+            "MTE_DOCKER_LOG_MAX_SIZE",
+            "MTE_GITHUB_CLI_VERSION",
+            "MTE_TOOL_RUNTIME_NETWORK",
+            "MTE_TOOLHIVE_VERSION",
+        ):
+            self.assertIn(key, canonical)
+        self.assertNotIn("MTE_DAYTONA_SANDBOX_IMAGE", canonical)
+        self.assertIn(
+            "MTE_DAYTONA_SANDBOX_IMAGE",
+            server_config.REQUIRED_OPERATOR_BOOTSTRAP_KEYS,
+        )
+        self.assertNotIn("MTE_DAYTONA_CODING_IMAGE", canonical)
 
     def test_redis_passwords_are_generated_and_all_app_paths_use_derived_urls(self):
         passwords = {
             key: value
             for key, value in server_secrets.generated_defaults(
-                "baserow-wikijs"
+                "postgres-notion"
             ).items()
             if key
             in {
-                "BASEROW_REDIS_PASSWORD",
                 "FIRECRAWL_REDIS_PASSWORD",
                 "SEARXNG_VALKEY_PASSWORD",
             }
         }
-        self.assertEqual(len(passwords), 3)
-        self.assertEqual(len(set(passwords.values())), 3)
+        self.assertEqual(len(passwords), 2)
+        self.assertEqual(len(set(passwords.values())), 2)
         self.assertTrue(all(len(value) >= 32 for value in passwords.values()))
 
         expected = {
@@ -2849,15 +3662,11 @@ class PlatformOrchestratorTests(unittest.TestCase):
         }
         self.assertTrue(expected <= server_config.DERIVED_VALUE_KEYS)
         for filename, service, password_ref in (
-            ("baserow.yaml", "redis", "BASEROW_REDIS_PASSWORD"),
             ("searxng.yaml", "valkey", "SEARXNG_VALKEY_PASSWORD"),
         ):
             compose = yaml.safe_load(
                 (
-                    ROOT
-                    / "deployment/services"
-                    / Path(filename).stem
-                    / "compose.yaml"
+                    ROOT / "deployment/services" / Path(filename).stem / "compose.yaml"
                 ).read_text()
             )
             runtime = compose["services"][service]
@@ -2876,16 +3685,11 @@ class PlatformOrchestratorTests(unittest.TestCase):
     def test_redis_secret_stays_out_of_rendered_command_and_healthcheck_argv(self):
         password = "compose-semantic-test-password-not-a-secret"
         for filename, service, password_ref in (
-            ("baserow.yaml", "redis", "BASEROW_REDIS_PASSWORD"),
             ("searxng.yaml", "valkey", "SEARXNG_VALKEY_PASSWORD"),
-            ("activepieces-data.yaml", "redis", "AP_REDIS_PASSWORD"),
         ):
             source = yaml.safe_load(
                 (
-                    ROOT
-                    / "deployment/services"
-                    / Path(filename).stem
-                    / "compose.yaml"
+                    ROOT / "deployment/services" / Path(filename).stem / "compose.yaml"
                 ).read_text()
             )
             runtime = source["services"][service]
@@ -2904,8 +3708,12 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 compose_path = root / "compose.yaml"
                 env_path = root / "platform.env"
                 compose_path.write_text(yaml.safe_dump(minimal, sort_keys=False))
-                extra = "BASEROW_REDIS_DB=0\n" if filename == "baserow.yaml" else ""
-                env_path.write_text(f"{password_ref}={password}\n{extra}")
+                env_path.write_text(
+                    f"{password_ref}={password}\n"
+                    "MTE_HEALTHCHECK_FAST_INTERVAL=10s\n"
+                    "MTE_HEALTHCHECK_FAST_TIMEOUT=5s\n"
+                    "MTE_HEALTHCHECK_FAST_RETRIES=15\n"
+                )
                 result = subprocess.run(
                     [
                         "docker",
@@ -2928,11 +3736,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertNotIn("${" + password_ref, command)
             self.assertIn("printenv " + password_ref, command)
             health = " ".join(rendered["healthcheck"]["test"])
-            if filename == "activepieces-data.yaml":
-                self.assertIn("/run/mte-activepieces-redis/redis.password", health)
-                self.assertNotIn(password_ref, health)
-            else:
-                self.assertIn("$${" + password_ref + ":?required}", health)
+            self.assertIn("$${" + password_ref + ":?required}", health)
             self.assertNotIn(password, health)
             self.assertNotIn("-a ", health)
 
@@ -2982,6 +3786,16 @@ class PlatformOrchestratorTests(unittest.TestCase):
                     side_effect=lambda _cfg, action: observed.append(action),
                 ),
                 mock.patch.object(
+                    platform,
+                    "operator_values",
+                    return_value=self.operator_input_values(),
+                ),
+                mock.patch.object(
+                    platform,
+                    "run_resource_preflight",
+                    side_effect=lambda _cfg, mode, **_kwargs: observed.append(mode),
+                ),
+                mock.patch.object(
                     platform, "sync", side_effect=lambda _cfg: observed.append("sync")
                 ),
                 mock.patch.object(
@@ -2996,7 +3810,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 ),
             ):
                 platform.run_kestra_canary(cfg, "apply")
-        self.assertEqual(observed[0], "sync")
+        self.assertEqual(observed[0], "daytona-e2e")
+        self.assertEqual(observed[1], "sync")
         self.assertEqual(observed[-1], "canary")
         self.assertEqual(len(ssh_commands), 1)
         self.assertIn(
@@ -3006,6 +3821,172 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertIn(
             "python3 /opt/mte-platform/bin/server-e2e-canary.py apply", ssh_commands[0]
         )
+
+    def test_e2e_acceptance_always_runs_apply_then_verify(self):
+        actions = []
+        with mock.patch.object(
+            platform,
+            "run_kestra_canary",
+            side_effect=lambda _cfg, action: actions.append(action),
+        ):
+            platform.run_kestra_canary_acceptance({})
+        self.assertEqual(actions, ["apply", "verify"])
+
+    def test_observability_acceptance_runs_indexed_passes_before_live_canary(self):
+        expected = "a" * 64
+        cfg = {"spec": {"host": {"root": "/opt/mte-platform"}}}
+        with (
+            mock.patch.object(platform, "sync") as sync,
+            mock.patch.object(
+                platform, "canonical_source_sha256", return_value=expected
+            ),
+            mock.patch.object(platform, "run_canonical_hash_bound") as run,
+        ):
+            platform.run_observability_acceptance(cfg)
+        sync.assert_called_once_with(cfg)
+        run.assert_called_once()
+        command = run.call_args.args[1]
+        self.assertEqual(command[:2], ["sh", "-c"])
+        script = command[2]
+        self.assertIn(
+            'exec 9>"$lock"; flock -x 9; python3',
+            script,
+        )
+        self.assertIn(
+            "/opt/mte-platform/evidence/.observability-acceptance.lock",
+            script,
+        )
+        self.assertLess(
+            script.index("reconcile-pass --pass-number 1"),
+            script.index("reconcile-pass --pass-number 2"),
+        )
+        self.assertLess(
+            script.index("reconcile-pass --pass-number 2"),
+            script.index("finalize-idempotency"),
+        )
+        self.assertLess(script.index("finalize-idempotency"), script.index(" apply "))
+        self.assertEqual(script.count(expected), 4)
+
+    def test_integration_canary_orchestrator_rejects_removed_ids(self):
+        with self.assertRaisesRegex(
+            platform.PlatformError, "unknown integration canary IDs"
+        ):
+            platform.run_integration_canaries({}, "run", ["C013"])
+        with self.assertRaisesRegex(
+            platform.PlatformError, "unknown integration canary IDs"
+        ):
+            platform.run_integration_canaries({}, "run", ["C028"])
+
+    def test_final_evidence_rebind_regenerates_and_verifies_e2e_attestation(self):
+        observed = []
+        with (
+            mock.patch.object(
+                platform,
+                "run_config",
+                side_effect=lambda _cfg, action: observed.append(("config", action)),
+            ),
+            mock.patch.object(
+                platform,
+                "run_provision",
+                side_effect=lambda _cfg, action: observed.append(("provision", action)),
+            ),
+            mock.patch.object(
+                platform,
+                "run_notion_projection",
+                side_effect=lambda _cfg, action: observed.append(("notion", action)),
+            ),
+            mock.patch.object(
+                platform,
+                "run_tools",
+                side_effect=lambda _cfg, action: observed.append(("tools", action)),
+            ),
+            mock.patch.object(
+                platform,
+                "run_kestra_canary",
+                side_effect=lambda _cfg, action: observed.append(("kestra", action)),
+            ),
+            mock.patch.object(
+                platform,
+                "run_profile_acceptance",
+                side_effect=lambda _cfg: observed.append(("profiles", "verify")),
+            ),
+            mock.patch.object(
+                platform,
+                "run_integration_canaries",
+                side_effect=lambda _cfg, action, _ids: observed.append(
+                    ("integrations", action)
+                ),
+            ),
+            mock.patch.object(
+                platform,
+                "run_hermes_acceptance",
+                side_effect=lambda _cfg: observed.append(("hermes", "acceptance")),
+            ),
+            mock.patch.object(
+                platform,
+                "run_observability_acceptance",
+                side_effect=lambda _cfg: observed.append(
+                    ("observability", "acceptance")
+                ),
+            ),
+        ):
+            platform.run_final_evidence_rebind({})
+        self.assertEqual(
+            observed,
+            [
+                ("config", "render"),
+                ("config", "audit"),
+                ("provision", "verify"),
+                ("tools", "verify"),
+                ("kestra", "apply"),
+                ("kestra", "verify"),
+                ("profiles", "verify"),
+                ("integrations", "run"),
+                ("hermes", "acceptance"),
+                ("observability", "acceptance"),
+                ("notion", "canary"),
+            ],
+        )
+
+    def test_public_evidence_and_hermes_acceptance_commands_use_existing_producers(
+        self,
+    ):
+        cfg = {"spec": {"host": {"root": "/opt/mte-platform"}}}
+        with (
+            mock.patch.object(platform, "config", return_value=cfg),
+            mock.patch.object(platform, "run_final_evidence_rebind") as rebind,
+        ):
+            platform.cmd_evidence_rebind(
+                platform.parser().parse_args(["evidence-rebind"])
+            )
+        rebind.assert_called_once_with(cfg)
+
+        with (
+            mock.patch.object(platform, "config", return_value=cfg),
+            mock.patch.object(platform, "run_hermes_acceptance") as hermes,
+        ):
+            platform.cmd_hermes(platform.parser().parse_args(["hermes", "acceptance"]))
+        hermes.assert_called_once_with(cfg)
+
+    def test_hermes_install_forwards_host_admin_only_when_explicit(self):
+        cfg = {"spec": {"host": {"root": "/opt/mte-platform"}}}
+        with (
+            mock.patch.object(platform, "sync"),
+            mock.patch.object(platform, "merge_hermes_inputs"),
+            mock.patch.object(
+                platform,
+                "remote_script",
+                return_value="/opt/mte-platform/bin/server-hermes.py",
+            ),
+            mock.patch.object(platform, "ssh") as ssh,
+        ):
+            platform.run_hermes(cfg, "install")
+            public_command = ssh.call_args.args[1]
+            platform.run_hermes(cfg, "install", grant_platform_admin=True)
+            private_command = ssh.call_args.args[1]
+
+        self.assertNotIn("--grant-platform-admin", public_command)
+        self.assertIn("--grant-platform-admin", private_command)
 
 
 class ExperimentalControllerTests(unittest.TestCase):
@@ -3060,7 +4041,14 @@ class ExperimentalControllerTests(unittest.TestCase):
             {},
             io.BytesIO(leaked),
         )
-        with mock.patch("urllib.request.urlopen", side_effect=error):
+        with (
+            mock.patch.object(
+                experimental,
+                "dotenv",
+                return_value={"PAPERCLIP_BOARD_API_KEY": "unit-board-key"},
+            ),
+            mock.patch("urllib.request.urlopen", side_effect=error),
+        ):
             with self.assertRaises(experimental.ControlError) as raised:
                 experimental.json_request(
                     "http://127.0.0.1", "POST", "/api/test", {"value": "SECRET_VALUE"}

@@ -17,6 +17,13 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
+PREFLIGHT_SPEC = importlib.util.spec_from_file_location(
+    "cloudflare_preflight_for_token_test",
+    ROOT / "tools/platform-cli" / "cloudflare-preflight.py",
+)
+assert PREFLIGHT_SPEC is not None and PREFLIGHT_SPEC.loader is not None
+preflight = importlib.util.module_from_spec(PREFLIGHT_SPEC)
+PREFLIGHT_SPEC.loader.exec_module(preflight)
 
 
 class CloudflareTokenBootstrapTests(unittest.TestCase):
@@ -64,7 +71,7 @@ class CloudflareTokenBootstrapTests(unittest.TestCase):
 
     def test_canonical_conflicts_detect_non_token_drift(self) -> None:
         desired = {
-            "PLATFORM_BASE_DOMAIN": "prin7r.com",
+            "PLATFORM_BASE_DOMAIN": "agents.example.test",
             "CLOUDFLARE_API_TOKEN": "new-secret",
         }
         snapshot = {
@@ -84,7 +91,7 @@ class CloudflareTokenBootstrapTests(unittest.TestCase):
             ["PLATFORM_BASE_DOMAIN"],
         )
 
-    def test_safe_plan_is_not_ready_when_an_origin_is_unhealthy(self) -> None:
+    def test_safe_plan_keeps_unhealthy_origins_informational(self) -> None:
         context = {
             "token": None,
             "policies": [],
@@ -93,19 +100,135 @@ class CloudflareTokenBootstrapTests(unittest.TestCase):
             ],
             "canonicalConflicts": [],
             "snapshot": {"keys": {}},
-            "canonicalDesired": {"PLATFORM_BASE_DOMAIN": "prin7r.com"},
-            "zoneName": "prin7r.com",
+            "canonicalDesired": {"PLATFORM_BASE_DOMAIN": "agents.example.test"},
+            "zoneName": "agents.example.test",
             "idpMode": "onetimepin",
         }
         plan = module.safe_plan(context, "plan")
-        self.assertFalse(plan["readyForApply"])
+        self.assertTrue(plan["readyForApply"])
         self.assertFalse(plan["mutationPerformed"])
+        self.assertFalse(plan["origins"]["green"])
+        self.assertEqual(plan["origins"]["blockers"], context["originBlockers"])
         self.assertIn("create_account_owned_token", plan["plannedActions"])
         self.assertIn(
             "render_audit_verify_manifest_under_shared_lock",
             plan["plannedActions"],
         )
         self.assertFalse(plan["token"]["localSecretProjectionPresent"])
+
+    def test_token_apply_converges_before_services_while_edge_preflight_blocks(self) -> None:
+        blocker = {"code": "internal_origin_unhealthy", "component": "9router"}
+        context = {
+            "token": {
+                "id": "managed-token-id",
+                "status": "active",
+                "policies": [{"effect": "allow", "resources": {"scope": "*"}}],
+            },
+            "policies": [{"effect": "allow", "resources": {"scope": "*"}}],
+            "originBlockers": [blocker],
+            "canonicalConflicts": [],
+            "snapshot": {"keys": {"CLOUDFLARE_API_TOKEN": {"present": True}}},
+            "canonicalDesired": {
+                "PLATFORM_BASE_DOMAIN": "agents.example.test",
+                "CLOUDFLARE_ACCOUNT_ID": "account-id",
+            },
+            "zoneName": "agents.example.test",
+            "idpMode": "onetimepin",
+            "accountId": "account-id",
+            "email": "operator@example.test",
+            "globalKey": "bootstrap-key",
+            "target": "root@example.test",
+            "canonicalPath": "/root/.config/mte-secrets/platform.env",
+            "platformRoot": "/opt/mte-platform",
+            "secretRoot": "/root/.config/mte-secrets",
+        }
+        evidence = {
+            "canonicalSourceSha256": "1" * 64,
+            "manifestSha256": "2" * 64,
+            "serverConfigSha256": "3" * 64,
+            "projectionCount": 41,
+            "generatorVersion": "mte-config-renderer/v1",
+        }
+        with (
+            mock.patch.object(module, "read_server_token", return_value="token-value"),
+            mock.patch.object(
+                module, "bearer_verified_token_id", return_value="managed-token-id"
+            ),
+            mock.patch.object(module, "write_canonical", return_value=evidence),
+            mock.patch.object(module, "atomic_local_metadata"),
+        ):
+            result = module.reconcile(context)
+
+        self.assertTrue(result["readyForApply"])
+        self.assertTrue(result["mutationPerformed"])
+        self.assertFalse(result["origins"]["green"])
+        self.assertEqual(result["origins"]["blockers"], [blocker])
+
+    def test_token_apply_rotates_an_active_but_unmanaged_server_token(self) -> None:
+        context = {
+            "token": {
+                "id": "managed-token-id",
+                "status": "active",
+                "policies": [{"effect": "allow", "resources": {"scope": "*"}}],
+            },
+            "policies": [{"effect": "allow", "resources": {"scope": "*"}}],
+            "originBlockers": [],
+            "canonicalConflicts": [],
+            "snapshot": {"keys": {"CLOUDFLARE_API_TOKEN": {"present": True}}},
+            "canonicalDesired": {"PLATFORM_BASE_DOMAIN": "agents.example.test"},
+            "zoneName": "agents.example.test",
+            "idpMode": "onetimepin",
+            "accountId": "account-id",
+            "email": "operator@example.test",
+            "globalKey": "bootstrap-key",
+            "target": "root@example.test",
+        }
+        evidence = {
+            "canonicalSourceSha256": "1" * 64,
+            "manifestSha256": "2" * 64,
+            "serverConfigSha256": "3" * 64,
+            "projectionCount": 41,
+            "generatorVersion": "mte-config-renderer/v1",
+        }
+        with (
+            mock.patch.object(module, "read_server_token", return_value="old-token"),
+            mock.patch.object(
+                module,
+                "bearer_verified_token_id",
+                side_effect=("different-active-token", "managed-token-id"),
+            ),
+            mock.patch.object(
+                module,
+                "request_json",
+                return_value={"result": {"value": "fresh-token-" + "x" * 48}},
+            ) as request,
+            mock.patch.object(module, "write_canonical", return_value=evidence) as write,
+            mock.patch.object(module, "atomic_local_metadata"),
+        ):
+            result = module.reconcile(context)
+
+        self.assertIn("rolled_unrecoverable_token_value", result["performedActions"])
+        self.assertEqual(request.call_args.args[1], "/accounts/account-id/tokens/managed-token-id/value")
+        self.assertEqual(
+            write.call_args.args[1]["CLOUDFLARE_API_TOKEN"], "fresh-token-" + "x" * 48
+        )
+
+        origins, blockers = preflight.internal_checks(
+            {
+                "host": {"ssh": "root@example.test"},
+                "components": [
+                    {
+                        "id": "9router",
+                        "exposure": {"origin": "http://9router:3000"},
+                    }
+                ],
+            }
+        )
+        self.assertEqual(origins, {})
+        self.assertEqual(
+            blockers,
+            [{"code": "invalid_internal_origin", "component": "9router"}],
+        )
 
     def test_remote_writer_uses_shared_lock_and_verifies_renderer_manifest(
         self,
@@ -117,7 +240,7 @@ class CloudflareTokenBootstrapTests(unittest.TestCase):
         self.assertIn('lock=secret_root/".platform-env.lock"', script)
         self.assertIn("fcntl.flock(descriptor,fcntl.LOCK_EX)", script)
         self.assertIn("os.fchown(descriptor,0,0)", script)
-        self.assertIn("module.render()", script)
+        self.assertIn("module.render(lock_fd=descriptor)", script)
         self.assertIn("audited=module.audit()", script)
         self.assertIn('manifest_path=secret_root/"projections-manifest.json"', script)
         self.assertIn("projection manifest content gate failed", script)
@@ -126,7 +249,7 @@ class CloudflareTokenBootstrapTests(unittest.TestCase):
         lock = script.index("fcntl.flock(descriptor,fcntl.LOCK_EX)")
         reread = script.index("current={}", lock)
         replace = script.index("os.replace(temporary,canonical)", reread)
-        render = script.index("module.render()", replace)
+        render = script.index("module.render(lock_fd=descriptor)", replace)
         audit = script.index("audited=module.audit()", render)
         unlock = script.index("fcntl.flock(descriptor,fcntl.LOCK_UN)", audit)
         self.assertEqual(

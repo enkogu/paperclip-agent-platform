@@ -2,10 +2,10 @@ name: mte-searxng
 x-logging: &id001
   driver: json-file
   options:
-    max-size: 10m
-    max-file: '3'
+    max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+    max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
 services:
-  config-init:
+  searxng-config-init:
     image: ${MTE_SEARXNG_CONFIG_INIT_IMAGE:?required}
     environment:
       SEARXNG_SECRET: ${SEARXNG_SECRET:?required}
@@ -45,7 +45,7 @@ services:
         aliases:
         - searxng
     depends_on:
-      config-init:
+      searxng-config-init:
         condition: service_completed_successfully
       valkey:
         condition: service_healthy
@@ -53,14 +53,14 @@ services:
       test:
       - CMD-SHELL
       - wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1
-      interval: 30s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
+      interval: ${MTE_HEALTHCHECK_STANDARD_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_STANDARD_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_STANDARD_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_STANDARD_START_PERIOD:?required}
     restart: unless-stopped
     cpus: ${SEARXNG_CPU_LIMIT:?required}
     mem_limit: ${SEARXNG_MEMORY_LIMIT:?required}
-    pids_limit: 256
+    pids_limit: ${MTE_PIDS_SERVICE_LIMIT:?required}
     logging: *id001
   valkey:
     image: ${MTE_SEARXNG_VALKEY_IMAGE:?required}
@@ -86,13 +86,13 @@ services:
       - CMD-SHELL
       - VALKEYCLI_AUTH="$${SEARXNG_VALKEY_PASSWORD:?required}" valkey-cli ping | grep
         -q PONG
-      interval: 10s
-      timeout: 5s
-      retries: 10
+      interval: ${MTE_HEALTHCHECK_FAST_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_FAST_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_FAST_RETRIES:?required}
     restart: unless-stopped
     cpus: ${SEARXNG_VALKEY_CPU_LIMIT:?required}
     mem_limit: ${SEARXNG_VALKEY_MEMORY_LIMIT:?required}
-    pids_limit: 128
+    pids_limit: ${MTE_PIDS_LIGHTWEIGHT_LIMIT:?required}
     logging: *id001
     ports: []
 volumes:

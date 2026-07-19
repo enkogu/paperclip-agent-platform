@@ -1,0 +1,267 @@
+name: release-sbom
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-sbom-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  targets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+      release_sha: ${{ steps.release-event.outputs.release_sha }}
+    steps:
+      - name: Check out the immutable tag target
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - id: release-event
+        name: Bind the tag to its immutable remote commit
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse --verify 'HEAD^{commit}')"
+          python3 tools/platform-cli/verify-release-event.py \
+            --tag "$RELEASE_TAG" \
+            --target-sha "$release_sha" \
+            --version-file VERSION
+          printf 'release_sha=%s\n' "$release_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the pinned dependency and license contracts
+        run: python3 tools/platform-cli/validate-dependencies.py
+
+      - id: targets
+        name: Derive every immutable shipped image target
+        run: |
+          set -euo pipefail
+          matrix="$(python3 tools/platform-cli/sbom-targets.py)"
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
+  source:
+    needs: targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the immutable release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.targets.outputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Revalidate the immutable tag target
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.targets.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/platform-cli/verify-release-event.py \
+            --tag "$RELEASE_TAG" \
+            --target-sha "$RELEASE_SHA" \
+            --version-file VERSION
+
+      - name: Generate the commit-bound deployment-source SBOM
+        uses: anchore/sbom-action@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
+        env:
+          SYFT_SOURCE_NAME: ${{ github.repository }}
+          SYFT_SOURCE_VERSION: ${{ needs.targets.outputs.release_sha }}
+        with:
+          path: .
+          format: spdx-json
+          syft-version: v1.38.0
+          output-file: paperclip-agent-platform-source-${{ needs.targets.outputs.release_sha }}.spdx.json
+          upload-artifact: "false"
+          upload-release-assets: "false"
+
+      - name: Verify the source SBOM root identity
+        env:
+          RELEASE_SHA: ${{ needs.targets.outputs.release_sha }}
+          SOURCE_ROOT_NAME: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 tools/platform-cli/verify-sbom.py \
+            --expected-target "$RELEASE_SHA" \
+            --expected-root-name "$SOURCE_ROOT_NAME" \
+            --expected-root-version "$RELEASE_SHA" \
+            paperclip-agent-platform-source-"$RELEASE_SHA".spdx.json
+
+      - name: Retain the verified source SBOM for assembly
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: paperclip-agent-platform-source-${{ needs.targets.outputs.release_sha }}
+          path: paperclip-agent-platform-source-${{ needs.targets.outputs.release_sha }}.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  images:
+    needs: targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - name: Check out the immutable release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.targets.outputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Revalidate the immutable tag target
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ needs.targets.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          python3 tools/platform-cli/verify-release-event.py \
+            --tag "$RELEASE_TAG" \
+            --target-sha "$RELEASE_SHA" \
+            --version-file VERSION
+
+      - name: Generate the digest-pinned image SBOM
+        uses: anchore/sbom-action@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
+        env:
+          SYFT_SOURCE_NAME: ${{ matrix.root_name }}
+          SYFT_SOURCE_VERSION: ${{ matrix.root_version }}
+        with:
+          image: ${{ matrix.image }}
+          format: spdx-json
+          syft-version: v1.38.0
+          output-file: paperclip-agent-platform-image-${{ matrix.id }}-${{ needs.targets.outputs.release_sha }}.spdx.json
+          upload-artifact: "false"
+          upload-release-assets: "false"
+
+      - name: Verify the image SBOM root identity and digest
+        env:
+          RELEASE_SHA: ${{ needs.targets.outputs.release_sha }}
+          EXPECTED_ROOT_NAME: ${{ matrix.root_name }}
+          EXPECTED_ROOT_VERSION: ${{ matrix.root_version }}
+          EXPECTED_ROOT_PURL: ${{ matrix.purl }}
+          EXPECTED_DIGEST: ${{ matrix.digest }}
+        run: |
+          set -euo pipefail
+          python3 tools/platform-cli/verify-sbom.py \
+            --expected-target "$RELEASE_SHA" \
+            --expected-root-name "$EXPECTED_ROOT_NAME" \
+            --expected-root-version "$EXPECTED_ROOT_VERSION" \
+            --expected-root-purl "$EXPECTED_ROOT_PURL" \
+            --expected-digest "$EXPECTED_DIGEST" \
+            paperclip-agent-platform-image-${{ matrix.id }}-"$RELEASE_SHA".spdx.json
+
+      - name: Retain the verified image SBOM for assembly
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: paperclip-agent-platform-image-${{ matrix.id }}-${{ needs.targets.outputs.release_sha }}
+          path: paperclip-agent-platform-image-${{ matrix.id }}-${{ needs.targets.outputs.release_sha }}.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [targets, source, images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out the immutable release commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.targets.outputs.release_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download every verified SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: paperclip-agent-platform-*
+          path: sbom-input
+          merge-multiple: true
+
+      - name: Revalidate completeness and build one deterministic checksum bundle
+        env:
+          RELEASE_SHA: ${{ needs.targets.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          asset="paperclip-agent-platform-sbom-$RELEASE_SHA.tar.gz"
+          python3 tools/platform-cli/sbom-bundle.py \
+            --directory sbom-input \
+            --output "$asset" \
+            --release-sha "$RELEASE_SHA" \
+            --repository "$GITHUB_REPOSITORY"
+          python3 tools/platform-cli/sbom-bundle.py --verify "$asset"
+          printf 'asset=%s\n' "$asset" >> "$GITHUB_ENV"
+
+      - name: Create or reconcile the draft, verify its sole SBOM asset, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.targets.outputs.release_sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          revalidate_remote_tag() {
+            python3 tools/platform-cli/verify-release-event.py \
+              --tag "$RELEASE_TAG" \
+              --target-sha "$RELEASE_SHA" \
+              --version-file VERSION
+          }
+
+          revalidate_remote_tag
+
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" 2>/dev/null || true)"
+          if [[ -n "$release" ]]; then
+            [[ "$(jq -r '.draft' <<<"$release")" == true ]] || {
+              echo "refusing to mutate an already-public release" >&2
+              exit 1
+            }
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --target "$RELEASE_SHA" \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
+
+          # Fail closed: a moved tag leaves this release as a non-public draft.
+          revalidate_remote_tag
+
+          gh release upload "$RELEASE_TAG" "$asset" --clobber
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          release_id="$(jq -r '.id' <<<"$release")"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [[ -z "$asset_id" || "$asset_name" == "$asset" ]] && continue
+            gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+          done < <(
+            jq -r '.assets[] | select(.name | startswith("paperclip-agent-platform-sbom-")) | [.id, .name] | @tsv' <<<"$release"
+          )
+
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases/$release_id")"
+          expected_sha="sha256:$(shasum -a 256 "$asset" | awk '{print $1}')"
+          expected_size="$(wc -c < "$asset" | tr -d ' ')"
+          jq -e \
+            --arg name "$asset" \
+            --arg digest "$expected_sha" \
+            --argjson size "$expected_size" \
+            '[.assets[] | select(.name | startswith("paperclip-agent-platform-sbom-"))] as $managed | ($managed | length == 1) and ($managed[0].name == $name) and ($managed[0].size == $size) and ($managed[0].digest == $digest)' \
+            <<<"$release" >/dev/null
+          [[ "$(jq -r '.draft' <<<"$release")" == true ]] || exit 1
+          # Keep the reconciled draft if the tag moves during asset verification.
+          revalidate_remote_tag
+          gh release edit "$RELEASE_TAG" --draft=false

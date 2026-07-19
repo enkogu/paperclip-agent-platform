@@ -33,11 +33,7 @@ NOTION_PROJECTION_CONSUMER_REFS = {
     "retryBaseSecondsRef": "NOTION_SYNC_RETRY_BASE_SECONDS",
     "intervalSecondsRef": "NOTION_SYNC_INTERVAL_SECONDS",
 }
-REVIEWED_PROFILE_IDS = (
-    "postgres-notion",
-    "baserow-wikijs",
-    "postgres-postgrest-nocodb-nocodocs",
-)
+REVIEWED_PROFILE_IDS = ("postgres-notion",)
 REVIEWED_ADAPTER_ROWS = (
     (
         "notion",
@@ -48,22 +44,6 @@ REVIEWED_ADAPTER_ROWS = (
         ("provision", "verify"),
     ),
     (
-        "baserow",
-        "server-baserow.py",
-        "baserow",
-        "baserow",
-        ("tables",),
-        ("database", "provision", "verify"),
-    ),
-    (
-        "wikijs",
-        "server-wikijs.py",
-        "wikijs",
-        "wikijs",
-        ("documents",),
-        ("database", "provision", "verify"),
-    ),
-    (
         "postgrest",
         "server-postgrest.py",
         "postgrest",
@@ -71,15 +51,8 @@ REVIEWED_ADAPTER_ROWS = (
         ("data",),
         ("database", "provision", "verify"),
     ),
-    (
-        "nocodb",
-        "server-nocodb.py",
-        "nocodb",
-        "nocodb",
-        ("tables", "documents"),
-        ("database", "provision", "verify"),
-    ),
 )
+REVIEWED_ADAPTER_ORDER = ("postgrest", "notion")
 REVIEWED_PROJECTION_CONSUMERS = {
     "notion": {
         "script": "server-notion-sync.py",
@@ -92,14 +65,6 @@ OSI_LICENSES = {
     "BSD-3-Clause",
     "GPL-3.0-only",
     "MIT",
-}
-REVIEWED_LICENSE_EXCEPTIONS = {
-    "LicenseRef-NocoDB-Sustainable-Use-1.0": {
-        "component": "nocodb",
-        "scope": "internal-self-hosted-tables-ui-and-nocodocs",
-        "approval": "user-approved-2026-07-15",
-        "source": "https://github.com/nocodb/nocodb/blob/2026.06.2/LICENSE.md",
-    }
 }
 PROFILE_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ENV_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -217,6 +182,13 @@ def _reviewed_adapters() -> dict[str, dict[str, Any]]:
             actions,
         ) in REVIEWED_ADAPTER_ROWS
     }
+
+
+def _reviewed_adapter_order() -> tuple[str, ...]:
+    reviewed = _reviewed_adapters()
+    if set(REVIEWED_ADAPTER_ORDER) != set(reviewed):
+        raise DataContentError("reviewed data/content adapter order is invalid")
+    return REVIEWED_ADAPTER_ORDER
 
 
 def _validate_role(
@@ -448,30 +420,14 @@ def validate_registry(lock: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise DataContentError(f"{profile_id} image pins are invalid")
         if not isinstance(license_exceptions, dict):
             raise DataContentError(f"{profile_id} licenseExceptions must be an object")
-        non_osi = {
-            str(component_id): str(license_id)
-            for component_id, license_id in licenses.items()
-            if license_id not in OSI_LICENSES
-        }
-        reviewed_exceptions = {
-            str(row.get("component")): license_id
-            for license_id, row in REVIEWED_LICENSE_EXCEPTIONS.items()
-            if isinstance(row, dict)
-        }
         if (
             not isinstance(licenses, dict)
             or set(licenses) != set(images)
-            or non_osi
-            != {
-                component_id: license_id
-                for component_id, license_id in reviewed_exceptions.items()
-                if license_exceptions.get(component_id)
-                == REVIEWED_LICENSE_EXCEPTIONS[license_id]
-            }
-            or set(license_exceptions) != set(non_osi)
+            or any(license_id not in OSI_LICENSES for license_id in licenses.values())
+            or license_exceptions
         ):
             raise DataContentError(
-                f"{profile_id} licenses must be OSI or an exact reviewed exception"
+                f"{profile_id} licenses must be OSI-approved without exceptions"
             )
 
         if bundle["selectable"]:
@@ -872,8 +828,7 @@ def resolve_bundle(
     if missing_components:
         raise DataContentError(
             f"selected profile {profile_id} components are missing from "
-            "config/platform.yaml: "
-            + ",".join(missing_components)
+            "config/platform.yaml: " + ",".join(missing_components)
         )
     missing_refs = sorted(
         {
@@ -950,8 +905,14 @@ def adapter_commands(plane: dict[str, Any], action: str) -> list[tuple[str, str]
         raise DataContentError("data/content projection adapters are invalid")
     commands: list[tuple[str, str]] = []
     reviewed = _reviewed_adapters()
-    for adapter_id, row in adapters.items():
-        if adapter_id not in reviewed or row != reviewed[adapter_id]:
+    if set(adapters) != set(reviewed):
+        raise DataContentError("data/content projection adapter set is incomplete")
+    # The generated projection is serialized with sorted JSON keys.  Do not let
+    # that incidental representation decide lifecycle order: PostgreSQL and
+    # Notion must always reconcile in the reviewed provider order.
+    for adapter_id in _reviewed_adapter_order():
+        row = adapters[adapter_id]
+        if row != reviewed[adapter_id]:
             raise DataContentError(
                 f"projection adapter {adapter_id} is not allowlisted"
             )
@@ -976,9 +937,12 @@ def projection_consumer_commands(
     if not isinstance(adapters, dict):
         raise DataContentError("data/content projection adapters are invalid")
     reviewed = _reviewed_adapters()
+    if set(adapters) != set(reviewed):
+        raise DataContentError("data/content projection adapter set is incomplete")
     commands: list[tuple[str, str]] = []
-    for adapter_id, row in adapters.items():
-        if adapter_id not in reviewed or row != reviewed[adapter_id]:
+    for adapter_id in _reviewed_adapter_order():
+        row = adapters[adapter_id]
+        if row != reviewed[adapter_id]:
             raise DataContentError(
                 f"projection adapter {adapter_id} is not allowlisted"
             )

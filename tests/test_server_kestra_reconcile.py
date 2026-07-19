@@ -47,7 +47,7 @@ class FakeKestra:
 
     def request(
         self,
-        _base,
+        base,
         _headers,
         method,
         path,
@@ -55,13 +55,16 @@ class FakeKestra:
         body=None,
         content_type=None,
         allow_status=None,
+        timeout_seconds=None,
     ):
         self.calls.append(
             {
+                "base": base,
                 "method": method,
                 "path": path,
                 "body": body,
                 "contentType": content_type,
+                "timeoutSeconds": timeout_seconds,
             }
         )
         clean = urllib.parse.urlsplit(path).path
@@ -147,6 +150,7 @@ class KestraReconcileTests(unittest.TestCase):
             "KESTRA_ADMIN_PASSWORD=unit-only-kestra-secret\n"
             "KESTRA_LOOPBACK_HOST=127.0.0.1\n"
             "KESTRA_ORIGIN_PORT=18082\n"
+            "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS=60\n"
         )
         self.canonical.chmod(0o600)
         lock = self.root / "platform.lock.yaml"
@@ -247,6 +251,23 @@ class KestraReconcileTests(unittest.TestCase):
         self.assertEqual(
             self.fake.kv[self.module.PROFILE_CATALOG_KEY]["value"]["namespace"],
             "mte.platform",
+        )
+        self.assertTrue(
+            all(
+                call["base"] == "http://127.0.0.1:18082"
+                and call["timeoutSeconds"] == 60
+                for call in self.fake.calls
+            )
+        )
+        self.assertEqual(
+            provision["connection"],
+            {
+                "scheme": "http",
+                "hostRef": "KESTRA_LOOPBACK_HOST",
+                "portRef": "KESTRA_ORIGIN_PORT",
+                "timeoutSecondsRef": "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS",
+                "loopbackOnly": True,
+            },
         )
 
         verify = self.module.execute("verify")
@@ -449,6 +470,121 @@ class KestraReconcileTests(unittest.TestCase):
         )
         self.assertTrue(path.is_file())
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_canonical_connection_values_are_required_before_remote_mutation(self):
+        original = self.canonical.read_text()
+        required = (
+            "KESTRA_ADMIN_USER",
+            "KESTRA_ADMIN_PASSWORD",
+            "KESTRA_LOOPBACK_HOST",
+            "KESTRA_ORIGIN_PORT",
+            "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS",
+        )
+        for key in required:
+            with self.subTest(key=key):
+                self.canonical.write_text(
+                    "\n".join(
+                        line
+                        for line in original.splitlines()
+                        if not line.startswith(f"{key}=")
+                    )
+                    + "\n"
+                )
+                self.canonical.chmod(0o600)
+                self.fake.calls.clear()
+                with self.assertRaisesRegex(
+                    self.module.ReconcileError,
+                    f"canonical_env_ref_missing:{key}",
+                ):
+                    self.module.execute("provision")
+                self.assertEqual(self.fake.calls, [])
+                self.canonical.write_text(original)
+                self.canonical.chmod(0o600)
+
+    def test_invalid_canonical_connection_values_fail_before_remote_mutation(self):
+        invalid = {
+            "KESTRA_LOOPBACK_HOST": (
+                "kestra.internal",
+                "kestra_origin_not_loopback",
+            ),
+            "KESTRA_ORIGIN_PORT": ("0", "kestra_origin_port_invalid"),
+            "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS": (
+                "0",
+                "kestra_reconcile_http_timeout_invalid",
+            ),
+        }
+        original = self.canonical.read_text()
+        for key, (replacement, error) in invalid.items():
+            with self.subTest(key=key):
+                self.canonical.write_text(
+                    re.sub(
+                        rf"(?m)^{re.escape(key)}=.*$",
+                        f"{key}={replacement}",
+                        original,
+                    )
+                )
+                self.canonical.chmod(0o600)
+                self.fake.calls.clear()
+                with self.assertRaisesRegex(self.module.ReconcileError, error):
+                    self.module.execute("provision")
+                self.assertEqual(self.fake.calls, [])
+                self.canonical.write_text(original)
+                self.canonical.chmod(0o600)
+
+    def test_canonical_endpoint_and_timeout_mutations_drive_every_request(self):
+        self.canonical.write_text(
+            self.canonical.read_text()
+            .replace("KESTRA_LOOPBACK_HOST=127.0.0.1", "KESTRA_LOOPBACK_HOST=localhost")
+            .replace("KESTRA_ORIGIN_PORT=18082", "KESTRA_ORIGIN_PORT=28082")
+            .replace(
+                "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS=60",
+                "KESTRA_RECONCILE_HTTP_TIMEOUT_SECONDS=17",
+            )
+        )
+        self.canonical.chmod(0o600)
+
+        result = self.module.execute("provision")
+
+        self.assertEqual(result["firstPass"]["mutationCount"], 6)
+        self.assertTrue(self.fake.calls)
+        self.assertTrue(
+            all(
+                call["base"] == "http://localhost:28082"
+                and call["timeoutSeconds"] == 17
+                for call in self.fake.calls
+            )
+        )
+
+    def test_ipv6_loopback_is_rendered_as_a_valid_authority(self):
+        values = self.module.dotenv()
+        values["KESTRA_LOOPBACK_HOST"] = "::1"
+
+        base, _headers, timeout_seconds = self.module.basic_auth(values)
+
+        self.assertEqual(base, "http://[::1]:18082")
+        self.assertEqual(timeout_seconds, 60)
+
+    def test_request_passes_the_canonical_timeout_to_urlopen(self):
+        module = load_module()
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b"{}"
+        with mock.patch.object(
+            module.urllib.request,
+            "urlopen",
+            return_value=response,
+        ) as urlopen:
+            status, payload = module.request(
+                "http://127.0.0.1:18082",
+                {"Authorization": "Basic unit-only"},
+                "GET",
+                "/api/v1/main/flows",
+                timeout_seconds=17,
+            )
+
+        self.assertEqual((status, payload), (200, {}))
+        urlopen.assert_called_once()
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 17)
 
 
 if __name__ == "__main__":

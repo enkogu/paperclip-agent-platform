@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 390" role="img" aria-labelledby="title description">
+  <title id="title">Operator path from setup to accepted deployment</title>
+  <desc id="description">An operator creates config/platform.env as the single source of truth, runs the quick gate and preflight, reconciles the platform with install.sh, checks a live smoke test, then runs the end-to-end acceptance test.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4c5965"/></marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .step { fill: #ffffff; stroke: #64748b; stroke-width: 2; }
+      .prepare { fill: #fff7ed; stroke: #d97706; }
+      .deploy { fill: #f0fdf4; stroke: #15803d; }
+      .verify { fill: #eff6ff; stroke: #2563eb; }
+      .arrow { fill: none; stroke: #4c5965; stroke-width: 2.5; marker-end: url(#arrow); }
+      .heading { fill: #0f172a; font: 700 22px Arial, sans-serif; }
+      .step-number { fill: #475569; font: 700 12px Arial, sans-serif; letter-spacing: 1.4px; }
+      .step-title { fill: #0f172a; font: 700 18px Arial, sans-serif; }
+      .step-text { fill: #475569; font: 13px Arial, sans-serif; }
+      .command { fill: #0f172a; font: 700 11.5px "SFMono-Regular", Consolas, monospace; }
+      .note { fill: #e0f2fe; stroke: #0284c7; stroke-width: 1.5; }
+      .note-text { fill: #0c4a6e; font: 700 14px Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="390" rx="20"/>
+  <text class="heading" x="48" y="52">One operator path: config, install, Compose, test</text>
+
+  <rect class="step prepare" x="38" y="98" width="196" height="178" rx="14"/>
+  <text class="step-number" x="62" y="128">01 · PREPARE</text>
+  <text class="step-title" x="62" y="161">Single config SSOT</text>
+  <text class="step-text" x="62" y="188">Copy template inside config.</text>
+  <text class="step-text" x="62" y="210">Host, Cloudflare, GitHub,</text>
+  <text class="step-text" x="62" y="230">LLM, and Notion inputs.</text>
+  <text class="command" x="62" y="258">config/platform.env</text>
+
+  <rect class="step" x="250" y="98" width="196" height="178" rx="14"/>
+  <text class="step-number" x="274" y="128">02 · READ-ONLY GATES</text>
+  <text class="step-title" x="274" y="161">Validate target</text>
+  <text class="step-text" x="274" y="188">Check inputs and source;</text>
+  <text class="step-text" x="274" y="210">validate remote preconditions.</text>
+  <text class="command" x="274" y="242">./test.sh quick</text>
+  <text class="command" x="274" y="261">./install.sh preflight</text>
+
+  <rect class="step deploy" x="462" y="98" width="196" height="178" rx="14"/>
+  <text class="step-number" x="486" y="128">03 · FULL DEPLOY</text>
+  <text class="step-title" x="486" y="161">Reconcile platform</text>
+  <text class="step-text" x="486" y="188">Run ordered semantic stages.</text>
+  <text class="step-text" x="486" y="210">Compose reconciles services.</text>
+  <text class="command" x="486" y="252">./install.sh</text>
+
+  <rect class="step" x="674" y="98" width="196" height="178" rx="14"/>
+  <text class="step-number" x="698" y="128">04 · SMOKE</text>
+  <text class="step-title" x="698" y="161">Live health</text>
+  <text class="step-text" x="698" y="188">Check live health and the</text>
+  <text class="step-text" x="698" y="210">narrow semantic verifier.</text>
+  <text class="command" x="698" y="252">./test.sh smoke</text>
+
+  <rect class="step verify" x="886" y="98" width="276" height="178" rx="14"/>
+  <text class="step-number" x="910" y="128">05 · ACCEPT</text>
+  <text class="step-title" x="910" y="161">Fresh verification</text>
+  <text class="step-text" x="910" y="188">Run the real Paperclip/Daytona/</text>
+  <text class="step-text" x="910" y="210">all-three-harness workflow.</text>
+  <text class="command" x="910" y="252">./test.sh e2e</text>
+
+  <path class="arrow" d="M234 120 V82 H250 V98"/>
+  <path class="arrow" d="M446 120 V82 H462 V98"/>
+  <path class="arrow" d="M658 120 V82 H674 V98"/>
+  <path class="arrow" d="M870 120 V82 H886 V98"/>
+
+  <rect class="note" x="248" y="310" width="704" height="42" rx="12"/>
+  <text class="note-text" x="600" y="337" text-anchor="middle">Use ./install.sh [stage [component]] for lifecycle and ./test.sh quick|smoke|e2e for evidence.</text>
+</svg>

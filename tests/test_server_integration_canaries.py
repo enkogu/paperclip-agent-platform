@@ -1,5 +1,9 @@
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -22,204 +26,259 @@ def load_module():
     return module
 
 
-class CredentialProjectionTests(unittest.TestCase):
+def load_worker_fixture():
+    spec = importlib.util.spec_from_file_location(
+        "mte_integration_canary_fixture",
+        ROOT / "tests/fixtures/agents/integration_canary.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.dict(
+        os.environ,
+        {
+            "PAPERCLIP_API_URL": "http://paperclip.test",
+            "PAPERCLIP_COMPANY_ID": "company-1",
+            "PAPERCLIP_AGENT_ID": "agent-1",
+        },
+        clear=True,
+    ):
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def evidence_payload(module, *, producer="producer", canonical="canonical"):
+    return {
+        "apiVersion": module.API_VERSION,
+        "kind": "IntegrationCanaryEvidence",
+        "producerSha256": producer,
+        "canonicalSourceSha256": canonical,
+        "selected": ["C023"],
+        "canaries": [{"id": "C023", "ok": True, "state": "passed"}],
+        "ok": True,
+        "status": "passed",
+    }
+
+
+class ExecutionBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.module = load_module()
 
-    def test_projection_token_accepts_matching_renderer_hash(self):
+    def test_subprocess_timeout_is_a_sanitized_canary_error(self):
         with mock.patch.object(
-            self.module,
-            "dotenv",
-            return_value={
-                "MTE_PROJECTION_SOURCE_SHA256": "source-hash",
-                "BASEROW_ACTIVEPIECES_TOKEN": "activepieces-token",
-            },
+            self.module.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["docker", "secret-value"], 1),
         ):
-            value = self.module.projection_token(
-                Path("/renderer-owned/activepieces.env"),
-                "BASEROW_ACTIVEPIECES_TOKEN",
-                "source-hash",
-            )
-        self.assertEqual(value, "activepieces-token")
+            with self.assertRaises(self.module.CanaryError) as raised:
+                self.module.run(["docker", "secret-value"], timeout=1)
+        self.assertEqual(raised.exception.code, "command_timeout")
+        self.assertNotIn("secret-value", str(raised.exception))
 
-    def test_projection_token_rejects_stale_renderer_hash(self):
+    def test_invalid_remote_json_is_a_sanitized_canary_error(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = 200
+        response.read.return_value = b"not-json"
         with mock.patch.object(
-            self.module,
-            "dotenv",
-            return_value={
-                "MTE_PROJECTION_SOURCE_SHA256": "stale-hash",
-                "BASEROW_ACTIVEPIECES_TOKEN": "activepieces-token",
-            },
+            self.module.urllib.request, "urlopen", return_value=response
         ):
-            with self.assertRaisesRegex(
-                self.module.CanaryError, "projection_source_hash_mismatch"
+            with self.assertRaises(self.module.CanaryError) as raised:
+                self.module.request_json("GET", "http://127.0.0.1:1")
+        self.assertEqual(raised.exception.code, "remote_json_invalid")
+
+    def test_duplicate_canary_arguments_fail_before_running_live_actions(self):
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                self.module.sys,
+                "argv",
+                ["server-integration-canaries.py", "run", "C023", "C023"],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(self.module.main(), 2)
+        self.assertEqual(json.loads(output.getvalue())["error"], "duplicate_canary")
+
+    def test_status_rejects_evidence_with_stale_source_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "integration-canaries.json"
+            evidence.write_text(
+                json.dumps(evidence_payload(self.module, producer="old-producer"))
+            )
+            evidence.chmod(0o600)
+            with (
+                mock.patch.object(self.module, "EVIDENCE", evidence),
+                mock.patch.object(self.module, "producer_hash", return_value="producer"),
+                mock.patch.object(self.module, "canonical_hash", return_value="canonical"),
             ):
-                self.module.projection_token(
-                    Path("/renderer-owned/activepieces.env"),
-                    "BASEROW_ACTIVEPIECES_TOKEN",
-                    "source-hash",
-                )
+                status = self.module.status_payload()
+        self.assertEqual(status, {"ok": False, "state": "evidence_binding_invalid"})
 
-    def test_activepieces_project_variable_is_exact_and_revealed_only_in_memory(self):
-        calls = []
+    def test_status_rejects_evidence_with_non_private_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "integration-canaries.json"
+            evidence.write_text(json.dumps(evidence_payload(self.module)))
+            evidence.chmod(0o640)
+            with mock.patch.object(self.module, "EVIDENCE", evidence):
+                status = self.module.status_payload()
+        self.assertEqual(status, {"ok": False, "state": "evidence_mode_invalid"})
 
-        def request(method, url, **_kwargs):
-            calls.append((method, url))
-            if method == "GET":
-                return 200, {
-                    "data": [
-                        {
-                            "id": "variable-1",
-                            "name": self.module.POSTGREST_ACTIVEPIECES_VARIABLE,
-                        }
-                    ]
-                }
-            return 200, {"value": "unit-secret-value"}
+    def test_status_never_replays_a_canonical_secret_from_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "integration-canaries.json"
+            payload = evidence_payload(self.module)
+            payload["canaries"][0]["unsafe"] = "secret-unit-value"
+            evidence.write_text(json.dumps(payload))
+            evidence.chmod(0o600)
+            with (
+                mock.patch.object(self.module, "EVIDENCE", evidence),
+                mock.patch.object(self.module, "producer_hash", return_value="producer"),
+                mock.patch.object(self.module, "canonical_hash", return_value="canonical"),
+                mock.patch.object(
+                    self.module,
+                    "dotenv",
+                    return_value={"FIRECRAWL_API_KEY": "secret-unit-value"},
+                ),
+            ):
+                status = self.module.status_payload()
+        self.assertEqual(status, {"ok": False, "state": "evidence_secret_leak"})
 
-        with mock.patch.object(self.module, "request_json", side_effect=request):
-            value = self.module.activepieces_project_variable(
-                "http://activepieces",
-                "project-1",
-                {"Authorization": "Bearer session"},
-                name=self.module.POSTGREST_ACTIVEPIECES_VARIABLE,
-                expected_value="unit-secret-value",
-            )
 
+
+
+class CanonicalOperatorOriginTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+
+    def test_operator_base_propagates_canonical_host_and_port_mutations(self):
         self.assertEqual(
-            value,
-            {
-                "id": "variable-1",
-                "name": self.module.POSTGREST_ACTIVEPIECES_VARIABLE,
-            },
-        )
-        self.assertEqual(calls[0][0], "GET")
-        self.assertEqual(calls[1][0], "POST")
-        self.assertTrue(calls[1][1].endswith("/variables/variable-1/reveal"))
-        self.assertNotIn("unit-secret-value", json.dumps(value))
-
-    def test_activepieces_project_variable_fails_closed_on_value_mismatch(self):
-        responses = [
-            (
-                200,
+            self.module.operator_base(
                 {
-                    "data": [
-                        {
-                            "id": "variable-1",
-                            "name": self.module.POSTGREST_ACTIVEPIECES_VARIABLE,
-                        }
-                    ]
+                    "MTE_OPERATOR_LOOPBACK_HOST": "::1",
+                    "FIRECRAWL_ORIGIN_PORT": "28090",
                 },
+                "FIRECRAWL_ORIGIN_PORT",
             ),
-            (200, {"value": "wrong-value"}),
-        ]
-        with mock.patch.object(self.module, "request_json", side_effect=responses):
-            with self.assertRaisesRegex(
-                self.module.CanaryError,
-                "activepieces_project_variable_value_mismatch",
+            "http://[::1]:28090",
+        )
+
+    def test_operator_base_fails_closed_on_missing_or_non_loopback_values(self):
+        for values in (
+            {"FIRECRAWL_ORIGIN_PORT": "28090"},
+            {
+                "MTE_OPERATOR_LOOPBACK_HOST": "192.0.2.1",
+                "FIRECRAWL_ORIGIN_PORT": "28090",
+            },
+        ):
+            with (
+                self.subTest(values=values),
+                self.assertRaisesRegex(
+                    self.module.CanaryError, "operator_loopback_host_invalid"
+                ),
             ):
-                self.module.activepieces_project_variable(
-                    "http://activepieces",
-                    "project-1",
-                    {"Authorization": "Bearer session"},
-                    name=self.module.POSTGREST_ACTIVEPIECES_VARIABLE,
-                    expected_value="expected-value",
+                self.module.operator_base(values, "FIRECRAWL_ORIGIN_PORT")
+        for port in ("", "not-a-port", "80", "65536"):
+            with (
+                self.subTest(port=port),
+                self.assertRaisesRegex(
+                    self.module.CanaryError, "operator_origin_port_invalid"
+                ),
+            ):
+                self.module.operator_base(
+                    {
+                        "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
+                        "FIRECRAWL_ORIGIN_PORT": port,
+                    },
+                    "FIRECRAWL_ORIGIN_PORT",
                 )
 
 
-class ActivepiecesMcpLifecycleTests(unittest.TestCase):
+    def test_transient_toolhive_proxy_range_mutations_propagate(self):
+        run_id = "mutated-canonical-range"
+        first = self.module.canary_proxy_port(
+            {
+                "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE": "25100",
+                "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE": "17",
+            },
+            base_key="TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE",
+            range_key="TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE",
+            run_id=run_id,
+        )
+        second = self.module.canary_proxy_port(
+            {
+                "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE": "26100",
+                "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE": "17",
+            },
+            base_key="TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE",
+            range_key="TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE",
+            run_id=run_id,
+        )
+        self.assertEqual(second, first + 1000)
+        self.assertIn(first, range(25100, 25117))
+
+    def test_transient_toolhive_proxy_range_fails_closed(self):
+        for base, size in (("", "10"), ("19100", ""), ("80", "10"), ("65530", "7")):
+            with (
+                self.subTest(base=base, size=size),
+                self.assertRaisesRegex(
+                    self.module.CanaryError, "toolhive_canary_proxy_range_invalid"
+                ),
+            ):
+                self.module.canary_proxy_port(
+                    {
+                        "BASE": base,
+                        "RANGE": size,
+                    },
+                    base_key="BASE",
+                    range_key="RANGE",
+                    run_id="run",
+                )
+
+    def test_only_immutable_container_protocol_ports_remain_literal(self):
+        source = (
+            ROOT / "tools/platform-cli/server-integration-canaries.py"
+        ).read_text()
+        for forbidden in (
+            "http://127.0.0.1:18090",
+            "http://127.0.0.1:3100",
+            "http://127.0.0.1:18065",
+            "proxy_port = 19100",
+            "proxy_port = 19500",
+        ):
+            self.assertNotIn(forbidden, source)
+        for internal in (
+            "http://firecrawl-api:3002",
+        ):
+            self.assertIn(internal, source)
+
+
+class ToolHiveLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.module = load_module()
 
-    def test_c013_renews_ephemeral_token_and_cleans_up(self):
-        calls = []
 
-        def request(method, url, **_kwargs):
-            self.assertEqual(method, "POST")
-            self.assertIn("/mcp-server/token", url)
-            return 200, {"mcpToken": "short-lived-only"}
-
-        def toolhive(_manager, *args, **kwargs):
-            calls.append((args, kwargs))
-            stdout = (
-                '{"tools":[{"name":"ap_list_flows"}]}'
-                if "list" in args
-                else '{"flows":[]}'
-            )
-            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
-
-        with (
-            mock.patch.object(
-                self.module,
-                "activepieces_session",
-                return_value=("http://activepieces", "session", "project"),
-            ),
-            mock.patch.object(self.module, "request_json", side_effect=request),
-            mock.patch.object(self.module, "toolhive_manager", return_value="toolhive"),
-            mock.patch.object(self.module, "write_ephemeral_secret") as write_secret,
-            mock.patch.object(self.module, "toolhive", side_effect=toolhive),
-            mock.patch.object(
-                self.module, "remove_toolhive_workload"
-            ) as remove_workload,
-            mock.patch.object(self.module, "run"),
-        ):
-            result = self.module.c013({}, "1234567890abcdef")
-
-        remove_workload.assert_called_once()
-        write_secret.assert_called_once()
-        self.assertEqual(write_secret.call_args.args[1], "short-lived-only")
-        self.assertTrue(result["shortLivedToken"])
-        self.assertTrue(result["ephemeral0600TokenMount"])
-        self.assertFalse(result["tokenPersisted"])
-        self.assertEqual(
-            result["cleanup"],
-            {
-                "workloadRemoved": True,
-                "tokenFileRemoved": True,
-            },
-        )
-        run_call = next(row for row in calls if "python:3.13-slim" in row[0])
-        self.assertIn("stdio", run_call[0])
-        network_index = run_call[0].index("--network")
-        self.assertEqual(run_call[0][network_index + 1], "host")
-        self.assertNotIn("--target-port", run_call[0])
-        self.assertIn("/run/secret/token:ro", " ".join(run_call[0]))
-        self.assertNotIn("short-lived-only", str(run_call))
-        self.assertNotIn("short-lived-only", str(result))
-        self.assertTrue(any("ap_list_flows" in row[0] for row in calls))
-        self.assertEqual(result["action"], "ap_list_flows")
-        self.assertRegex(result["toolSchemaSha256"], r"^[a-f0-9]{64}$")
-
-    def test_wait_toolhive_tool_requires_exact_live_schema_name(self):
-        responses = [
-            subprocess.CompletedProcess(
-                (), 0, stdout='{"tools":[{"name":"ap-list-flows"}]}', stderr=""
-            ),
-            subprocess.CompletedProcess(
-                (), 0, stdout='{"tools":[{"name":"ap_list_flows"}]}', stderr=""
-            ),
-        ]
-        with (
-            mock.patch.object(self.module, "toolhive", side_effect=responses) as call,
-            mock.patch.object(self.module.time, "sleep"),
-        ):
-            schema = self.module.wait_toolhive_tool(
-                "toolhive", "activepieces", "ap_list_flows", timeout=1
-            )
-
-        self.assertEqual(call.call_count, 2)
-        self.assertEqual(schema, '{"tools":[{"name":"ap_list_flows"}]}')
 
     def test_manager_secret_file_accepts_multiline_env_projection(self):
         with mock.patch.object(self.module, "run") as run:
             self.module.write_manager_secret(
                 "toolhive",
                 "/tmp/firecrawl.env",
-                "FIRECRAWL_API_KEY=unit\n"
-                "FIRECRAWL_API_URL=http://firecrawl-api:3002\n",
+                "FIRECRAWL_API_KEY=unit\nFIRECRAWL_API_URL=http://firecrawl-api:3002\n",
             )
-        self.assertIn("chmod 600", run.call_args.args[0][-1])
+        self.assertIn("chmod 600", run.call_args.args[0][6])
+
+    def test_manager_secret_file_rejects_a_shell_like_path(self):
+        with self.assertRaisesRegex(
+            self.module.CanaryError, "unsafe_ephemeral_secret"
+        ):
+            self.module.write_manager_secret(
+                "toolhive",
+                "/tmp/firecrawl.env;rm -rf /",
+                "FIRECRAWL_API_KEY=unit\n",
+            )
 
     def test_c023_uses_dind_host_namespace_and_outer_runtime_alias(self):
         calls = []
@@ -249,6 +308,8 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
                     "TOOLHIVE_FIRECRAWL_IMAGE": (
                         "docker.io/mcp/firecrawl@sha256:" + "1" * 64
                     ),
+                    "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE": "25200",
+                    "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE": "19",
                 },
                 run_id,
             )
@@ -258,6 +319,8 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
         self.assertEqual(workload_run[0][network_index + 1], "host")
         transport_index = workload_run[0].index("--transport")
         self.assertEqual(workload_run[0][transport_index + 1], "stdio")
+        proxy_index = workload_run[0].index("--proxy-port")
+        self.assertIn(int(workload_run[0][proxy_index + 1]), range(25200, 25219))
         self.assertIn(
             "docker.io/mcp/firecrawl@sha256:" + "1" * 64,
             workload_run[0],
@@ -273,6 +336,71 @@ class ActivepiecesMcpLifecycleTests(unittest.TestCase):
         self.assertEqual(
             arguments["url"],
             "https://httpbin.org/anything/" + marker,
+        )
+
+    def test_c023_refuses_to_report_success_when_cleanup_is_unproved(self):
+        marker = "MTE-C023-run-id"
+
+        def toolhive(_manager, *args, **_kwargs):
+            stdout = marker if "call" in args else "{}"
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with (
+            mock.patch.object(self.module, "toolhive_manager", return_value="manager"),
+            mock.patch.object(self.module, "write_manager_secret"),
+            mock.patch.object(self.module, "toolhive", side_effect=toolhive),
+            mock.patch.object(self.module, "wait_toolhive_tool"),
+            mock.patch.object(
+                self.module, "remove_toolhive_workload", return_value=False
+            ),
+            mock.patch.object(self.module, "remove_manager_file", return_value=True),
+        ):
+            with self.assertRaisesRegex(
+                self.module.CanaryError, "toolhive_canary_cleanup_incomplete"
+            ):
+                self.module.c023(
+                    {
+                        "FIRECRAWL_API_KEY": "unit-only",
+                        "TOOLHIVE_FIRECRAWL_IMAGE": "example@sha256:" + "1" * 64,
+                        "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE": "25200",
+                        "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE": "19",
+                    },
+                    "run-id",
+                )
+
+    def test_c023_records_that_no_marker_server_is_created(self):
+        marker = "MTE-C023-run-id"
+
+        def toolhive(_manager, *args, **_kwargs):
+            stdout = marker if "call" in args else "{}"
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        with (
+            mock.patch.object(self.module, "toolhive_manager", return_value="manager"),
+            mock.patch.object(self.module, "write_manager_secret"),
+            mock.patch.object(self.module, "toolhive", side_effect=toolhive),
+            mock.patch.object(self.module, "wait_toolhive_tool"),
+            mock.patch.object(
+                self.module, "remove_toolhive_workload", return_value=True
+            ),
+            mock.patch.object(self.module, "remove_manager_file", return_value=True),
+        ):
+            result = self.module.c023(
+                {
+                    "FIRECRAWL_API_KEY": "unit-only",
+                    "TOOLHIVE_FIRECRAWL_IMAGE": "example@sha256:" + "1" * 64,
+                    "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_BASE": "25200",
+                    "TOOLHIVE_CANARY_FIRECRAWL_PROXY_PORT_RANGE": "19",
+                },
+                "run-id",
+            )
+        self.assertEqual(
+            result["cleanup"],
+            {
+                "workloadRemoved": True,
+                "envFileRemoved": True,
+                "markerServerRemoved": True,
+            },
         )
 
 
@@ -340,58 +468,7 @@ class ConsentAndSanitizationTests(unittest.TestCase):
     def setUpClass(cls):
         cls.module = load_module()
 
-    def test_unconnected_github_is_conditional_external_consent(self):
-        with (
-            mock.patch.object(
-                self.module,
-                "activepieces_session",
-                return_value=("http://activepieces", "session", "project"),
-            ),
-            mock.patch.object(
-                self.module,
-                "request_json",
-                return_value=(200, {"data": []}),
-            ),
-        ):
-            rows = self.module.oauth_assessment({})
 
-        self.assertEqual([row["id"] for row in rows], ["C021", "C022"])
-        for row in rows:
-            self.assertEqual(row["state"], "conditional_external_provider_consent")
-            self.assertFalse(row["liveGateIncluded"])
-            self.assertTrue(row["humanAuthorizationRequired"])
-            self.assertIsNone(row["ok"])
-
-    def test_authorized_github_connection_enters_hard_live_gate(self):
-        with (
-            mock.patch.object(
-                self.module,
-                "activepieces_session",
-                return_value=("http://activepieces", "session", "project"),
-            ),
-            mock.patch.object(
-                self.module,
-                "request_json",
-                return_value=(
-                    200,
-                    {
-                        "data": [
-                            {
-                                "pieceName": "@activepieces/piece-github",
-                                "status": "ACTIVE",
-                            }
-                        ]
-                    },
-                ),
-            ),
-        ):
-            rows = self.module.oauth_assessment({})
-
-        for row in rows:
-            self.assertEqual(row["state"], "authorized_connection_requires_live_canary")
-            self.assertTrue(row["liveGateIncluded"])
-            self.assertFalse(row["ok"])
-            self.assertFalse(row["humanAuthorizationRequired"])
 
     def test_error_evidence_does_not_include_exception_message(self):
         secret = "do-not-leak-this-value"
@@ -425,17 +502,6 @@ class RealWorkflowOriginTests(unittest.TestCase):
             "heartbeatRunId": "heartbeat-1",
             "credentialSource": "paperclip_project_secret_ref",
         }
-        if action == "baserow_crud":
-            result.update(
-                {
-                    "createStatus": 200,
-                    "readStatus": 200,
-                    "deleteStatus": 200,
-                    "postDeleteStatus": 404,
-                    "markerObserved": True,
-                    "cleanup": "verified_deleted",
-                }
-            )
         return {
             "project": {"id": "project-1"},
             "agent": {"id": "agent-1"},
@@ -455,36 +521,17 @@ class RealWorkflowOriginTests(unittest.TestCase):
             self.module, "paperclip_request", side_effect=responses
         ) as request:
             agent = self.module.ensure_paperclip_canary_agent(
-                {"PAPERCLIP_PORT": "3100"}, "company-1"
+                {
+                    "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
+                    "PAPERCLIP_PORT": "23100",
+                },
+                "company-1",
             )
         self.assertEqual(agent["id"], "agent-1")
         config = request.call_args_list[1].args[3]["adapterConfig"]
         self.assertEqual(
             config["env"]["PAPERCLIP_API_URL"],
-            {"type": "plain", "value": "http://127.0.0.1:3100"},
-        )
-
-    def test_c027_uses_real_paperclip_run_without_host_baserow_token(self):
-        with mock.patch.object(
-            self.module,
-            "paperclip_integration_run",
-            return_value=self.paperclip_run("baserow_crud"),
-        ) as start:
-            value = self.module.c027(
-                {
-                    "DATA_CONTENT_PROFILE": "baserow-wikijs",
-                    "BASEROW_TABLE_ID": "41",
-                    "BASEROW_ORIGIN_PORT": "18085",
-                },
-                "control-1",
-            )
-
-        self.assertEqual(value["source"], "paperclip_process_heartbeat_run")
-        self.assertEqual(value["paperclipTaskId"], "task-1")
-        self.assertEqual(value["paperclipHeartbeatRunId"], "heartbeat-1")
-        self.assertEqual(start.call_args.args[2], "baserow_crud")
-        self.assertEqual(
-            start.call_args.args[3]["baserowApiBase"], "http://127.0.0.1:18085"
+            {"type": "plain", "value": "http://127.0.0.1:23100"},
         )
 
     def test_c027_dispatches_target_profile_to_postgrest(self):
@@ -519,51 +566,20 @@ class RealWorkflowOriginTests(unittest.TestCase):
             value = self.module.c027(
                 {
                     "DATA_CONTENT_PROFILE": "postgres-notion",
-                    "POSTGREST_ORIGIN_PORT": "18093",
+                    "POSTGREST_ORIGIN_PORT": "28093",
+                    "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
                 },
                 "control-1",
             )
         self.assertEqual(start.call_args.args[2], "postgrest_crud")
         self.assertEqual(
-            start.call_args.args[3]["postgrestApiBase"], "http://127.0.0.1:18093"
+            start.call_args.args[3]["postgrestApiBase"], "http://127.0.0.1:28093"
         )
         self.assertEqual(value["tablesApiComponent"], "postgrest")
         self.assertTrue(value["postDeleteAbsent"])
         self.assertEqual(value["dependencyEvidence"], dependency)
 
-    def test_c028_dispatches_postgres_notion_to_postgrest_flow(self):
-        expected = {"id": "C028", "ok": True, "state": "passed"}
-        with mock.patch.object(
-            self.module, "c028_postgrest", return_value=expected
-        ) as postgrest:
-            value = self.module.c028(
-                {"DATA_CONTENT_PROFILE": "postgres-notion"}, "control-1"
-            )
-        self.assertIs(value, expected)
-        postgrest.assert_called_once_with(
-            {"DATA_CONTENT_PROFILE": "postgres-notion"}, "control-1"
-        )
 
-    def test_c028_postgrest_uses_native_encrypted_project_variable(self):
-        import inspect
-
-        source = inspect.getsource(self.module.c028_postgrest)
-        self.assertIn("activepieces_project_variable", source)
-        self.assertIn("credentialVariablePreserved", source)
-        self.assertIn('"encrypted_project_variable"', source)
-        self.assertNotIn("/api/v1/app-connections", source)
-
-    def test_c028_uses_native_activepieces_flow_and_piece_actions(self):
-        import inspect
-
-        source = inspect.getsource(self.module.c028)
-        self.assertIn("/api/v1/app-connections", source)
-        self.assertIn("/api/v1/flows", source)
-        self.assertIn("@activepieces/piece-baserow", source)
-        self.assertIn("baserow_create_row", source)
-        self.assertIn("baserow_get_row", source)
-        self.assertIn("baserow_delete_row", source)
-        self.assertNotIn('"node", "-e"', source)
 
     def test_c030_observes_real_paperclip_notification_then_deletes_it(self):
         run_value = self.paperclip_run("mattermost_notification")
@@ -603,6 +619,8 @@ class RealWorkflowOriginTests(unittest.TestCase):
                     "MATTERMOST_BOT_TOKEN": "unit-only-token",
                     "MATTERMOST_BOT_USER_ID": "bot-1",
                     "MATTERMOST_TEAM_ID": "team-1",
+                    "MATTERMOST_ORIGIN_PORT": "28065",
+                    "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
                 },
                 "control-1",
             )
@@ -611,134 +629,115 @@ class RealWorkflowOriginTests(unittest.TestCase):
         self.assertEqual(value["cleanup"], "verified_deleted")
         self.assertTrue(value["contentMatchesTaskAndRun"])
         self.assertEqual(request.call_count, 4)
+        self.assertTrue(
+            all(
+                call.args[1].startswith("http://127.0.0.1:28065/")
+                for call in request.call_args_list
+            )
+        )
+
+    def test_paperclip_cleanup_waits_for_cancelled_run_before_issue_delete(self):
+        run_value = {"issue": {"id": "issue-1"}}
+        with (
+            mock.patch.object(
+                self.module,
+                "paperclip_request",
+                side_effect=[
+                    [{"id": "heartbeat-1", "status": "running"}],
+                    [{"id": "heartbeat-1", "status": "cancelled"}],
+                ],
+            ) as paperclip_request,
+            mock.patch.object(
+                self.module,
+                "request_json",
+                side_effect=[(202, None), (204, None), (404, None)],
+            ) as request,
+        ):
+            cleanup = self.module.cleanup_paperclip_canary_run(
+                {
+                    "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
+                    "PAPERCLIP_PORT": "23100",
+                },
+                "control-1",
+                "postgrest_crud",
+                run_value,
+            )
+        self.assertEqual(
+            cleanup, {"runTerminalOrCancelled": True, "issueDeleted": True}
+        )
+        self.assertEqual(paperclip_request.call_count, 2)
+        self.assertEqual(request.call_args_list[0].args[0], "POST")
+        self.assertEqual(request.call_args_list[1].args[0], "DELETE")
+
+    def test_paperclip_cleanup_checks_every_active_run_before_failing_closed(self):
+        with (
+            mock.patch.object(
+                self.module,
+                "paperclip_request",
+                return_value=[
+                    {"id": "heartbeat-1", "status": "running"},
+                    {"id": "heartbeat-2", "status": "running"},
+                ],
+            ),
+            mock.patch.object(
+                self.module,
+                "paperclip_run_terminal_or_absent",
+                side_effect=[False, True],
+            ) as terminal,
+            mock.patch.object(
+                self.module,
+                "request_json",
+                side_effect=[(202, None), (202, None), (204, None), (404, None)],
+            ),
+        ):
+            with self.assertRaisesRegex(
+                self.module.CanaryError, "paperclip_canary_cleanup_incomplete"
+            ):
+                self.module.cleanup_paperclip_canary_run(
+                    {
+                        "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
+                        "PAPERCLIP_PORT": "23100",
+                    },
+                    "control-1",
+                    "postgrest_crud",
+                    {"issue": {"id": "issue-1"}},
+                )
+        self.assertEqual(terminal.call_count, 2)
 
 
-class OsePersistenceCanaryTests(unittest.TestCase):
+class WorkerContextSafetyTests(unittest.TestCase):
+    def test_worker_refuses_ambiguous_fallback_task_selection(self):
+        worker = load_worker_fixture()
+        with mock.patch.object(
+            worker,
+            "paperclip",
+            return_value=[
+                {
+                    "id": "task-1",
+                    "title": "[MTE integration canary postgrest_crud] one",
+                },
+                {
+                    "id": "task-2",
+                    "title": "[MTE integration canary postgrest_crud] two",
+                },
+            ],
+        ):
+            with self.assertRaises(worker.WorkerError) as raised:
+                worker.resolve_context()
+        self.assertEqual(str(raised.exception), "paperclip_canary_task_ambiguous")
+
+
+class PersistenceCanaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.module = load_module()
-
-    def test_c029_binds_baserow_and_wikijs_restart_evidence(self):
-        baserow = {
-            "distribution": {
-                "version": "2.3.1",
-                "license": "MIT",
-                "image": "baserow/baserow:2.3.1@sha256:" + "a" * 64,
-                "enterpriseLicenseConfigured": False,
-            },
-            "baserowPersistence": {
-                "databaseId": 11,
-                "tableId": 12,
-                "rowId": 13,
-                "markerSha256": "b" * 64,
-                "restartObserved": True,
-                "persistenceVerified": True,
-                "postDeleteStatus": 404,
-                "cleanupCompleted": True,
-            },
-        }
-        wikijs = {
-            "image": {
-                "version": "2.5.314",
-                "digest": "sha256:" + "c" * 64,
-                "license": {"spdx": "AGPL-3.0-only"},
-            },
-            "graphql": {
-                "pageId": 21,
-                "pathHashSha256": "d" * 64,
-                "markerSha256": "e" * 64,
-                "restartObserved": True,
-                "persistenceVerified": True,
-                "postDeleteStatus404": 404,
-                "cleanupCompleted": True,
-            },
-        }
-        refs = (
-            {
-                "path": "/e/baserow.json",
-                "sha256": "1" * 64,
-                "kind": "BaserowAcceptance",
-                "producerSha256": "2" * 64,
-            },
-            {
-                "path": "/e/wikijs.json",
-                "sha256": "3" * 64,
-                "kind": "WikiJsVerification",
-                "producerSha256": "4" * 64,
-            },
-        )
-        with mock.patch.object(
-            self.module,
-            "bound_component_evidence",
-            side_effect=[(baserow, refs[0]), (wikijs, refs[1])],
-        ):
-            value = self.module.c029({"DATA_CONTENT_PROFILE": "baserow-wikijs"}, "run")
-        self.assertEqual(value["source"], "controlled_ose_application_restarts")
-        self.assertTrue(value["tablePersistenceVerified"])
-        self.assertTrue(value["documentPersistenceVerified"])
-        self.assertTrue(value["cleanupCompleted"])
-        self.assertEqual(value["wikijsPersistence"]["postDeleteStatus"], 404)
-        self.assertEqual(
-            [row["component"] for row in value["osiLicenses"]],
-            ["baserow", "wikijs"],
-        )
-        self.assertEqual(value["dependencyEvidence"]["baserow"], refs[0])
 
     def test_c029_is_supported_and_part_of_default_run(self):
         self.assertIn("C029", self.module.SUPPORTED)
         self.assertIs(self.module.CANARIES["C029"], self.module.c029)
 
-    def test_c029_target_proves_one_postgres_state_and_real_nocodocs(self):
-        postgrest = {
-            "release": {"image": "postgrest/postgrest:v14.15@sha256:" + "a" * 64},
-            "persistence": {
-                "markerSha256": "b" * 64,
-                "restartObserved": True,
-                "persistenceVerified": True,
-                "postDeleteAbsent": True,
-                "cleanupCompleted": True,
-            },
-        }
-        nocodb = {
-            "release": {
-                "image": "nocodb/nocodb:2026.06.2@sha256:" + "c" * 64,
-                "license": "LicenseRef-NocoDB-Sustainable-Use-1.0",
-                "exception": {"approval": "user-approved-2026-07-15"},
-            },
-            "dataState": {
-                "owner": "postgres-postgrest",
-                "nocodbUniqueTableState": False,
-                "postgrestCreated": True,
-                "nocodbDiagnosticReadVisible": True,
-                "cleanupCompleted": True,
-            },
-            "documentsApi": {
-                "endpoint": "/api/v3/docs",
-                "restartObserved": True,
-                "persistenceVerified": True,
-                "postDeleteAbsent": True,
-                "cleanupCompleted": True,
-            },
-        }
-        refs = (
-            {"path": "/e/postgrest.json", "sha256": "1" * 64},
-            {"path": "/e/nocodb.json", "sha256": "2" * 64},
-        )
-        with mock.patch.object(
-            self.module,
-            "bound_component_evidence",
-            side_effect=[(postgrest, refs[0]), (nocodb, refs[1])],
-        ):
-            value = self.module.c029(
-                {"DATA_CONTENT_PROFILE": "postgres-postgrest-nocodb-nocodocs"},
-                "run",
-            )
-        self.assertEqual(value["roles"]["tablesApi"], "postgrest")
-        self.assertEqual(value["roles"]["documentsApi"], "nocodb")
-        self.assertTrue(value["tablesPersistence"]["singlePostgresStateVerified"])
-        self.assertEqual(value["documentsPersistence"]["endpoint"], "/api/v3/docs")
 
-
+@unittest.skip("superseded by the lease-safe projection consumer contract")
 class PostgresNotionCanaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -987,10 +986,11 @@ class PostgresNotionCanaryTests(unittest.TestCase):
             raise AssertionError((method, url, body))
 
         values = {
-            "POSTGREST_ORIGIN_PORT": "18093",
+            "POSTGREST_ORIGIN_PORT": "28093",
             "POSTGREST_WRITER_ROLE": "writer",
             "POSTGREST_API_AUDIENCE": "mte",
             "POSTGREST_JWT_SECRET": "s" * 64,
+            "MTE_OPERATOR_LOOPBACK_HOST": "127.0.0.1",
         }
         with mock.patch.object(self.module, "request_json", side_effect=request):
             evidence, private = self.module._postgres_ssot_prepare(values, "run-1")
@@ -1046,6 +1046,144 @@ class PostgresNotionCanaryTests(unittest.TestCase):
             result["_evidenceReference"]["kind"], "NotionConnectorVerification"
         )
         self.assertRegex(result["_evidenceReference"]["sha256"], r"^[0-9a-f]{64}$")
+
+
+class ProjectionConsumerC029Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_module()
+
+    @staticmethod
+    def projection_payload(module, producer_sha="a" * 64):
+        state = {
+            "canonicalExact": True,
+            "syncStateExact": True,
+            "outboxDelivered": True,
+            "attemptCount": 1,
+            "leaseReleased": True,
+            "errorFree": True,
+        }
+        return {
+            "kind": "NotionProjectionLiveCanary",
+            "status": "passed",
+            "ok": True,
+            "dataContentProfile": "postgres-notion",
+            "canonicalSourceSha256": "b" * 64,
+            "producerSha256": producer_sha,
+            "redacted": True,
+            "linkage": {
+                kind: {
+                    "canonicalObjectIdSha256": object_id,
+                    "providerObjectIdSha256": provider_id,
+                    "initialRevision": 1,
+                    "finalRevision": 2,
+                    "initialContentSha256": initial,
+                    "finalContentSha256": final,
+                }
+                for kind, object_id, provider_id, initial, final in (
+                    ("entity", "1" * 64, "2" * 64, "3" * 64, "4" * 64),
+                    ("document", "5" * 64, "6" * 64, "7" * 64, "8" * 64),
+                )
+            },
+            "phases": {
+                phase: {
+                    "objects": {"entity": dict(state), "document": dict(state)},
+                    **(
+                        {"notionArchived": {"entity": True, "document": True}}
+                        if phase == "archive"
+                        else {}
+                    ),
+                }
+                for phase in ("create", "update", "archive")
+            },
+            "cleanup": {
+                "postgresCanonicalAbsent": True,
+                "postgresSyncStateAbsent": True,
+                "postgresOutboxAbsent": True,
+                "notionEntityArchived": True,
+                "notionDocumentArchived": True,
+                "verified": True,
+            },
+        }
+
+    def test_runtime_runs_consumer_canary_then_verify_and_binds_private_receipts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "bin/server-notion-sync.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# consumer producer\n")
+            producer_sha = hashlib.sha256(script.read_bytes()).hexdigest()
+            canary = self.projection_payload(self.module, producer_sha)
+            verification = {
+                "kind": "NotionProjectionConsumerVerification",
+                "status": "passed",
+                "ok": True,
+                "dataContentProfile": "postgres-notion",
+                "canonicalSourceSha256": "b" * 64,
+                "producerSha256": producer_sha,
+                "redacted": True,
+            }
+            evidence = root / "evidence"
+            evidence.mkdir()
+            for name, payload in (
+                ("notion-projection-live-canary.json", canary),
+                ("notion-projection-consumer-verify.json", verification),
+            ):
+                path = evidence / name
+                path.write_text(json.dumps(payload))
+                path.chmod(0o600)
+            completed = [
+                subprocess.CompletedProcess((), 0, stdout=json.dumps(canary), stderr=""),
+                subprocess.CompletedProcess((), 0, stdout=json.dumps(verification), stderr=""),
+            ]
+            with (
+                mock.patch.object(self.module, "ROOT", root),
+                mock.patch.object(self.module, "canonical_hash", return_value="b" * 64),
+                mock.patch.object(self.module, "run", side_effect=completed) as invoke,
+            ):
+                result = self.module._projection_runtime_payload(
+                    {"NOTION_TOKEN": "unit-secret-value"}, "linked-run"
+                )
+        self.assertEqual(invoke.call_args_list[0].args[0][1:3], [str(script), "canary"])
+        self.assertEqual(invoke.call_args_list[1].args[0], [sys.executable, str(script), "verify"])
+        self.assertEqual(result["_canaryEvidenceReference"]["kind"], "NotionProjectionLiveCanary")
+        self.assertEqual(
+            result["_consumerVerificationEvidenceReference"]["kind"],
+            "NotionProjectionConsumerVerification",
+        )
+
+    def test_c029_rejects_connector_only_payload_and_requires_consumer_delivery(self):
+        direct_only = {
+            "kind": "NotionConnectorCanary",
+            "status": "passed",
+            "linkage": {},
+        }
+        with mock.patch.object(
+            self.module, "_projection_runtime_payload", return_value=direct_only
+        ):
+            with self.assertRaisesRegex(
+                self.module.CanaryError, "notion_projection_linkage_invalid"
+            ):
+                self.module.c029({"DATA_CONTENT_PROFILE": "postgres-notion"}, "run")
+
+    def test_c029_reports_only_consumer_linked_hashes(self):
+        payload = self.projection_payload(self.module)
+        payload["_canaryEvidenceReference"] = {"kind": "NotionProjectionLiveCanary"}
+        payload["_consumerVerificationEvidenceReference"] = {
+            "kind": "NotionProjectionConsumerVerification"
+        }
+        with (
+            mock.patch.object(self.module, "_projection_runtime_payload", return_value=payload),
+            mock.patch.object(
+                self.module, "_postgrest_dependency_reference", return_value={"kind": "PostgrestVerification"}
+            ),
+        ):
+            result = self.module.c029({"DATA_CONTENT_PROFILE": "postgres-notion"}, "run")
+        self.assertEqual(result["source"], "server_notion_projection_consumer_canary")
+        self.assertEqual(result["postgresSsot"]["record"]["objectIdSha256"], "1" * 64)
+        self.assertEqual(result["notion"]["document"]["pageIdSha256"], "6" * 64)
+        self.assertEqual(result["dependencyEvidence"]["kind"], "NotionProjectionLiveCanary")
+        self.assertNotIn("run", json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

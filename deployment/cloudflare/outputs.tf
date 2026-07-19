@@ -8,30 +8,27 @@ output "tunnel" {
 }
 
 output "published_hostnames" {
-  description = "Hostnames managed by this stack, keyed by component ID."
+  description = "Hostnames declared by this stack and reconciled through the DNS batch API."
   value = {
-    for id, record in cloudflare_dns_record.platform : id => record.name
+    for id, app in var.apps : id => app.hostname
   }
 }
 
-output "access_applications" {
-  description = "Access application identifiers and audience tags."
-  value = merge(
-    {
-      for id, app in cloudflare_zero_trust_access_application.human : id => {
-        id           = app.id
-        audience_tag = app.aud
-        class        = "human"
-      }
-    },
-    {
-      for id, app in cloudflare_zero_trust_access_application.service : id => {
-        id           = app.id
-        audience_tag = app.aud
-        class        = "service"
-      }
-    }
-  )
+output "tunnel_id" {
+  description = "Non-secret tunnel identifier consumed by the DNS batch reconciler."
+  value       = cloudflare_zero_trust_tunnel_cloudflared.platform.id
+}
+
+output "human_access_policy_id" {
+  description = "Non-secret policy ID consumed by the Access API reconciler."
+  value       = try(cloudflare_zero_trust_access_policy.human[0].id, null)
+}
+
+output "service_access_policy_ids" {
+  description = "Per-application policy IDs consumed by the Access API reconciler."
+  value = {
+    for id, policy in cloudflare_zero_trust_access_policy.service : id => policy.id
+  }
 }
 
 # Terraform/OpenTofu masks sensitive outputs during plan/apply. Deployment code
@@ -43,13 +40,15 @@ output "tunnel_token" {
   sensitive   = true
 }
 
-output "service_token" {
-  description = "Credential used by automated clients of service-class apps."
-  value = length(cloudflare_zero_trust_access_service_token.platform) == 1 ? {
-    id            = cloudflare_zero_trust_access_service_token.platform[0].id
-    client_id     = cloudflare_zero_trust_access_service_token.platform[0].client_id
-    client_secret = cloudflare_zero_trust_access_service_token.platform[0].client_secret
-    expires_at    = cloudflare_zero_trust_access_service_token.platform[0].expires_at
-  } : null
+output "service_tokens" {
+  description = "Per-application credentials used only by the matching service route."
+  value = {
+    for id, token in cloudflare_zero_trust_access_service_token.service : id => {
+      id            = token.id
+      client_id     = token.client_id
+      client_secret = token.client_secret
+      expires_at    = token.expires_at
+    }
+  }
   sensitive = true
 }

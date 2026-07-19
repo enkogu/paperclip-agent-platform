@@ -1,0 +1,66 @@
+apiVersion: micro-task-engine/v1alpha1
+kind: ReleaseEvidenceRegistry
+requirements:
+  - {id: C001, from: kestra, to: paperclip, required: true, auth: service, exposure: internal, check: paperclip-task-canary}
+  - {id: C002, from: paperclip, to: runner, required: true, auth: run-token, exposure: internal, check: runner-claim}
+  - {id: C003, from: runner, to: paperclip, required: true, auth: run-token, exposure: internal, check: paperclip-heartbeats-result}
+  - {id: C004, from: operator, to: paperclip, required: true, auth: cloudflare-human, exposure: human, check: cloudflare-paperclip}
+  - {id: C005, from: operator, to: kestra, required: true, auth: cloudflare-human+app, exposure: human, check: cloudflare-kestra}
+  - {id: C006, from: operator, to: hermes-native-api, required: true, auth: loopback-bearer, exposure: loopback, check: hermes-native-api}
+  - {id: C007, from: hermes-native-api, to: hermes-llm-loop, required: true, auth: native-session, exposure: none, check: hermes-native-turn}
+  - {id: C008, from: runner, to: 9router, required: true, auth: profile-client-key, exposure: internal, check: runner-llm-completion}
+  - {id: C009, from: hermes, to: 9router, required: true, auth: hermes-client-key, exposure: internal, check: hermes-llm-completion}
+  - {id: C010, from: runner, to: toolhive, required: true, auth: profile-identity, exposure: internal, check: toolhive-mcp-initialize, policy: postgres-ssot-notion-readonly-v1}
+  - {id: C011, from: hermes-llm-loop, to: hermes-native-terminal, required: true, auth: native-approval, exposure: none, check: hermes-native-terminal}
+  - {id: C012, from: toolhive, to: mcp-runtime, required: true, auth: injected-secret-refs, exposure: internal, check: toolhive-workload-canary, policy: per-workload-tools-list-and-call-filter}
+  - {id: C014, from: provisioner, to: paperclip, required: true, auth: bootstrap-service, exposure: loopback, check: provision-paperclip}
+  - {id: C015, from: provisioner, to: 9router, required: true, auth: admin, exposure: loopback, check: provision-9router}
+  - {id: C016, from: provisioner, to: toolhive, required: true, auth: operator, exposure: loopback, check: provision-toolhive}
+  - {id: C017, from: harness-profile, to: 9router, required: true, auth: profile-client-key, exposure: internal, check: profile-llm-completion}
+  - {id: C018, from: native-harness, to: 9router-profile-route, required: true, auth: profile-scoped-runtime-key, exposure: internal, check: harness-scoped-router-auth}
+  - {id: C019, from: profile-reconciler, to: control-planes, required: true, auth: service, exposure: internal, check: profile-reconcile}
+  - {id: C023, from: toolhive, to: firecrawl, required: true, auth: service, exposure: internal, check: firecrawl-scrape}
+  - {id: C024, from: firecrawl, to: searxng, required: true, auth: network-policy, exposure: internal, check: searxng-json-search}
+  - {id: C025, from: operator, to: searxng, required: true, auth: cloudflare-human, exposure: human, check: cloudflare-searxng}
+  - {id: C026, from: operator-service, to: firecrawl, required: true, auth: cloudflare-service-token, exposure: service, check: cloudflare-firecrawl}
+  - {id: C027, from: paperclip-kestra, to: data-content/scopedDataApi, required: true, auth: profile-scoped-database-token, exposure: internal, check: paperclip-tables-api-scoped-token}
+  - {id: C029, from: postgres-ssot, to: data-content/tables+documents-projections, required: true, auth: provider-integration-secret, exposure: egress, check: data-content-persistence, connectorIdentity: mte.notion.connector}
+  - {id: C030, from: paperclip-kestra, to: mattermost, required: true, auth: bot-or-webhook, exposure: internal, check: mattermost-notification}
+  - {id: C031, from: mattermost, to: hermes, required: true, auth: bot-token+allowed-user, exposure: internal, check: hermes-mattermost-auth}
+  - {id: C032, from: operator, to: mattermost, required: true, auth: cloudflare-human+app, exposure: human, check: cloudflare-mattermost}
+  - {id: C033, from: telegram, to: hermes, required: true, condition: telegram-configured, auth: bot-token+allowed-user, exposure: webhook, check: hermes-telegram-auth}
+  - {id: C034, from: hermes-native-terminal, to: platform-cli, required: true, auth: native-approval, exposure: none, check: hermes-platform-status}
+  - {id: C035, from: hermes, to: platform-host, required: true, auth: declared-operator-mode, exposure: none, check: hermes-host-operator-policy}
+  - {id: C036, from: provisioner, to: data-content/connectors, required: true, auth: scoped-provider-secret, exposure: egress, check: provision-data-content, connectorIdentity: mte.notion.connector}
+  - {id: C037, from: provisioner, to: mattermost, required: true, auth: bootstrap-admin, exposure: loopback, check: provision-mattermost}
+  - {id: C039, from: provisioner, to: kestra, required: true, auth: admin, exposure: loopback, check: provision-kestra}
+  - {id: C040, from: applications-runners, to: otel, required: true, auth: internal-network, exposure: internal, check: telemetry-canary}
+  - {id: C041, from: exporters, to: victoria, required: true, auth: internal-network, exposure: internal, check: host-container-metrics}
+  - {id: C042, from: otel, to: victoria-metrics, required: true, auth: internal-network, exposure: internal, check: victoria-metrics-canary}
+  - {id: C043, from: otel, to: victoria-logs, required: true, auth: internal-network, exposure: internal, check: victoria-logs-canary}
+  - {id: C044, from: otel, to: victoria-traces, required: true, auth: internal-network, exposure: internal, check: victoria-traces-canary}
+  - {id: C045, from: grafana, to: victoria-backends, required: true, auth: internal-network, exposure: internal, check: grafana-datasources}
+  - {id: C046, from: operator, to: grafana, required: true, auth: cloudflare-human+app, exposure: human, check: cloudflare-grafana}
+  - {id: C047, from: vmalert, to: alertmanager, required: true, auth: internal-network, exposure: internal, check: alertmanager-canary}
+  - {id: C048, from: alertmanager, to: mattermost, required: true, auth: webhook-secret, exposure: internal, check: alertmanager-mattermost}
+  - {id: C049, from: blackbox, to: loopback-services, required: true, auth: none, exposure: loopback, check: blackbox-probes}
+  - {id: C050, from: provisioner, to: grafana, required: true, auth: bootstrap-admin, exposure: loopback, check: provision-grafana}
+  - {id: C060, from: platform-cli, to: storage-vps, required: true, auth: ssh-key, exposure: restricted, check: host-preflight}
+  - {id: C063, from: apps, to: own-postgresql, required: true, auth: per-app-password, exposure: internal, check: postgres-ready-query}
+  - {id: C064, from: apps, to: own-redis-valkey, required: true, auth: per-app-password, exposure: internal, check: redis-auth-ping}
+  - {id: C065, from: cloudflared, to: cloudflare, required: true, auth: tunnel-token, exposure: egress, check: tunnel-health}
+  - {id: C066, from: cloudflare, to: cloudflared, required: true, auth: cloudflare-managed, exposure: edge, check: tunnel-routes}
+  - {id: C067, from: platform-cloudflare, to: cloudflare-api, required: true, auth: scoped-api-token, exposure: egress, check: cloudflare-empty-plan}
+  - {id: C068, from: backup-job, to: encrypted-target, required: false, auth: age-recipient, exposure: egress, check: restore-canary}
+  - {id: C069, from: indexed-deploy, to: provisioning-methods, required: true, auth: secret-refs, exposure: none, check: deploy-idempotency}
+  - {id: C070, from: verifier, to: integrations-secret-store, required: true, auth: root-files, exposure: none, check: secret-permissions-audit}
+  - {id: C071, from: canonical-platform-env, to: runtime-projections, required: true, auth: root-source-hash, exposure: none, check: canonical-projections-audit}
+  - {id: C072, from: paperclip, to: daytona-provider, required: true, auth: plugin-secret-ref, exposure: egress, check: paperclip-daytona-provider}
+  - {id: C073, from: paperclip, to: execution-workspace, required: true, auth: runtime-identity, exposure: none, check: paperclip-workspace-canary}
+  - {id: C074, from: daytona, to: sandbox-image-runtime, required: true, auth: provider-credential, exposure: egress, check: daytona-sandbox-runtime}
+  - {id: C075, from: paperclip-secrets, to: harness-env, required: true, auth: secret-refs, exposure: none, check: paperclip-harness-env}
+  - {id: C076, from: kestra, to: e2e-flow, required: true, auth: service, exposure: internal, check: kestra-e2e-flow}
+  - {id: C077, from: harness, to: 9router-minimax, required: true, auth: profile-client-key, exposure: internal, check: harness-minimax-completion}
+  - {id: C078, from: harness, to: github-branch-pr, required: true, auth: scoped-github-token, exposure: egress, check: harness-github-pr}
+  - {id: C079, from: github-checks, to: kestra-terminal-status, required: true, auth: public-observation+service, exposure: egress, check: github-checks-kestra-terminal}
+  - {id: C080, from: e2e-cleanup, to: sandbox-workspace-state, required: true, auth: provider+runtime-identity, exposure: none, check: e2e-cleanup-state}

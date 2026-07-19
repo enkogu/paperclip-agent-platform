@@ -91,9 +91,10 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 def combined_environment(env_file: Path) -> dict[str, str]:
-    values = parse_env_file(env_file)
-    values.update(os.environ)
-    return values
+    # platform.env is the authoritative, hash-governed input. In particular,
+    # do not let a stale operator shell override it or fill a missing governed
+    # provider reference from ambient process state.
+    return parse_env_file(env_file)
 
 
 def env_ref(section: dict[str, Any], key: str, environment: dict[str, str]) -> str:
@@ -601,11 +602,11 @@ def main() -> int:
         domain,
         args.data_content_projection.expanduser().resolve(),
     )
-    allowed_emails = parse_allowed_emails(cloudflare, environment)
-    if (
-        any(app["access_class"] == "human" for app in apps.values())
-        and not allowed_emails
-    ):
+    human_apps_present = any(app["access_class"] == "human" for app in apps.values())
+    allowed_emails = (
+        parse_allowed_emails(cloudflare, environment) if human_apps_present else []
+    )
+    if human_apps_present and not allowed_emails:
         raise RenderError(
             "human-facing apps require canonical Cloudflare allowed emails"
         )

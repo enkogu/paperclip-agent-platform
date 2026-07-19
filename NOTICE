@@ -8,9 +8,16 @@ The project configures and interoperates with independently distributed
 third-party software. Those projects, container images, command-line tools,
 hosted APIs, names, and trademarks remain governed by their respective
 licenses and policies. The Apache-2.0 license in this repository does not
-relicense them. See docs/en/third-party.md and platform.lock.yaml.
+relicense them. See skills/system-platform/references/third-party.md,
+config/licenses.lock.json, and config/dependencies.lock.json.
 
 Licensing rationale: Apache-2.0 gives downstream operators an explicit patent
 grant and permissive rights for the original platform code, while preserving
 all third-party license boundaries. Copyleft runtime components are consumed
 as separate services or images; their source is not relicensed by this notice.
+
+The non-official MTE Paperclip runtime is never represented as an official
+upstream image. Its upstream MIT base provenance is recorded separately from
+the operator-supplied fork image digest, source URL, and immutable revision.
+Hermes provenance verification also uses the Apache-2.0 `sigstore` JavaScript
+package 3.0.0 already shipped in the digest-pinned Node verifier image.

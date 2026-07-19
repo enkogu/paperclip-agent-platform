@@ -1,0 +1,402 @@
+{
+  "schemaVersion": 1,
+  "kind": "PublicCoreLicenseCatalog",
+  "metadata": {
+    "reviewedAt": "2026-07-16",
+    "scope": "Direct pinned runtime artifacts, installers and source installations shipped or fetched by this repository.",
+    "limitation": "This catalog is not a transitive container or operating-system SBOM. A release SBOM is still required before redistribution."
+  },
+  "policy": {
+    "allowedLicenseExpressions": [
+      "AGPL-3.0-only",
+      "Apache-2.0",
+      "Apache-2.0 AND MIT",
+      "BSD-3-Clause",
+      "LicenseRef-OCI-Mixed-Open-Source",
+      "MIT",
+      "MIT OR Unlicense",
+      "MPL-2.0",
+      "MPL-2.0 AND Apache-2.0",
+      "PostgreSQL"
+    ],
+    "deniedLicenseTokens": [
+      "BUSL",
+      "Commons-Clause",
+      "Elastic-License",
+      "LicenseRef-Activepieces-Enterprise",
+      "LicenseRef-RSAL",
+      "NC",
+      "PolyForm",
+      "SSPL"
+    ],
+    "allowedDecisions": [
+      "approved-oss",
+      "operator-provided-external-runtime",
+      "operator-provided-proprietary-tool",
+      "blocked"
+    ],
+    "operatorHarnessEnablement": {
+      "key": "MTE_ENABLE_OPERATOR_PROVIDED_PROPRIETARY_HARNESSES",
+      "default": "false",
+      "requiredComponents": ["claude-code", "codex-cli"],
+      "installerConsumers": ["deployment/steps/daytona.sh"]
+    }
+  },
+  "components": {
+    "9router": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "v0.5.30",
+      "sourceUrl": "https://github.com/decolua/9router/tree/v0.5.30"
+    },
+    "activepieces-official-image": {
+      "decision": "blocked",
+      "licenseExpression": "MIT AND LicenseRef-Activepieces-Enterprise",
+      "reason": "The official image contains packages/ee under a production-subscription license that prohibits redistribution.",
+      "sourceRef": "36ba96ba119ff4f8ce3808b6210f6d367e8e4ac8",
+      "sourceUrl": "https://github.com/activepieces/activepieces/tree/36ba96ba119ff4f8ce3808b6210f6d367e8e4ac8"
+    },
+    "cadvisor": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v0.60.5",
+      "sourceUrl": "https://github.com/google/cadvisor/tree/v0.60.5"
+    },
+    "claude-code": {
+      "decision": "operator-provided-proprietary-tool",
+      "licenseExpression": "LicenseRef-Anthropic-Proprietary",
+      "reason": "Fetched from Anthropic only after deliberate operator enablement; never redistributed by this repository.",
+      "redistributed": false,
+      "sourceRef": "2.1.209",
+      "sourceUrl": "https://www.npmjs.com/package/@anthropic-ai/claude-code/v/2.1.209"
+    },
+    "cloudflared": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "2026.7.1",
+      "sourceUrl": "https://github.com/cloudflare/cloudflared/tree/2026.7.1"
+    },
+    "codex-cli": {
+      "decision": "operator-provided-proprietary-tool",
+      "licenseExpression": "Apache-2.0",
+      "reason": "The executable is Apache-2.0, but it remains an operator-enabled client. Its runtime key is a 9router profile key; no native subscription credential is distributed or stored.",
+      "redistributed": false,
+      "sourceRef": "rust-v0.144.4",
+      "sourceUrl": "https://github.com/openai/codex/tree/rust-v0.144.4"
+    },
+    "context7": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "0.1.1",
+      "sourceUrl": "https://www.npmjs.com/package/@upstash/context7-pi/v/0.1.1"
+    },
+    "daytona-runtime": {
+      "decision": "approved-oss",
+      "licenseExpression": "AGPL-3.0-only",
+      "reason": "Frozen self-hosted control-plane images report v0.187.0; the separately versioned sandbox base is tracked by daytona-sandbox-image.",
+      "sourceRef": "8a446cb96331737e5a2118cbcaa0604d95c07f71",
+      "sourceUrl": "https://github.com/daytonaio/daytona/tree/8a446cb96331737e5a2118cbcaa0604d95c07f71"
+    },
+    "daytona-harness-private-image": {
+      "decision": "operator-provided-external-runtime",
+      "licenseExpression": "LicenseRef-Private-Harness-Composite",
+      "reason": "Deployment receives the private CI-built digest plus exact source/revision evidence. The image includes the independently cataloged Daytona base, Codex, Claude Code, Pi, Context7, ToolHive, GitHub CLI and jq artifacts; it is not part of the public source-release image matrix.",
+      "redistributed": false,
+      "sourceRef": "operator-release-evidence-required",
+      "sourceUrl": "https://github.com/daytonaio/daytona"
+    },
+    "daytona-sdk": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v0.171.0",
+      "sourceUrl": "https://github.com/daytonaio/sdk/tree/v0.171.0"
+    },
+    "daytona-sandbox-image": {
+      "decision": "approved-oss",
+      "licenseExpression": "AGPL-3.0-only",
+      "reason": "The CI-only Dockerfile extends Daytona's official sandbox image pinned by immutable digest; harness npm packages and downloaded tools are independently checksum locked. The resulting private harness image requires operator release evidence at deployment.",
+      "sourceRef": "v0.190.0",
+      "sourceUrl": "https://github.com/daytonaio/daytona/tree/v0.190.0",
+      "provenance": {
+        "type": "official-digest-pinned-base",
+        "baseImage": "daytonaio/sandbox:v0.190.0-slim-amd64@sha256:91e37b087e04314e481009f9f95c98b6d882a930691deb03de6a68f774cdb16e",
+        "dockerfile": "deployment/image-build/daytona-harness/Dockerfile"
+      }
+    },
+    "dex": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v2.42.0",
+      "sourceUrl": "https://github.com/dexidp/dex/tree/v2.42.0"
+    },
+    "distribution": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v2.8.3",
+      "sourceUrl": "https://github.com/distribution/distribution/tree/v2.8.3"
+    },
+    "docker-engine": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "29.6.1",
+      "sourceUrl": "https://github.com/moby/moby"
+    },
+    "firecrawl": {
+      "decision": "approved-oss",
+      "licenseExpression": "AGPL-3.0-only",
+      "reason": "Firecrawl, Playwright and NuQ PostgreSQL use the official Firecrawl GHCR images pinned by immutable multi-platform digest.",
+      "sourceRef": "16d5e3915ce2cb4324f21639576425f4b09b0c9f",
+      "sourceUrl": "https://github.com/firecrawl/firecrawl/tree/16d5e3915ce2cb4324f21639576425f4b09b0c9f"
+    },
+    "firecrawl-mcp": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "reason": "The pinned Docker MCP image declares OCI revision 2bab1cc2f960e32a3071ec592c89e0c46731a45f, whose exact upstream source carries MIT.",
+      "sourceRef": "2bab1cc2f960e32a3071ec592c89e0c46731a45f",
+      "sourceUrl": "https://github.com/firecrawl/firecrawl-mcp-server/tree/2bab1cc2f960e32a3071ec592c89e0c46731a45f"
+    },
+    "github-cli": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "v2.96.0",
+      "sourceUrl": "https://github.com/cli/cli/tree/v2.96.0"
+    },
+    "grafana": {
+      "decision": "approved-oss",
+      "licenseExpression": "AGPL-3.0-only",
+      "sourceRef": "v13.1.0",
+      "sourceUrl": "https://github.com/grafana/grafana/tree/v13.1.0"
+    },
+    "hermes": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "9de9c25f620ff7f1ce0fd5457d596052d5159596",
+      "sourceUrl": "https://github.com/NousResearch/hermes-agent/tree/9de9c25f620ff7f1ce0fd5457d596052d5159596"
+    },
+    "jq": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "jq-1.8.1",
+      "sourceUrl": "https://github.com/jqlang/jq/tree/jq-1.8.1"
+    },
+    "kestra": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v1.3.27",
+      "sourceUrl": "https://github.com/kestra-io/kestra/tree/v1.3.27"
+    },
+    "mattermost-compiled-team-edition": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "reason": "Mattermost's exact source license grants MIT for compiled versions produced by Mattermost, including the official Team Edition image.",
+      "sourceRef": "v11.7.2",
+      "sourceUrl": "https://github.com/mattermost/mattermost/tree/v11.7.2"
+    },
+    "mcp-everything": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0 AND MIT",
+      "sourceRef": "pinned-image-digest-330885a0",
+      "sourceUrl": "https://github.com/modelcontextprotocol/servers"
+    },
+    "minio": {
+      "decision": "approved-oss",
+      "licenseExpression": "AGPL-3.0-only",
+      "sourceRef": "RELEASE.2025-09-07T16-13-09Z",
+      "sourceUrl": "https://github.com/minio/minio/tree/RELEASE.2025-09-07T16-13-09Z"
+    },
+    "notion-mcp": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "pinned-image-digest-180a55ce",
+      "sourceUrl": "https://github.com/makenotion/notion-mcp-server"
+    },
+    "oci-mixed-open-source": {
+      "decision": "approved-oss",
+      "licenseExpression": "LicenseRef-OCI-Mixed-Open-Source",
+      "reason": "Reviewed upstream distribution image; this direct classification does not replace a transitive release SBOM.",
+      "sourceRef": "digest-pinned",
+      "sourceUrl": "https://github.com/opencontainers/image-spec"
+    },
+    "opentelemetry-collector": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v0.156.0",
+      "sourceUrl": "https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/v0.156.0"
+    },
+    "opentofu": {
+      "decision": "approved-oss",
+      "licenseExpression": "MPL-2.0",
+      "sourceRef": "v1.12.1",
+      "sourceUrl": "https://github.com/opentofu/opentofu/tree/v1.12.1"
+    },
+    "paperclip-mte-runtime": {
+      "decision": "operator-provided-external-runtime",
+      "licenseExpression": "LicenseRef-Operator-Provided-Fork-Pending-Verification",
+      "reason": "The deployed MTE fork image is an external operator-provided artifact. Its upstream base MIT provenance is recorded separately. Release validation requires the exact fork digest, source URL, and immutable revision; this repository does not invent or infer fork-license evidence.",
+      "redistributed": false,
+      "sourceRef": "operator-release-evidence-required",
+      "sourceUrl": "https://github.com/HenkDz/paperclip"
+    },
+    "paperclip-upstream-base": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "390627b46eb333309d357004384b220ecf8a65af",
+      "sourceUrl": "https://github.com/paperclipai/paperclip/tree/390627b46eb333309d357004384b220ecf8a65af"
+    },
+    "paperclip-daytona-plugin": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "0.1.0",
+      "sourceUrl": "https://www.npmjs.com/package/@paperclipai/plugin-daytona/v/0.1.0"
+    },
+    "sigstore-js": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v3.0.0",
+      "sourceUrl": "https://github.com/sigstore/sigstore-js/tree/v3.0.0"
+    },
+    "aws-sdk-js-v3": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v3.1075.0",
+      "sourceUrl": "https://github.com/aws/aws-sdk-js-v3/tree/v3.1075.0"
+    },
+    "pgvector": {
+      "decision": "approved-oss",
+      "licenseExpression": "PostgreSQL",
+      "sourceRef": "v0.8.0",
+      "sourceUrl": "https://github.com/pgvector/pgvector/tree/v0.8.0"
+    },
+    "pi-coding-agent": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "v0.80.7",
+      "sourceUrl": "https://github.com/earendil-works/pi/tree/v0.80.7"
+    },
+    "postgresql": {
+      "decision": "approved-oss",
+      "licenseExpression": "PostgreSQL",
+      "sourceRef": "REL_17_10-or-18-image",
+      "sourceUrl": "https://github.com/postgres/postgres"
+    },
+    "postgrest": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT",
+      "sourceRef": "v14.15",
+      "sourceUrl": "https://github.com/PostgREST/postgrest/tree/v14.15"
+    },
+    "prometheus-components": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "pinned-component-tags",
+      "sourceUrl": "https://github.com/prometheus"
+    },
+    "rabbitmq": {
+      "decision": "approved-oss",
+      "licenseExpression": "MPL-2.0 AND Apache-2.0",
+      "sourceRef": "v4.3.2",
+      "sourceUrl": "https://github.com/rabbitmq/rabbitmq-server/tree/v4.3.2"
+    },
+    "ripgrep": {
+      "decision": "approved-oss",
+      "licenseExpression": "MIT OR Unlicense",
+      "sourceRef": "15.1.0",
+      "sourceUrl": "https://github.com/BurntSushi/ripgrep/tree/15.1.0"
+    },
+    "searxng": {
+      "decision": "approved-oss",
+      "licenseExpression": "AGPL-3.0-only",
+      "sourceRef": "58e02a01a",
+      "sourceUrl": "https://github.com/searxng/searxng/commit/58e02a01a"
+    },
+    "syft": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v1.38.0",
+      "sourceUrl": "https://github.com/anchore/syft/tree/v1.38.0"
+    },
+    "toolhive": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "v0.36.0",
+      "sourceUrl": "https://github.com/stacklok/toolhive/tree/v0.36.0"
+    },
+    "valkey": {
+      "decision": "approved-oss",
+      "licenseExpression": "BSD-3-Clause",
+      "sourceRef": "9.1.0",
+      "sourceUrl": "https://github.com/valkey-io/valkey/tree/9.1.0"
+    },
+    "victoriametrics": {
+      "decision": "approved-oss",
+      "licenseExpression": "Apache-2.0",
+      "sourceRef": "pinned-component-tags",
+      "sourceUrl": "https://github.com/VictoriaMetrics"
+    }
+  },
+  "artifactRules": [
+    {"scope": "platformLockImages", "pattern": "^nodeHarness$", "component": "oci-mixed-open-source"},
+    {"scope": "platformLockImages", "pattern": "^openTofu$", "component": "opentofu"},
+    {"scope": "platformLockImages", "pattern": "^cloudflared$", "component": "cloudflared"},
+    {"scope": "platformLockImages", "pattern": "^mcpEverything$", "component": "mcp-everything"},
+    {"scope": "platformLockImages", "pattern": "^postgres$", "component": "postgresql"},
+    {"scope": "platformLockImages", "pattern": "^postgrest$", "component": "postgrest"},
+    {"scope": "platformLockImages", "pattern": "^searxng$", "component": "searxng"},
+    {"scope": "runtimeImages", "pattern": "^CLOUDFLARED_IMAGE$", "component": "cloudflared"},
+    {"scope": "runtimeImages", "pattern": "^MTE_AGENT_GATEWAY_IMAGE$", "component": "oci-mixed-open-source"},
+    {"scope": "runtimeImages", "pattern": "^HERMES_SIGSTORE_VERIFIER_IMAGE$", "component": "oci-mixed-open-source"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_(API|PROXY|RUNNER|SSH)_IMAGE$", "component": "daytona-runtime"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_SANDBOX_IMAGE$", "component": "daytona-harness-private-image"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_POSTGRES_IMAGE$", "component": "postgresql"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_VALKEY_IMAGE$", "component": "valkey"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_DEX_IMAGE$", "component": "dex"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_REGISTRY_IMAGE$", "component": "distribution"},
+    {"scope": "runtimeImages", "pattern": "^MTE_DAYTONA_MINIO_IMAGE$", "component": "minio"},
+    {"scope": "runtimeImages", "pattern": "^MTE_PAPERCLIP_IMAGE$", "component": "paperclip-mte-runtime"},
+    {"scope": "runtimeImages", "pattern": "^TOOLHIVE_CANARY_IMAGE$", "component": "mcp-everything"},
+    {"scope": "runtimeImages", "pattern": "^TOOLHIVE_NOTION_IMAGE$", "component": "notion-mcp"},
+    {"scope": "runtimeImages", "pattern": "^TOOLHIVE_FIRECRAWL_IMAGE$", "component": "firecrawl-mcp"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_FIRECRAWL_(API|NUQ_POSTGRES|PLAYWRIGHT_SERVICE)_IMAGE$", "component": "firecrawl"},
+
+    {"scope": "composeSeedImages", "pattern": "^MTE_9ROUTER_9ROUTER_IMAGE$", "component": "9router"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_ACTIVEPIECES_(APP|WORKER)_IMAGE$", "component": "activepieces-official-image"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_ACTIVEPIECES_DATA_POSTGRES_IMAGE$", "component": "pgvector"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_FIRECRAWL_RABBITMQ_IMAGE$", "component": "rabbitmq"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_FIRECRAWL_VALKEY_IMAGE$", "component": "valkey"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_(KESTRA_DATA|MATTERMOST_DB|POSTGRES)_POSTGRES_IMAGE$", "component": "postgresql"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_KESTRA_KESTRA_IMAGE$", "component": "kestra"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_MATTERMOST_MATTERMOST_IMAGE$", "component": "mattermost-compiled-team-edition"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_OBSERVABILITY_(ALERTMANAGER|BLACKBOX_EXPORTER|NODE_EXPORTER)_IMAGE$", "component": "prometheus-components"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_OBSERVABILITY_CADVISOR_IMAGE$", "component": "cadvisor"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_(OBSERVABILITY|SEARXNG)_CONFIG_INIT_IMAGE$", "component": "oci-mixed-open-source"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_OBSERVABILITY_GRAFANA_IMAGE$", "component": "grafana"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_OBSERVABILITY_OTEL_COLLECTOR_IMAGE$", "component": "opentelemetry-collector"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_OBSERVABILITY_(VICTORIALOGS|VICTORIAMETRICS|VICTORIATRACES|VMALERT)_IMAGE$", "component": "victoriametrics"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_POSTGREST_POSTGREST_IMAGE$", "component": "postgrest"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_SEARXNG_SEARXNG_IMAGE$", "component": "searxng"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_SEARXNG_VALKEY_IMAGE$", "component": "valkey"},
+    {"scope": "composeSeedImages", "pattern": "^MTE_TOOLHIVE_(TOOLHIVE|TOOL_RUNTIME)_IMAGE$", "component": "oci-mixed-open-source"},
+
+    {"scope": "embeddedImagePackages", "pattern": "^HERMES_SIGSTORE_VERIFIER_IMAGE/sigstore@3\\.0\\.0$", "component": "sigstore-js"},
+    {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@paperclipai/plugin-daytona@0\\.1\\.0$", "component": "paperclip-daytona-plugin"},
+    {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@daytonaio/sdk@0\\.171\\.0$", "component": "daytona-sdk"},
+    {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@aws-sdk/client-s3@3\\.1075\\.0$", "component": "aws-sdk-js-v3"},
+    {"scope": "npmPackages", "pattern": "^@openai/codex(-linux-x64)?$", "component": "codex-cli", "delivery": "operator-provided-proprietary-tool"},
+    {"scope": "npmPackages", "pattern": "^@anthropic-ai/claude-code(-linux-x64)?$", "component": "claude-code", "delivery": "operator-provided-proprietary-tool"},
+    {"scope": "npmPackages", "pattern": "^@earendil-works/pi-coding-agent$", "component": "pi-coding-agent"},
+    {"scope": "npmPackages", "pattern": "^@upstash/context7-pi$", "component": "context7"},
+
+    {"scope": "downloads", "pattern": "^github-cli-linux-amd64$", "component": "github-cli"},
+    {"scope": "downloads", "pattern": "^jq-linux-amd64$", "component": "jq"},
+    {"scope": "downloads", "pattern": "^toolhive-linux-amd64$", "component": "toolhive"},
+    {"scope": "systemPackages", "pattern": "^(docker.*|containerd(\\.io)?)$", "component": "docker-engine"},
+    {"scope": "downloads", "pattern": "^hermes-agent-(wheel|sigstore-bundle)$", "component": "hermes"},
+    {"scope": "pythonDistributions", "pattern": "^hermes-agent$", "component": "hermes"}
+  ],
+  "evaluatedNotShipped": {
+    "activepieces": "Rejected: official image contains non-redistributable enterprise code.",
+    "automatisch": "Rejected as a full replacement: stable public API, API tokens and OAuth client administration are enterprise-only modules.",
+    "node-red": "Evaluated only: Apache-2.0 foundation, but no standardized OAuth connection catalog or provider-neutral action API is shipped by this platform.",
+    "windmill": "Rejected for the OAuth role: the OSS OAuth implementation is intentionally incomplete and the official CE image includes restricted code."
+  }
+}

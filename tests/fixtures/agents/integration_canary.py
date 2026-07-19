@@ -104,15 +104,13 @@ def resolve_context() -> tuple[dict[str, Any], str]:
             row
             for row in assigned
             if str(row.get("title") or "").startswith("[MTE integration canary ")
+            and str(row.get("id") or "")
         ]
         if not candidates:
             raise WorkerError("paperclip_canary_task_missing")
-        task_id = str(
-            max(
-                candidates,
-                key=lambda row: str(row.get("createdAt") or row.get("updatedAt") or ""),
-            )["id"]
-        )
+        if len(candidates) != 1:
+            raise WorkerError("paperclip_canary_task_ambiguous")
+        task_id = str(candidates[0]["id"])
     task = paperclip("GET", f"/api/issues/{task_id}")
     if not isinstance(task, dict):
         raise WorkerError("paperclip_task_missing")
@@ -158,71 +156,6 @@ def record_id(value: Any) -> str:
             if found:
                 return found
     return ""
-
-
-def baserow_canary(value: dict[str, Any], task_id: str, run_id: str) -> dict[str, Any]:
-    token = os.environ.get("BASEROW_API_TOKEN", "")
-    if not token:
-        raise WorkerError("paperclip_baserow_secret_not_resolved")
-    api_base = str(value.get("baserowApiBase") or "").rstrip("/")
-    table_id = str(value.get("baserowTableId") or "")
-    if not api_base or not table_id:
-        raise WorkerError("baserow_target_missing")
-    headers = {"Authorization": f"Token {token}"}
-    marker = f"MTE-C027-{task_id}-{run_id}"
-    created_id = ""
-    try:
-        create_status, created = request_json(
-            "POST",
-            f"{api_base}/api/database/rows/table/{table_id}/?user_field_names=true",
-            headers=headers,
-            body={"Value": marker},
-        )
-        created_id = record_id(created)
-        if not created_id:
-            raise WorkerError("baserow_row_id_missing")
-        read_status, observed = request_json(
-            "GET",
-            f"{api_base}/api/database/rows/table/{table_id}/{created_id}/?user_field_names=true",
-            headers=headers,
-        )
-        if not isinstance(observed, dict) or observed.get("Value") != marker:
-            raise WorkerError("baserow_row_read_mismatch")
-        delete_status, _deleted = request_json(
-            "DELETE",
-            f"{api_base}/api/database/rows/table/{table_id}/{created_id}/",
-            headers=headers,
-        )
-        after_status, _after = request_json(
-            "GET",
-            f"{api_base}/api/database/rows/table/{table_id}/{created_id}/",
-            headers=headers,
-            allow_status={404},
-        )
-        if after_status != 404:
-            raise WorkerError("baserow_row_cleanup_not_observed")
-        created_id = ""
-        return {
-            "action": "baserow_crud",
-            "taskId": task_id,
-            "heartbeatRunId": run_id,
-            "createStatus": create_status,
-            "readStatus": read_status,
-            "deleteStatus": delete_status,
-            "postDeleteStatus": after_status,
-            "markerSha256": hashlib.sha256(marker.encode()).hexdigest(),
-            "markerObserved": True,
-            "cleanup": "verified_deleted",
-            "credentialSource": "paperclip_project_secret_ref",
-        }
-    finally:
-        if created_id:
-            request_json(
-                "DELETE",
-                f"{api_base}/api/database/rows/table/{table_id}/{created_id}/",
-                headers=headers,
-                allow_status={404},
-            )
 
 
 def postgrest_canary(
@@ -361,9 +294,7 @@ def main() -> int:
     value = task_input(task)
     task_id = str(task["id"])
     action = str(value.get("action") or "")
-    if action == "baserow_crud":
-        result = baserow_canary(value, task_id, run_id)
-    elif action == "postgrest_crud":
+    if action == "postgrest_crud":
         result = postgrest_canary(value, task_id, run_id)
     elif action == "mattermost_notification":
         result = mattermost_canary(value, task_id, run_id)

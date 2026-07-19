@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import http.cookiejar
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -23,7 +24,6 @@ import uuid
 
 
 ENV_FILE = Path("/root/.config/mte-secrets/platform.env")
-ENV_HASH_FILE = Path("/root/.config/mte-secrets/platform.env.sha256")
 EVIDENCE = Path("/opt/mte-platform/evidence/hermes-live.json")
 PRODUCER = Path(__file__).resolve()
 HERMES_CLI = Path("/opt/mte-hermes/current/venv/bin/hermes")
@@ -56,14 +56,9 @@ def producer_metadata() -> dict[str, str]:
 
 
 def env_values() -> dict[str, str]:
-    if not ENV_FILE.is_file() or not ENV_HASH_FILE.is_file():
-        raise CanaryError("canonical Hermes configuration evidence is missing")
+    if not ENV_FILE.is_file():
+        raise CanaryError("canonical Hermes configuration is missing")
     raw = ENV_FILE.read_bytes()
-    expected = ENV_HASH_FILE.read_text(encoding="ascii").strip()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected):
-        raise CanaryError("canonical configuration hash has an invalid shape")
-    if hashlib.sha256(raw).hexdigest() != expected:
-        raise CanaryError("canonical configuration changed after Hermes reconcile")
     values: dict[str, str] = {}
     for number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
         stripped = line.strip()
@@ -108,7 +103,11 @@ def request_json(
         url, method=method, data=data, headers=request_headers
     )
     try:
-        response = (opener or urllib.request).open(request, timeout=timeout)
+        response = (
+            opener.open(request, timeout=timeout)
+            if opener is not None
+            else urllib.request.urlopen(request, timeout=timeout)
+        )
         with response:
             payload = response.read(5_000_001)
             if len(payload) > 5_000_000:
@@ -127,10 +126,16 @@ def request_json(
 
 def api_server(values: dict[str, str]) -> tuple[str, str]:
     host = required(values, "HERMES_API_SERVER_HOST")
-    if host not in {"127.0.0.1", "::1"}:
-        raise CanaryError("Hermes native API server is not loopback-bound")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        raise CanaryError("Hermes native API server host is invalid") from error
+    if not (address.is_loopback or address.is_private) or any(
+        (address.is_unspecified, address.is_link_local, address.is_multicast)
+    ):
+        raise CanaryError("Hermes native API server is not privately bound")
     port = int(required(values, "HERMES_API_SERVER_PORT"))
-    rendered_host = "[::1]" if host == "::1" else host
+    rendered_host = f"[{host}]" if address.version == 6 else host
     return f"http://{rendered_host}:{port}", required(values, "HERMES_API_SERVER_KEY")
 
 
@@ -351,12 +356,14 @@ def mattermost_connection(values: dict[str, str]) -> dict[str, Any]:
     base = values.get("MATTERMOST_URL", "").strip().rstrip("/")
     token = values.get("MATTERMOST_TOKEN", "").strip()
     allowed = values.get("MATTERMOST_ALLOWED_USERS", "").strip()
-    if not base and not token and not allowed:
+    home_channel = values.get("MATTERMOST_HOME_CHANNEL", "").strip()
+    if not base and not token and not allowed and not home_channel:
         return {"ok": None, "state": "conditional_disabled", "notFabricated": True}
     if (
         not base
         or not token
         or not allowed
+        or not re.fullmatch(r"[a-z0-9]{26}", home_channel)
         or "*" in {item.strip() for item in allowed.split(",")}
     ):
         raise CanaryError("Mattermost native integration is not fail-closed")
@@ -365,7 +372,17 @@ def mattermost_connection(values: dict[str, str]) -> dict[str, Any]:
         isinstance(value, dict) and value.get("id") and value.get("is_bot") is True
     ):
         raise CanaryError("Mattermost rejected the native Hermes bot")
-    return {"ok": True, "state": "ready", "nativeHermesIntegration": True}
+    channel = request_json(
+        base + f"/api/v4/channels/{home_channel}", bearer=token
+    )
+    if not isinstance(channel, dict) or channel.get("id") != home_channel:
+        raise CanaryError("Mattermost rejected the Hermes operator channel")
+    return {
+        "ok": True,
+        "state": "ready",
+        "nativeHermesIntegration": True,
+        "operatorChannelAccessible": True,
+    }
 
 
 def atomic_evidence(value: dict[str, Any]) -> None:

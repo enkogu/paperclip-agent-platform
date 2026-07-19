@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import unittest
+from unittest import mock
 import uuid
 
 
@@ -462,6 +463,72 @@ class NotionProjectionConsumerTests(unittest.TestCase):
                 canonical_expected=True,
             )
 
+    def test_live_canary_waits_only_for_an_active_foreign_lease(self):
+        object_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        provider_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        content_hash = "c" * 64
+        processing = {
+            "canonicalExists": True,
+            "canonicalRevision": 1,
+            "canonicalContentHash": content_hash,
+            "sync": {
+                "desiredOperation": "upsert",
+                "canonicalRevision": 1,
+                "canonicalContentHash": content_hash,
+                "projectedRevision": None,
+                "projectedContentHash": None,
+                "syncStatus": "syncing",
+                "providerObjectId": None,
+                "errorFree": True,
+                "leaseReleased": False,
+            },
+            "outbox": {
+                "deliveryState": "processing",
+                "attemptCount": 1,
+                "delivered": False,
+                "errorFree": True,
+                "leaseReleased": False,
+            },
+        }
+        settled = {
+            **processing,
+            "sync": {
+                **processing["sync"],
+                "projectedRevision": 1,
+                "projectedContentHash": content_hash,
+                "syncStatus": "synced",
+                "providerObjectId": provider_id,
+                "leaseReleased": True,
+            },
+            "outbox": {
+                **processing["outbox"],
+                "deliveryState": "delivered",
+                "delivered": True,
+                "leaseReleased": True,
+            },
+        }
+        responses = iter((json.dumps(processing), json.dumps(settled)))
+        consumer = self.module.Consumer(
+            values(self.module),
+            SimpleNamespace(),
+            self.module.settings_from_env(values(self.module)),
+            instance_id="canary-lease-test",
+            psql=lambda *_args: next(responses),
+        )
+        with mock.patch.object(self.module.time, "sleep") as sleep:
+            evidence, actual_provider_id = self.module.settled_canary_state(
+                consumer,
+                object_kind="entity",
+                canonical_object_id=object_id,
+                operation="upsert",
+                revision=1,
+                content_hash=content_hash,
+                canonical_expected=True,
+            )
+        self.assertEqual(actual_provider_id, provider_id)
+        self.assertTrue(all(evidence.values()))
+        sleep.assert_called_once_with(self.module.CANARY_SETTLE_INTERVAL_SECONDS)
+
     def test_live_canary_evidence_rejects_secrets_and_raw_markers(self):
         safe = {"kind": "NotionProjectionLiveCanary", "redacted": True}
         self.module.assert_canary_redacted(
@@ -630,6 +697,86 @@ class NotionProjectionConsumerTests(unittest.TestCase):
         self.assertTrue(fake.pages[entity_page]["archived"])
         self.assertTrue(fake.pages[document_page]["archived"])
         self.assertEqual(harness.failed, [])
+
+    def test_ambiguous_create_or_append_is_retried_without_duplicate_projection(self):
+        """A request that reached Notion but lost its response must be safe to retry."""
+
+        for object_kind in ("entity", "document"):
+            for ambiguous_operation in ("create", "append"):
+                with self.subTest(
+                    object_kind=object_kind, ambiguous_operation=ambiguous_operation
+                ):
+                    fake = FakeNotion(self.module)
+                    object_id = (
+                        "33333333-3333-4333-8333-333333333333"
+                        if object_kind == "entity"
+                        else "44444444-4444-4444-8444-444444444444"
+                    )
+                    digest = ("a" if object_kind == "entity" else "b") * 64
+                    row = {
+                        "id": object_id,
+                        "external_object_id": object_kind + "-retry",
+                        "title": object_kind + " retry",
+                        "metadata": {"retry": True},
+                        "revision": 1,
+                        "content_hash": digest,
+                    }
+                    if object_kind == "entity":
+                        row["data"] = {"state": "created"}
+                    else:
+                        row["body"] = "retry body " * 300
+                        row["content_type"] = "text/markdown"
+                    harness = InMemoryConsumer(
+                        self.module, fake, {(object_kind, object_id): row}
+                    )
+                    event = self.event(
+                        row_id=21 if object_kind == "entity" else 22,
+                        kind=object_kind,
+                        object_id=object_id,
+                        external=object_kind + "-retry",
+                        operation="upsert",
+                        revision=1,
+                        digest=digest,
+                    )
+                    original_request = fake.request_json
+                    injected = False
+
+                    def ambiguous_request(config, method, path, **kwargs):
+                        nonlocal injected
+                        result = original_request(config, method, path, **kwargs)
+                        create = method == "POST" and path == "/pages"
+                        append = method == "PATCH" and path.endswith("/children")
+                        if (
+                            not injected
+                            and ((ambiguous_operation == "create" and create)
+                                 or (ambiguous_operation == "append" and append))
+                        ):
+                            injected = True
+                            raise self.module.ProjectionError("notion_response_ambiguous")
+                        return result
+
+                    fake.request_json = ambiguous_request
+                    self.assertEqual(harness.consumer.process(event), "failed")
+                    self.assertTrue(injected)
+                    self.assertEqual(len(fake.pages), 1)
+
+                    # The retry has no finalized provider object ID.  It must
+                    # discover the page through the canonical marker/key,
+                    # replace partial children, and converge to exactly one page.
+                    fake.request_json = original_request
+                    self.assertEqual(harness.consumer.process(event), "delivered")
+                    self.assertEqual(len(fake.pages), 1)
+                    page_id = next(iter(fake.pages))
+                    metadata, body = harness.consumer.readback_body(page_id)
+                    self.assertEqual(metadata["canonicalObjectId"], object_id)
+                    self.assertEqual(metadata["revision"], 1)
+                    self.assertEqual(
+                        body, harness.consumer.projection_body(event, row)
+                    )
+                    self.assertEqual(
+                        len(fake.blocks[page_id]),
+                        len(harness.consumer.projection_children(event, row)),
+                    )
 
     def test_platform_index_and_schema_register_consumer(self):
         platform_source = (ROOT / "tools/platform-cli/platform.py").read_text()

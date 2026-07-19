@@ -1,9 +1,13 @@
 import importlib.util
+import base64
 import hashlib
 import io
 import json
 from pathlib import Path
+import shlex
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -45,6 +49,28 @@ def direct_harness_document(*, commit_sha="d" * 40, harness="pi"):
 
 
 def github_files():
+    contents = {
+        ".github/workflows/paperclip-e2e.yml": """name: paperclip-e2e
+on: [pull_request]
+jobs:
+  paperclip-e2e:
+    name: paperclip-e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd paperclip-e2e && python -m unittest test_marker.py
+""",
+        "paperclip-e2e/marker.py": (
+            'def marker():\n    return "PAPERCLIP_DAYTONA_E2E"\n'
+        ),
+        "paperclip-e2e/test_marker.py": """from marker import marker
+import unittest
+
+class MarkerTest(unittest.TestCase):
+    def test_marker(self):
+        self.assertEqual(marker(), "PAPERCLIP_DAYTONA_E2E")
+""",
+    }
     return [
         {
             "filename": path,
@@ -54,6 +80,7 @@ def github_files():
             "deletions": 0,
             "changes": index,
             "patch": f"@@ -0,0 +1 @@\n+{path}",
+            "content": contents[path],
         }
         for index, path in enumerate(
             (
@@ -67,8 +94,40 @@ def github_files():
 
 
 class ServerE2ECanaryTests(unittest.TestCase):
+    def test_harness_version_matching_rejects_substring_collisions(self):
+        module = load_module()
+        self.assertEqual(
+            module.normalized_harness_version("codex", "codex-cli 0.144.4"),
+            "0.144.4",
+        )
+        self.assertNotEqual(
+            module.normalized_harness_version("codex", "codex-cli 0.144.40"),
+            "0.144.4",
+        )
+
     def setUp(self):
         self.module = load_module()
+
+    def test_controller_github_artifacts_run_from_repository_root(self):
+        contents = {row["filename"]: row["content"] for row in github_files()}
+        identity = self.module.controller_github_artifact_identity(contents)
+        command = identity["testCommand"].replace(
+            "python ", f"{shlex.quote(sys.executable)} ", 1
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, content in contents.items():
+                destination = root / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content)
+            completed = subprocess.run(
+                ["/bin/sh", "-c", command],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_http_error_body_is_never_exposed(self):
         error = urllib.error.HTTPError(
@@ -92,6 +151,25 @@ class ServerE2ECanaryTests(unittest.TestCase):
         self.assertNotIn('"GET", "/api/v1/main/configs"', source)
         self.assertIn('"/api/v1/main/flows/"', source)
         self.assertIn('"kestra_flow_not_ready"', source)
+
+    def test_daytona_e2e_admission_allows_only_one_active_coding_sandbox(self):
+        with mock.patch.object(
+            self.module,
+            "daytona_environment_sandboxes",
+            return_value=[{"id": "stopped", "state": "stopped"}],
+        ):
+            self.assertEqual(
+                self.module.admit_single_coding_sandbox({}, "environment-1"),
+                {"maxActiveCodingSandboxes": 1, "activeBefore": 0},
+            )
+        with mock.patch.object(
+            self.module,
+            "daytona_environment_sandboxes",
+            return_value=[{"id": "active", "state": "started"}],
+        ):
+            with self.assertRaises(self.module.CanaryError) as raised:
+                self.module.admit_single_coding_sandbox({}, "environment-1")
+        self.assertEqual(raised.exception.code, "coding_sandbox_capacity_exhausted")
 
     def test_harness_evidence_v3_requires_exactly_one_document(self):
         valid = {
@@ -172,59 +250,44 @@ class ServerE2ECanaryTests(unittest.TestCase):
             profile_source = root / "profiles-source.yaml"
             profiles = root / "profiles.yaml"
             paperclip_runtime = root / "paperclip-runtime.sh"
+            daytona_runtime = root / "daytona-runtime.sh"
             daytona = root / "paperclip-daytona.json"
             daytona_verify = root / "paperclip-daytona-verify.json"
             daytona_images = root / "daytona-images.json"
             daytona_lifecycle = root / "daytona-lifecycle.json"
             environment = root / "platform.env"
             runner = root / "runner.py"
-            release_id = "release-12345678"
-            deploy = root / ".deploy"
-            manifest = deploy / "releases" / release_id / "source-manifest.json"
-            current = deploy / "current-release.json"
             config.write_text('{"spec":{}}')
             flow.write_text("id: test\n")
             profile_source.write_text("profiles: []\n")
             profiles.write_text("profiles: []\n")
             paperclip_runtime.write_text("#!/bin/sh\n")
+            daytona_runtime.write_text("#!/bin/sh\n")
             daytona.write_text('{"status":"ready"}')
             daytona_verify.write_text('{"status":"ready"}')
             daytona_images.write_text('{"status":"ready"}')
             daytona_lifecycle.write_text('{"status":"ready"}')
             environment.write_text("CANONICAL_MARKER=first\n")
             runner.write_text("pass\n")
-            manifest.parent.mkdir(parents=True)
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "paperclip-agent-platform/v1alpha1",
-                        "kind": "GovernedSourceManifest",
-                        "sourceSha256": "f" * 64,
-                        "files": [{"path": "runner.py"}],
-                    }
-                )
-            )
-            current.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "paperclip-agent-platform/v1alpha1",
-                        "kind": "GovernedSourceActivation",
-                        "status": "active",
-                        "runId": "run-12345678",
-                        "releaseId": release_id,
-                        "activationId": "activation-12345678",
-                        "sourceSha256": "f" * 64,
-                        "fileCount": 1,
-                    }
-                )
-            )
-            current.chmod(0o600)
+            for source_path in (
+                config,
+                flow,
+                profile_source,
+                profiles,
+                paperclip_runtime,
+                daytona_runtime,
+                runner,
+            ):
+                source_path.chmod(0o644)
             e2e = {
                 "profiles": [
                     "coding-daytona-codex",
                     "coding-daytona-claude",
                     "coding-daytona-pi",
                 ],
+                "githubOwnerRef": "E2E_GITHUB_OWNER",
+                "githubRepositoryRef": "E2E_GITHUB_REPOSITORY",
+                "baseBranchRef": "E2E_GITHUB_BASE_BRANCH",
                 "llmCredentialRefs": ["MINIMAX_API_KEY"],
                 "githubCredentialRefs": ["GITHUB_TOKEN"],
             }
@@ -236,6 +299,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 mock.patch.object(
                     self.module, "PAPERCLIP_RUNTIME_SOURCE", paperclip_runtime
                 ),
+                mock.patch.object(self.module, "DAYTONA_STEP_SOURCE", daytona_runtime),
                 mock.patch.object(self.module, "DAYTONA_EVIDENCE", daytona),
                 mock.patch.object(
                     self.module, "DAYTONA_VERIFY_EVIDENCE", daytona_verify
@@ -263,56 +327,68 @@ class ServerE2ECanaryTests(unittest.TestCase):
             second["canonicalSourceSha256"], third["canonicalSourceSha256"]
         )
         self.assertEqual(first["credentialRefs"], ["GITHUB_TOKEN", "MINIMAX_API_KEY"])
-        self.assertEqual(first["deploymentRelease"]["releaseId"], "release-12345678")
+        self.assertEqual(
+            first["repositoryRefs"],
+            {
+                "owner": "E2E_GITHUB_OWNER",
+                "repository": "E2E_GITHUB_REPOSITORY",
+                "baseBranch": "E2E_GITHUB_BASE_BRANCH",
+            },
+        )
+        self.assertEqual(first["directSync"]["kind"], "DirectSyncCanonicalContract")
+        self.assertEqual(first["directSync"]["fileCount"], 7)
         self.assertNotIn("token-value", json.dumps(first))
 
-    def test_deployment_release_binding_rejects_manifest_or_mode_drift(self):
+    def test_direct_sync_binding_rejects_symlink_and_writable_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            release = root / ".deploy/releases/release-12345678"
-            release.mkdir(parents=True)
-            manifest = release / "source-manifest.json"
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "paperclip-agent-platform/v1alpha1",
-                        "kind": "GovernedSourceManifest",
-                        "sourceSha256": "a" * 64,
-                        "files": [{"path": "scripts/example.py"}],
-                    }
+            paths = [
+                root / name
+                for name in (
+                    "config",
+                    "flow",
+                    "source",
+                    "profiles",
+                    "paperclip",
+                    "daytona",
+                    "runner",
                 )
+            ]
+            for path in paths:
+                path.write_text(path.name)
+                path.chmod(0o644)
+            patches = (
+                mock.patch.object(self.module, "ROOT", root),
+                mock.patch.object(self.module, "CONFIG", paths[0]),
+                mock.patch.object(self.module, "FLOW", paths[1]),
+                mock.patch.object(self.module, "PROFILE_SOURCE", paths[2]),
+                mock.patch.object(self.module, "PROFILES", paths[3]),
+                mock.patch.object(self.module, "PAPERCLIP_RUNTIME_SOURCE", paths[4]),
+                mock.patch.object(self.module, "DAYTONA_STEP_SOURCE", paths[5]),
+                mock.patch.object(self.module, "__file__", str(paths[6])),
             )
-            current = root / ".deploy/current-release.json"
-            current.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "paperclip-agent-platform/v1alpha1",
-                        "kind": "GovernedSourceActivation",
-                        "status": "active",
-                        "runId": "run-12345678",
-                        "releaseId": "release-12345678",
-                        "activationId": "activation-12345678",
-                        "sourceSha256": "a" * 64,
-                        "fileCount": 1,
-                    }
-                )
-            )
-            current.chmod(0o600)
-            with mock.patch.object(self.module, "ROOT", root):
-                binding = self.module.deployment_release_binding()
-                self.assertEqual(binding["sourceSha256"], "a" * 64)
-                manifest_payload = json.loads(manifest.read_text())
-                manifest_payload["sourceSha256"] = "b" * 64
-                manifest.write_text(json.dumps(manifest_payload))
+            with (
+                patches[0],
+                patches[1],
+                patches[2],
+                patches[3],
+                patches[4],
+                patches[5],
+                patches[6],
+            ):
+                binding = self.module.direct_sync_binding()
+                self.assertEqual(binding["kind"], "DirectSyncCanonicalContract")
+                self.assertEqual(binding["fileCount"], 7)
+                paths[0].chmod(0o666)
                 with self.assertRaises(self.module.CanaryError) as raised:
-                    self.module.deployment_release_binding()
-                self.assertEqual(raised.exception.code, "deployment_release_invalid")
-                manifest_payload["sourceSha256"] = "a" * 64
-                manifest.write_text(json.dumps(manifest_payload))
-                current.chmod(0o644)
+                    self.module.direct_sync_binding()
+                self.assertEqual(raised.exception.code, "direct_sync_source_invalid")
+                paths[0].chmod(0o644)
+                paths[1].unlink()
+                paths[1].symlink_to(paths[2])
                 with self.assertRaises(self.module.CanaryError) as raised:
-                    self.module.deployment_release_binding()
-                self.assertEqual(raised.exception.code, "evidence_file_invalid")
+                    self.module.direct_sync_binding()
+                self.assertEqual(raised.exception.code, "direct_sync_source_invalid")
 
     def test_verification_attestation_is_separate_mode0600_and_subject_hash_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -332,7 +408,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     producer_sha="b" * 64,
                     values={},
                     sources={"canonicalSourceSha256": "a" * 64},
-                    runs=[{"profile": name} for name in ("codex", "claude", "pi")],
+                    runs=[
+                        {"profile": "coding-daytona-codex"},
+                        {"profile": "coding-daytona-claude"},
+                        {"profile": "coding-daytona-pi"},
+                    ],
                     cleanup_verified=True,
                     toolhive_gateway_audit={"status": "passed"},
                     apply_finished_at="2026-07-15T01:00:00+00:00",
@@ -342,7 +422,14 @@ class ServerE2ECanaryTests(unittest.TestCase):
             self.assertEqual(verify_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(result["subjectEvidenceSha256"], subject_sha)
             self.assertEqual(result["status"], "passed")
-            self.assertEqual(len(result["runs"]), 3)
+            self.assertEqual(
+                result["runs"],
+                [
+                    {"profile": "coding-daytona-codex"},
+                    {"profile": "coding-daytona-claude"},
+                    {"profile": "coding-daytona-pi"},
+                ],
+            )
 
     def test_e2e_context_requires_declared_runtime_refs_without_returning_them_in_config(
         self,
@@ -380,9 +467,9 @@ class ServerE2ECanaryTests(unittest.TestCase):
                                 "paperclipContainerHost": "paperclip.internal",
                                 "kestraPortRef": "KESTRA_HTTP_PORT",
                                 "kestraLoopbackHost": "kestra.invalid",
-                                "githubOwner": "example",
-                                "githubRepository": "canary",
-                                "baseBranch": "main",
+                                "githubOwnerRef": "E2E_GITHUB_OWNER",
+                                "githubRepositoryRef": "E2E_GITHUB_REPOSITORY",
+                                "baseBranchRef": "E2E_GITHUB_BASE_BRANCH",
                                 "llmCredentialRefs": ["MINIMAX_API_KEY"],
                                 "githubCredentialRefs": ["GITHUB_TOKEN"],
                             }
@@ -392,7 +479,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
             )
             environment.write_text(
                 "GITHUB_TOKEN=fake-github-value\n"
+                "E2E_GITHUB_OWNER=example\n"
+                "E2E_GITHUB_REPOSITORY=canary\n"
+                "E2E_GITHUB_BASE_BRANCH=release/canary\n"
                 "MINIMAX_API_KEY=fake-minimax-value\n"
+                "MTE_ENABLE_OPERATOR_PROVIDED_PROPRIETARY_HARNESSES=false\n"
                 "PAPERCLIP_PORT=3100\n"
                 "PAPERCLIP_COMPANY_ID=company-1\n"
                 "PAPERCLIP_PROJECT_ID=project-1\n"
@@ -407,13 +498,205 @@ class ServerE2ECanaryTests(unittest.TestCase):
             e2e["profiles"],
             ["coding-daytona-codex", "coding-daytona-claude", "coding-daytona-pi"],
         )
+        self.assertEqual(
+            e2e["profileContracts"],
+            {
+                "coding-daytona-codex": {
+                    "nativeAdapter": "codex_local",
+                    "requireExplicitProvider": False,
+                },
+                "coding-daytona-claude": {
+                    "nativeAdapter": "claude_local",
+                    "requireExplicitProvider": False,
+                },
+                "coding-daytona-pi": {
+                    "nativeAdapter": "pi_local",
+                    "requireExplicitProvider": True,
+                },
+            },
+        )
+        self.assertEqual(
+            values["MTE_ENABLE_OPERATOR_PROVIDED_PROPRIETARY_HARNESSES"], "false"
+        )
         self.assertEqual(values["GITHUB_TOKEN"], "fake-github-value")
         self.assertEqual(e2e["paperclipBaseUrl"], "http://paperclip.invalid:3100")
         self.assertEqual(
             e2e["kestraPaperclipBaseUrl"], "http://paperclip.internal:3100"
         )
         self.assertEqual(e2e["kestraBaseUrl"], "http://kestra.invalid:18082")
+        self.assertEqual(e2e["githubOwner"], "example")
+        self.assertEqual(e2e["githubRepository"], "canary")
+        self.assertEqual(e2e["baseBranch"], "release/canary")
         self.assertNotIn("fake-github-value", json.dumps(loaded))
+        self.assertNotIn("release/canary", json.dumps(loaded))
+        self.assertEqual(
+            loaded["spec"]["e2eCanary"]["baseBranchRef"],
+            "E2E_GITHUB_BASE_BRANCH",
+        )
+
+    def test_r1_profile_contracts_require_all_native_protocols_and_9router(self):
+        profiles = list(self.module.R1_E2E_PROFILES)
+        contracts = {
+            "coding-daytona-codex": {
+                "nativeAdapter": "codex_local",
+                "requireExplicitProvider": False,
+            },
+            "coding-daytona-claude": {
+                "nativeAdapter": "claude_local",
+                "requireExplicitProvider": False,
+            },
+            "coding-daytona-pi": {
+                "nativeAdapter": "pi_local",
+                "requireExplicitProvider": True,
+            },
+        }
+        catalog = {
+            "coding-daytona-codex": {
+                "adapter": "codex_local",
+                "protocol": "openai-responses",
+                "routerProvider": "9router",
+                "model": "mte-minimax/MiniMax-M2.7-highspeed",
+                "authPolicy": dict(self.module.R1_RUNTIME_AUTH_POLICY),
+            },
+            "coding-daytona-claude": {
+                "adapter": "claude_local",
+                "protocol": "anthropic-messages",
+                "routerProvider": "9router",
+                "model": "mte-minimax/MiniMax-M2.7-highspeed",
+                "authPolicy": dict(self.module.R1_RUNTIME_AUTH_POLICY),
+            },
+            "coding-daytona-pi": {
+                "adapter": "pi_local",
+                "protocol": "openai-chat-completions",
+                "routerProvider": "9router",
+                "model": "mte9router/mte-minimax/MiniMax-M2.7-highspeed",
+                "authPolicy": dict(self.module.R1_RUNTIME_AUTH_POLICY),
+            },
+        }
+        self.module.validate_r1_profile_contracts(profiles, contracts, catalog)
+        invalid_catalog = {
+            **catalog,
+            "coding-daytona-claude": {
+                **catalog["coding-daytona-claude"],
+                "protocol": "openai-responses",
+            },
+        }
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validate_r1_profile_contracts(
+                profiles, contracts, invalid_catalog
+            )
+        self.assertEqual(raised.exception.code, "minimax_profile_invalid")
+        oauth_catalog = {
+            **catalog,
+            "coding-daytona-codex": {
+                **catalog["coding-daytona-codex"],
+                "authPolicy": {
+                    **catalog["coding-daytona-codex"]["authPolicy"],
+                    "oauthInImage": True,
+                },
+            },
+        }
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validate_r1_profile_contracts(
+                profiles, contracts, oauth_catalog
+            )
+        self.assertEqual(raised.exception.code, "minimax_profile_invalid")
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validate_r1_profile_contracts(
+                profiles[1:],
+                {ref: contracts[ref] for ref in profiles[1:]},
+            )
+        self.assertEqual(raised.exception.code, "r1_profile_selection_invalid")
+
+    def test_profile_catalog_projects_and_enforces_r1_no_oauth_auth_policy(self):
+        profiles = list(self.module.R1_E2E_PROFILES)
+        contracts = {
+            "coding-daytona-codex": {
+                "nativeAdapter": "codex_local",
+                "requireExplicitProvider": False,
+            },
+            "coding-daytona-claude": {
+                "nativeAdapter": "claude_local",
+                "requireExplicitProvider": False,
+            },
+            "coding-daytona-pi": {
+                "nativeAdapter": "pi_local",
+                "requireExplicitProvider": True,
+            },
+        }
+        document = {
+            "profiles": [
+                {
+                    "ref": ref,
+                    "nativeAdapter": contract["nativeAdapter"],
+                    "nativeAdapterConfig": {
+                        "model": self.module.R1_E2E_PROFILE_CONTRACTS[ref][
+                            "modelNamespace"
+                        ]
+                        + "MiniMax-M2.7-highspeed",
+                    },
+                    "runtimeContract": {
+                        "protocol": self.module.R1_E2E_PROFILE_CONTRACTS[ref][
+                            "protocol"
+                        ],
+                    },
+                    "llmRouting": {"provider": "9router"},
+                    "authPolicy": dict(self.module.R1_RUNTIME_AUTH_POLICY),
+                }
+                for ref, contract in contracts.items()
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            projection = Path(directory) / "profiles.yaml"
+
+            def load_projected(value):
+                projection.write_text(json.dumps(value))
+                with mock.patch.object(self.module, "PROFILES", projection):
+                    return self.module.profile_catalog()
+
+            catalog = load_projected(document)
+            self.assertEqual(
+                {ref: catalog[ref]["authPolicy"] for ref in profiles},
+                {ref: self.module.R1_RUNTIME_AUTH_POLICY for ref in profiles},
+            )
+            self.module.validate_r1_profile_contracts(profiles, contracts, catalog)
+
+            missing_policy = json.loads(json.dumps(document))
+            del missing_policy["profiles"][0]["authPolicy"]
+            with self.assertRaises(self.module.CanaryError) as raised:
+                self.module.validate_r1_profile_contracts(
+                    profiles, contracts, load_projected(missing_policy)
+                )
+            self.assertEqual(raised.exception.code, "minimax_profile_invalid")
+
+            malformed_policy = json.loads(json.dumps(document))
+            malformed_policy["profiles"][1]["authPolicy"] = "no-oauth"
+            with self.assertRaises(self.module.CanaryError) as raised:
+                self.module.validate_r1_profile_contracts(
+                    profiles, contracts, load_projected(malformed_policy)
+                )
+            self.assertEqual(raised.exception.code, "minimax_profile_invalid")
+
+    def test_github_target_validation_rejects_unsafe_slugs_and_refs(self):
+        for owner, repository, branch in (
+            ("-owner", "canary", "main"),
+            ("example", "bad/repository", "main"),
+            ("example", "canary", "refs/heads/main..evil"),
+            ("example", "canary", "feature/@{bad"),
+            ("example", "canary", "feature branch"),
+            ("example", "canary", "HEAD"),
+            ("example", "canary", "release/-unsafe"),
+            ("example", "canary", "release./unsafe"),
+            ("example", "canary", "релиз/main"),
+        ):
+            with self.subTest(owner=owner, repository=repository, branch=branch):
+                with self.assertRaises(self.module.CanaryError) as raised:
+                    self.module.validate_github_target(owner, repository, branch)
+                self.assertEqual(raised.exception.code, "unsafe_config")
+
+        self.module.validate_github_target(
+            "example-org", "agent_canary.repo", "release/canary-v1"
+        )
 
     def test_secret_scan_rejects_exact_values_and_credential_shapes(self):
         with self.assertRaises(self.module.CanaryError) as exact:
@@ -425,6 +708,93 @@ class ServerE2ECanaryTests(unittest.TestCase):
         with self.assertRaises(self.module.CanaryError) as shaped:
             self.module.scan_for_secrets({"artifact": "github_pat_fake"}, {})
         self.assertEqual(shaped.exception.code, "evidence_secret_pattern")
+
+    def test_portable_bundle_embeds_redacted_documents_and_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = root / "evidence/apply.json"
+            verification = root / "evidence/verify.json"
+            bundle_path = root / "evidence/bundle.json"
+            canonical = root / "secrets/platform.env"
+            canonical.parent.mkdir(parents=True)
+            canonical.write_text("DAYTONA_API_KEY=fake-secret-value\n")
+            canonical.chmod(0o600)
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "finishedAt": "2026-07-16T00:00:00+00:00",
+                        "producerPath": str(root / "bin/server-e2e-canary.py"),
+                    }
+                )
+            )
+            verification.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "subjectEvidencePath": str(evidence),
+                        "subjectEvidenceSha256": hashlib.sha256(
+                            evidence.read_bytes()
+                        ).hexdigest(),
+                        "canonicalSourceSha256": hashlib.sha256(
+                            canonical.read_bytes()
+                        ).hexdigest(),
+                        "producerSha256": hashlib.sha256(
+                            SCRIPT.read_bytes()
+                        ).hexdigest(),
+                        "applyFinishedAt": "2026-07-16T00:00:00+00:00",
+                    }
+                )
+            )
+            evidence.chmod(0o600)
+            verification.chmod(0o600)
+            with (
+                mock.patch.object(self.module, "ROOT", root),
+                mock.patch.object(self.module, "PLATFORM_ENV", canonical),
+                mock.patch.object(self.module, "EVIDENCE", evidence),
+                mock.patch.object(self.module, "VERIFICATION_EVIDENCE", verification),
+                mock.patch.object(self.module, "PORTABLE_EVIDENCE_BUNDLE", bundle_path),
+            ):
+                bundle = self.module.write_portable_evidence_bundle(
+                    {"DAYTONA_API_KEY": "fake-secret-value"}
+                )
+        self.assertEqual(bundle["status"], "passed")
+        self.assertEqual(
+            bundle["documents"]["apply.json"]["producerPath"],
+            "$MTE_ROOT/bin/server-e2e-canary.py",
+        )
+        self.assertNotIn("fake-secret-value", json.dumps(bundle))
+        self.assertRegex(bundle["bundleSha256"], r"^[0-9a-f]{64}$")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            canonical = root / "platform.env"
+            apply = root / "apply.json"
+            verify = root / "verify.json"
+            bundle_path = root / "bundle.json"
+            canonical.write_text("KEY=value\n")
+            apply.write_text(json.dumps({"status": "passed", "finishedAt": "now"}))
+            verify.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "subjectEvidencePath": str(apply),
+                        "subjectEvidenceSha256": "0" * 64,
+                    }
+                )
+            )
+            for path in (canonical, apply, verify):
+                path.chmod(0o600)
+            with (
+                mock.patch.object(self.module, "ROOT", root),
+                mock.patch.object(self.module, "PLATFORM_ENV", canonical),
+                mock.patch.object(self.module, "EVIDENCE", apply),
+                mock.patch.object(self.module, "VERIFICATION_EVIDENCE", verify),
+                mock.patch.object(self.module, "PORTABLE_EVIDENCE_BUNDLE", bundle_path),
+            ):
+                stale = self.module.write_portable_evidence_bundle({})
+        self.assertEqual(stale["status"], "unverified")
 
     def test_evidence_files_must_be_private_regular_and_fresh(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -444,6 +814,23 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 "2020-01-01T00:00:00+00:00", "evidence.generatedAt"
             )
         self.assertEqual(raised.exception.code, "evidence_stale")
+        bounded_start = self.module.parse_timestamp(
+            "2020-01-01T00:09:00+00:00", "e2e.startedAt"
+        )
+        self.module.require_fresh_timestamp(
+            "2020-01-01T00:00:00+00:00",
+            "dependency.generatedAt",
+            relative_to=bounded_start,
+        )
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.require_fresh_timestamp(
+                "2020-01-01T00:00:00+00:00",
+                "dependency.generatedAt",
+                relative_to=self.module.parse_timestamp(
+                    "2020-01-01T00:11:00+00:00", "e2e.startedAt"
+                ),
+            )
+        self.assertEqual(raised.exception.code, "evidence_stale")
 
     def test_cleanup_accepts_an_already_closed_pr_and_deleted_branch(self):
         e2e = {"githubOwner": "example", "githubRepository": "canary"}
@@ -460,7 +847,14 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 e2e,
                 "not-a-real-token",
                 "agent/paperclip-e2e-123",
-                {"number": 7, "state": "closed"},
+                {
+                    "number": 7,
+                    "state": "closed",
+                    "head": {
+                        "ref": "agent/paperclip-e2e-123",
+                        "label": "example:agent/paperclip-e2e-123",
+                    },
+                },
             )
         self.assertEqual(
             result,
@@ -483,13 +877,20 @@ class ServerE2ECanaryTests(unittest.TestCase):
 
     def test_cleanup_rediscovers_and_verifies_open_pr_when_capture_failed(self):
         e2e = {"githubOwner": "example", "githubRepository": "canary"}
-        open_pull = {"number": 7, "state": "open"}
+        open_pull = {
+            "number": 7,
+            "state": "open",
+            "head": {
+                "ref": "agent/paperclip-e2e-123",
+                "label": "example:agent/paperclip-e2e-123",
+            },
+        }
         with mock.patch.object(
             self.module,
             "github_write",
             side_effect=[
                 (200, [open_pull]),
-                (200, {"state": "closed"}),
+                (200, {"number": 7, "state": "closed"}),
                 (204, None),
                 (404, None),
                 (200, {"state": "closed"}),
@@ -519,6 +920,52 @@ class ServerE2ECanaryTests(unittest.TestCase):
             ["GET", "PATCH", "DELETE", "GET", "GET"],
         )
 
+    def test_cleanup_refuses_an_unrelated_pr_before_any_write(self):
+        e2e = {"githubOwner": "example", "githubRepository": "canary"}
+        with (
+            mock.patch.object(self.module, "github_write") as write,
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.cleanup_github(
+                e2e,
+                "not-a-real-token",
+                "agent/paperclip-e2e-123",
+                {
+                    "number": 7,
+                    "state": "open",
+                    "head": {
+                        "ref": "other-branch",
+                        "label": "example:other-branch",
+                    },
+                },
+            )
+        self.assertEqual(raised.exception.code, "github_cleanup_identity_invalid")
+        write.assert_not_called()
+
+    def test_find_pr_accepts_only_one_exact_same_owner_head(self):
+        e2e = {"githubOwner": "example", "githubRepository": "canary"}
+        branch = "agent/paperclip-e2e-123"
+        foreign = {
+            "number": 4,
+            "head": {"ref": branch, "label": f"fork:{branch}"},
+        }
+        exact = {
+            "number": 7,
+            "head": {"ref": branch, "label": f"example:{branch}"},
+        }
+        with mock.patch.object(self.module, "public_github", return_value=[foreign]):
+            self.assertIsNone(self.module.find_pr(e2e, branch))
+        with mock.patch.object(self.module, "public_github", return_value=[exact]):
+            self.assertEqual(self.module.find_pr(e2e, branch), exact)
+        with (
+            mock.patch.object(
+                self.module, "public_github", return_value=[exact, dict(exact)]
+            ),
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.find_pr(e2e, branch)
+        self.assertEqual(raised.exception.code, "github_pr_ambiguous")
+
     def test_adapter_api_contract_must_match_live_native_profiles(self):
         required = {
             "coding-daytona-codex",
@@ -534,6 +981,8 @@ class ServerE2ECanaryTests(unittest.TestCase):
             ref: {
                 "adapter": adapter,
                 "model": "model-pi" if ref.endswith("-pi") else "model-shared",
+                "protocol": "openai-chat-completions",
+                "routerProvider": "9router",
                 "provider": "mte9router" if ref.endswith("-pi") else "9router",
             }
             for ref, adapter in adapters.items()
@@ -569,6 +1018,12 @@ class ServerE2ECanaryTests(unittest.TestCase):
             api, required, adapters, catalog, contracts
         )
         self.assertEqual(drift, ["coding-daytona-pi"])
+        api["profiles"][2]["nativeAdapterConfig"]["provider"] = "mte9router"
+        api["profiles"][0]["llmRouting"]["provider"] = "wrong-router"
+        _, drift = self.module.profile_api_contract_drift(
+            api, required, adapters, catalog, contracts
+        )
+        self.assertEqual(drift, ["coding-daytona-codex"])
 
     def test_validate_evidence_requires_all_independent_layers(self):
         commit_sha = "d" * 40
@@ -671,6 +1126,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 "started_at": "2026-07-15T01:00:06+00:00",
                 "completed_at": "2026-07-15T01:00:09+00:00",
                 "html_url": "https://github.com/example/check/17",
+                "app": {
+                    "id": 15368,
+                    "slug": "github-actions",
+                    "name": "GitHub Actions",
+                },
             }
         ]
         self.module.validate_evidence(
@@ -818,6 +1278,16 @@ class ServerE2ECanaryTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "heartbeat_identity_drift")
 
     def test_workspace_identity_and_real_operation_are_exact_and_secret_free(self):
+        temporary = tempfile.TemporaryDirectory(prefix="mte-e2e-projection-test-")
+        self.addCleanup(temporary.cleanup)
+        self.module.ROOT = Path(temporary.name)
+        self.module.PLATFORM_ENV = Path(temporary.name) / "platform.env"
+        self.module.PLATFORM_ENV.write_text("fixture=canonical\n")
+        self.module.PLATFORM_ENV.chmod(0o600)
+        remote_cwd = "/home/daytona/paperclip-workspace/paperclip-workspace"
+        worktree_path = (
+            "/data/instances/default/projects/project-1/workspace-1/_default"
+        )
         environment = {
             "provider": "daytona",
             "environmentId": "environment-1",
@@ -825,23 +1295,40 @@ class ServerE2ECanaryTests(unittest.TestCase):
             "providerLeaseId": "sandbox-1",
             "sandboxId": "sandbox-1",
             "executionWorkspaceId": "workspace-1",
-            "remoteCwd": "/workspace/repo",
+            "remoteCwd": remote_cwd,
         }
         resources = {
             "environment": environment,
             "paperclipEnvironmentReleased": False,
             "paperclipWorkspace": {
                 "id": "workspace-1",
-                "worktreePath": "/workspace/repo",
+                "worktreePath": worktree_path,
                 "worktreePathSource": "paperclip.execution-workspace",
                 "worktreePathFingerprintSha256": hashlib.sha256(
-                    b"/workspace/repo"
+                    worktree_path.encode()
                 ).hexdigest(),
             },
         }
         identity = self.module.validated_workspace_identity(
             {"environment": environment}, resources, "environment-1"
         )
+        self.assertEqual(identity["remoteCwd"], remote_cwd)
+        self.assertEqual(identity["worktreePath"], worktree_path)
+        self.assertNotEqual(identity["remoteCwd"], identity["worktreePath"])
+        invalid_resources = {
+            **resources,
+            "paperclipWorkspace": {
+                **resources["paperclipWorkspace"],
+                "worktreePath": remote_cwd,
+                "worktreePathFingerprintSha256": hashlib.sha256(
+                    remote_cwd.encode()
+                ).hexdigest(),
+            },
+        }
+        with self.assertRaises(self.module.CanaryError):
+            self.module.validated_workspace_identity(
+                {"environment": environment}, invalid_resources, "environment-1"
+            )
         commit_sha = "e" * 40
         executable_realpath = (
             "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/pi"
@@ -849,7 +1336,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
         proof = {
             "sandboxId": "sandbox-1",
             "workspaceId": "workspace-1",
-            "cwd": "/workspace/repo",
+            "cwd": remote_cwd,
             "commitSha": commit_sha,
             "exitCode": 0,
             "markerFileSha256": "a" * 64,
@@ -861,9 +1348,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
         }
         completed = mock.Mock(stdout=json.dumps(proof))
         values = {
-            "PAPERCLIP_NODE_IMAGE": "paperclip-node:test",
+            "MTE_PAPERCLIP_IMAGE": "ghcr.io/example/paperclip-mte@sha256:" + "a" * 64,
             "PI_CLI_VERSION": "0.80.7",
             "DAYTONA_API_KEY": "must-not-enter-command-argv",
+            "MTE_DAYTONA_API_URL": "http://127.0.0.1:3310/api",
+            "DAYTONA_TARGET": "us",
         }
         with mock.patch.object(
             self.module.subprocess, "run", return_value=completed
@@ -874,6 +1363,9 @@ class ServerE2ECanaryTests(unittest.TestCase):
         rendered_argv = json.dumps(run.call_args.args[0])
         self.assertNotIn(values["DAYTONA_API_KEY"], rendered_argv)
         self.assertNotIn(values["DAYTONA_API_KEY"], run.call_args.kwargs["input"])
+        self.assertNotIn(str(self.module.PLATFORM_ENV), rendered_argv)
+        self.assertIn("/run/secrets/daytona-probe.env:ro", rendered_argv)
+        self.assertTrue(operation["credentialProjection"]["temporaryProjectionRemoved"])
         self.assertEqual(operation["executionWorkspaceId"], "workspace-1")
         self.assertEqual(operation["commitSha"], commit_sha)
         self.assertEqual(
@@ -959,6 +1451,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 "started_at": "2026-07-15T01:00:05+00:00",
                 "completed_at": "2026-07-15T01:00:09+00:00",
                 "html_url": "https://github.com/example/check/101",
+                "app": {
+                    "id": 15368,
+                    "slug": "github-actions",
+                    "name": "GitHub Actions",
+                },
             }
         ]
         github = self.module.validated_github_evidence(
@@ -993,7 +1490,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "github_pr_invalid")
 
-        profiles = ["codex", "claude", "pi"]
+        profiles = [
+            "coding-daytona-codex",
+            "coding-daytona-claude",
+            "coding-daytona-pi",
+        ]
         runs = []
         for index, profile in enumerate(profiles, start=1):
             execution_id = f"exec-{index}"
@@ -1035,9 +1536,17 @@ class ServerE2ECanaryTests(unittest.TestCase):
             )
         cross = self.module.validated_cross_run_identity(runs, profiles, 7)
         self.assertEqual(cross["status"], "passed")
-        runs[2]["paperclip"]["workspaceIdentity"]["sandboxId"] = "sandbox-1"
+        self.assertEqual(cross["profileOrder"], profiles)
+        runs[0]["paperclip"]["workspaceIdentity"]["sandboxId"] = ""
         with self.assertRaises(self.module.CanaryError) as raised:
             self.module.validated_cross_run_identity(runs, profiles, 7)
+        self.assertEqual(raised.exception.code, "cross_run_identity_invalid")
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validated_cross_run_identity(
+                runs,
+                ["coding-daytona-codex"],
+                7,
+            )
         self.assertEqual(raised.exception.code, "cross_run_identity_invalid")
 
     def test_github_proof_rejects_neutral_check_wrong_name_and_extra_path(self):
@@ -1064,6 +1573,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
             "started_at": "2026-07-15T01:00:01+00:00",
             "completed_at": "2026-07-15T01:00:09+00:00",
             "html_url": "https://github.com/example/check/1",
+            "app": {"id": 15368, "slug": "github-actions", "name": "GitHub Actions"},
         }
         e2e = {
             "githubOwner": "example",
@@ -1089,6 +1599,19 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     **kwargs,
                 )
             self.assertEqual(raised.exception.code, code)
+        wrong_app = {**check, "app": {**check["app"], "slug": "foreign-app"}}
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validated_github_evidence(
+                execution,
+                pull,
+                [wrong_app],
+                e2e,
+                "agent/paperclip-e2e-exec",
+                **kwargs,
+            )
+        self.assertEqual(
+            raised.exception.code, "github_required_check_identity_invalid"
+        )
         files = [*github_files(), {**github_files()[0], "filename": "README.md"}]
         with self.assertRaises(self.module.CanaryError) as raised:
             self.module.validated_github_evidence(
@@ -1101,6 +1624,34 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 commit=kwargs["commit"],
             )
         self.assertEqual(raised.exception.code, "github_diff_invalid")
+        wrong_marker = github_files()
+        wrong_marker[1]["content"] = (
+            'def marker():\n    return "NOT_CONTROLLER_OWNED"\n'
+        )
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validated_github_evidence(
+                execution,
+                pull,
+                [check],
+                e2e,
+                "agent/paperclip-e2e-exec",
+                pull_files=wrong_marker,
+                commit=kwargs["commit"],
+            )
+        self.assertEqual(raised.exception.code, "github_artifact_identity_invalid")
+        bypass_test = github_files()
+        bypass_test[2]["content"] += "\nimport sys\nsys.exit(0)\n"
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.validated_github_evidence(
+                execution,
+                pull,
+                [check],
+                e2e,
+                "agent/paperclip-e2e-exec",
+                pull_files=bypass_test,
+                commit=kwargs["commit"],
+            )
+        self.assertEqual(raised.exception.code, "github_artifact_identity_invalid")
 
     def test_check_runs_requires_complete_stable_pagination(self):
         rows = [{"id": index} for index in range(100)]
@@ -1118,6 +1669,34 @@ class ServerE2ECanaryTests(unittest.TestCase):
             )
         self.assertEqual(len(result), 101)
         self.assertIn("page=2", request.call_args_list[1].args[0])
+
+    def test_github_blob_accepts_api_line_wrapping_but_rejects_invalid_base64(self):
+        sha = "a" * 40
+        content = "controller-owned\n" * 20
+        wrapped = base64.encodebytes(content.encode()).decode()
+        with mock.patch.object(
+            self.module,
+            "public_github",
+            return_value={"sha": sha, "encoding": "base64", "content": wrapped},
+        ):
+            self.assertEqual(
+                self.module.github_blob(
+                    {"githubOwner": "example", "githubRepository": "canary"}, sha
+                ),
+                content,
+            )
+        with (
+            mock.patch.object(
+                self.module,
+                "public_github",
+                return_value={"sha": sha, "encoding": "base64", "content": "%%%"},
+            ),
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.github_blob(
+                {"githubOwner": "example", "githubRepository": "canary"}, sha
+            )
+        self.assertEqual(raised.exception.code, "github_blob_invalid")
 
     def test_harness_scoped_router_auth_requires_no_subscription_and_positive_exact_route(
         self,
@@ -1203,6 +1782,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
         values = {
             access["endpointRef"]: "http://172.20.0.1:22083/mcp",
             "MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_URL": "http://172.20.0.1:22081/mcp",
+            "MTE_AGENT_GATEWAY_HOST": "172.20.0.1",
             access["credentialRef"]: "secret-never-emitted",
         }
         result = self.module.validated_toolhive_profile(
@@ -1210,7 +1790,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
             values,
             {"toolAccess": access},
             profile=profile,
-            normalized_run_id=run_id,
+            paperclip_issue_id=run_id,
         )
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["canaryTool"], "echo")
@@ -1221,7 +1801,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 values,
                 {"toolAccess": access},
                 profile=profile,
-                normalized_run_id=run_id,
+                paperclip_issue_id=run_id,
             )
         self.assertEqual(raised.exception.code, "runner_toolhive_profile_failed")
 
@@ -1261,49 +1841,32 @@ class ServerE2ECanaryTests(unittest.TestCase):
                         "apiVersion": "micro-task-engine/v1alpha1",
                         "kind": "PaperclipDaytonaControlPlaneEvidence",
                         "status": "ready",
+                        "generatedAt": self.module.datetime.now(
+                            self.module.timezone.utc
+                        ).isoformat(),
                         "canonicalSourceSha256": hashlib.sha256(
                             canonical.read_bytes()
                         ).hexdigest(),
-                        "producerPath": str(daytona_patch),
                         "producerSha256": hashlib.sha256(
                             daytona_patch.read_bytes()
                         ).hexdigest(),
-                        "secretValuesPrinted": False,
-                        "agentGateway": {
-                            "status": "passed",
-                            "profileCount": 3,
-                            "runnerContainerId": "runner-container-id",
-                            "gatewayContainerId": "gateway-container-id",
-                            "gatewayNetworkMode": "container:runner-container-id",
-                            "runnerNetworks": [
-                                "mte-agent-plane",
-                                "mte-daytona-net",
-                                "mte-tool-runtime",
-                            ],
-                            "expectedRunnerNetworks": [
-                                "mte-agent-plane",
-                                "mte-daytona-net",
-                                "mte-tool-runtime",
-                            ],
-                            "privateToolRuntimeNetwork": "mte-tool-runtime",
-                            "noPublishedPorts": True,
-                            "profiles": [
-                                {
-                                    "profileRef": profile,
-                                    "upstreamRef": f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_UPSTREAM",
-                                    "host": "tool-runtime",
-                                    "port": upstream_port,
-                                    "gatewayPort": gateway_port,
-                                    "httpStatus": 200,
-                                    "initialize": True,
-                                }
-                                for profile, harness, upstream_port, gateway_port in (
-                                    ("coding-daytona-codex", "CODEX", 19011, 22081),
-                                    ("coding-daytona-claude", "CLAUDE", 19012, 22082),
-                                    ("coding-daytona-pi", "PI", 19013, 22083),
-                                )
-                            ],
+                        "composeServices": [
+                            "agent-gateway",
+                            "api",
+                            "db",
+                            "dex",
+                            "minio",
+                            "proxy",
+                            "redis",
+                            "registry",
+                            "runner",
+                            "ssh-gateway",
+                        ],
+                        "runtimeEvidence": {
+                            "images": str(self.module.DAYTONA_IMAGES_EVIDENCE),
+                            "lifecycle": str(self.module.DAYTONA_LIFECYCLE_EVIDENCE),
                         },
+                        "secretValuesPrinted": False,
                     }
                 )
             )
@@ -1355,8 +1918,8 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     return_value={
                         "runnerContainer": "mte-daytona-runner",
                         "gatewayContainer": "mte-agent-plane-gateway",
-                        "runnerContainerId": "runner-container-id",
-                        "gatewayContainerId": "gateway-container-id",
+                        "runnerContainerId": "1" * 64,
+                        "gatewayContainerId": "2" * 64,
                         "runnerNetworkNames": [
                             "mte-agent-plane",
                             "mte-daytona-net",
@@ -1364,6 +1927,8 @@ class ServerE2ECanaryTests(unittest.TestCase):
                         ],
                         "gatewaySharesRunnerNamespace": True,
                         "publishedPorts": [],
+                        "canonicalEnvironmentMounted": False,
+                        "mountInventorySha256": "a" * 64,
                     },
                 ),
             ):
@@ -1371,6 +1936,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     {
                         "TOOLHIVE_TOKEN": "secret-never-emitted",
                         "MTE_AGENT_PLANE_NETWORK": "mte-agent-plane",
+                        "MTE_AGENT_GATEWAY_HOST": "172.20.0.1",
                         **{
                             f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_UPSTREAM": f"http://tool-runtime:{port}"
                             for harness, port in (
@@ -1410,6 +1976,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     audit,
                     {
                         "MTE_AGENT_PLANE_NETWORK": "mte-agent-plane",
+                        "MTE_AGENT_GATEWAY_HOST": "172.20.0.1",
                         **{
                             f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_UPSTREAM": f"http://tool-runtime:{port}"
                             for harness, port in (
@@ -1495,7 +2062,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
         )
 
     def test_cleanup_releases_exact_paperclip_resources_and_proves_daytona_404(self):
-        worktree_path = "/workspace/repo"
+        remote_cwd = "/home/daytona/paperclip-workspace/paperclip-workspace"
+        worktree_path = (
+            "/data/instances/default/projects/project-1/workspace-1/_default"
+        )
+        remote_cwd_fingerprint = hashlib.sha256(remote_cwd.encode()).hexdigest()
         worktree_fingerprint = hashlib.sha256(worktree_path.encode()).hexdigest()
         before = {
             "environment": {
@@ -1504,7 +2075,16 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 "providerLeaseId": "sandbox-1",
                 "sandboxId": "sandbox-1",
                 "executionWorkspaceId": "workspace-1",
-                "remoteCwd": worktree_path,
+                "remoteCwd": remote_cwd,
+            },
+            "environmentLeaseGroup": {
+                "providerLeaseId": "sandbox-1",
+                "leaseIds": ["lease-1", "lease-duplicate"],
+                "successfulLeaseIds": [],
+                "duplicateTerminalLeaseIds": [],
+                "unexpectedLeaseIds": [],
+                "successfulExpiredLeaseObserved": False,
+                "leaseGroupFingerprintSha256": "0" * 64,
             },
             "paperclipWorkspace": {
                 "id": "workspace-1",
@@ -1518,16 +2098,65 @@ class ServerE2ECanaryTests(unittest.TestCase):
         }
         after = {
             "environment": before["environment"],
+            "environmentLeaseGroup": {
+                **before["environmentLeaseGroup"],
+                "successfulLeaseIds": ["lease-1"],
+                "duplicateTerminalLeaseIds": ["lease-duplicate"],
+                "successfulExpiredLeaseObserved": True,
+                "leaseGroupFingerprintSha256": "1" * 64,
+            },
             "paperclipWorkspace": {
                 "id": "workspace-1",
                 "status": "archived",
                 "worktreePath": worktree_path,
                 "worktreePathFingerprintSha256": worktree_fingerprint,
-                "worktreeAbsent": None,
-                "filesystemAbsenceVerified": False,
+                "worktreeAbsent": True,
+                "filesystemAbsenceVerified": True,
+                "filesystemProbe": "absent",
             },
             "paperclipEnvironmentReleased": True,
         }
+        after_group = after["environmentLeaseGroup"]
+        after_group["leaseGroupFingerprintSha256"] = hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in after_group.items()
+                    if key != "leaseGroupFingerprintSha256"
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        after["environmentLeaseGroups"] = [after["environmentLeaseGroup"]]
+        unproven_after = {
+            **after,
+            "paperclipWorkspace": {
+                **after["paperclipWorkspace"],
+                "worktreeAbsent": None,
+                "filesystemAbsenceVerified": False,
+            },
+        }
+        with (
+            mock.patch.object(
+                self.module,
+                "paperclip_resource_state",
+                side_effect=[before, unproven_after],
+            ),
+            mock.patch.object(self.module, "request_json", return_value=(202, after)),
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.cleanup_paperclip_daytona(
+                "http://adapter.invalid",
+                {
+                    "DAYTONA_API_URL": "https://daytona.invalid/api",
+                    "DAYTONA_API_KEY": "fake",
+                },
+                "run-1",
+                attempts=1,
+                poll_interval=0,
+            )
+        self.assertEqual(raised.exception.code, "paperclip_resource_cleanup_failed")
         with (
             mock.patch.object(
                 self.module,
@@ -1560,7 +2189,16 @@ class ServerE2ECanaryTests(unittest.TestCase):
             result["paperclip"]["filesystemProof"]["providerGetStatus"], 404
         )
         self.assertEqual(result["worktreePathFingerprintSha256"], worktree_fingerprint)
+        self.assertEqual(
+            result["remoteCwdFingerprintSha256"], remote_cwd_fingerprint
+        )
+        self.assertNotEqual(result["remoteCwd"], result["worktreePath"])
         self.assertTrue(result["daytona"]["sandboxAbsent"])
+        self.assertTrue(
+            result["paperclip"]["providerLeaseCleanup"][
+                "successfulExpiredLeaseObserved"
+            ]
+        )
         self.assertEqual(result["daytona"]["providerGetStatus"], 404)
         self.assertEqual(request.call_args.args[1], "PATCH")
         self.assertTrue(
@@ -1570,8 +2208,255 @@ class ServerE2ECanaryTests(unittest.TestCase):
             [call.args[1] for call in daytona.call_args_list], ["GET", "GET"]
         )
 
-    def test_global_cleanup_requires_zero_daytona_labels_and_github_prefix_refs(self):
+    def test_resource_state_proves_exact_paperclip_worktree_absence_on_owner(self):
+        worktree_path = (
+            "/data/instances/default/projects/project-1/workspace-1/_default"
+        )
+        lease_group = {
+            "providerLeaseId": "sandbox-1",
+            "leaseIds": ["lease-1"],
+            "successfulLeaseIds": ["lease-1"],
+            "duplicateTerminalLeaseIds": [],
+            "unexpectedLeaseIds": [],
+            "successfulExpiredLeaseObserved": True,
+        }
+        lease_group["leaseGroupFingerprintSha256"] = hashlib.sha256(
+            json.dumps(
+                lease_group, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        projection = {
+            "environment": {
+                "provider": "daytona",
+                "providerLeaseId": "sandbox-1",
+                "sandboxId": "sandbox-1",
+                "executionWorkspaceId": "workspace-1",
+                "remoteCwd": "/home/daytona/paperclip-workspace/paperclip-workspace",
+            },
+            "environmentLeaseGroup": lease_group,
+            "environmentLeaseGroups": [lease_group],
+        }
+        workspace = {
+            "id": "workspace-1",
+            "status": "archived",
+            "worktreePath": worktree_path,
+        }
+        with (
+            mock.patch.object(
+                self.module, "native_issue_projection", return_value=projection
+            ),
+            mock.patch.object(
+                self.module, "paperclip_request", return_value=(200, workspace)
+            ),
+            mock.patch.object(
+                self.module.subprocess,
+                "run",
+                side_effect=[mock.Mock(returncode=1), mock.Mock(returncode=0)],
+            ) as run,
+        ):
+            result = self.module.paperclip_resource_state(
+                "http://paperclip.invalid", {}, "issue-1"
+            )
+
+        observed = result["paperclipWorkspace"]
+        self.assertTrue(observed["worktreeAbsent"])
+        self.assertTrue(observed["filesystemAbsenceVerified"])
+        self.assertEqual(observed["filesystemProbe"], "absent")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0][-1], worktree_path)
+        self.assertEqual(run.call_args_list[1].args[0][-1], worktree_path)
+        self.assertNotIn(projection["environment"]["remoteCwd"], str(run.call_args_list))
+
+        traversal_workspace = {
+            **workspace,
+            "worktreePath": (
+                "/data/instances/default/projects/project-1/../_default"
+            ),
+        }
+        with (
+            mock.patch.object(
+                self.module, "native_issue_projection", return_value=projection
+            ),
+            mock.patch.object(
+                self.module,
+                "paperclip_request",
+                return_value=(200, traversal_workspace),
+            ),
+            mock.patch.object(self.module.subprocess, "run") as rejected_run,
+        ):
+            rejected = self.module.paperclip_resource_state(
+                "http://paperclip.invalid", {}, "issue-1"
+            )
+        rejected_run.assert_not_called()
+        self.assertIsNone(rejected["paperclipWorkspace"]["worktreeAbsent"])
+        self.assertFalse(
+            rejected["paperclipWorkspace"]["filesystemAbsenceVerified"]
+        )
+        self.assertEqual(
+            rejected["paperclipWorkspace"]["filesystemProbe"], "unverified"
+        )
+
+    def test_native_projection_uses_run_id_and_last_lease_bearing_run(self):
+        issue_id = "issue-1"
+        older_lease = {
+            "id": "lease-1",
+            "provider": "daytona",
+            "providerLeaseId": "sandbox-1",
+            "executionWorkspaceId": "workspace-1",
+            "workspacePath": "/workspace/repo",
+            "status": "expired",
+            "cleanupStatus": "success",
+        }
+        runs = [
+            {
+                "runId": "run-with-lease",
+                "status": "succeeded",
+                "createdAt": "2026-07-19T10:00:00Z",
+                "environmentLease": older_lease,
+            },
+            {
+                "runId": "run-setup-failure",
+                "status": "failed",
+                "createdAt": "2026-07-19T10:01:00Z",
+                "environmentLease": None,
+            },
+        ]
+
+        def request(_base, _values, _method, path, **_kwargs):
+            if path == f"/api/issues/{issue_id}":
+                return 200, {"id": issue_id, "status": "blocked"}
+            if path == f"/api/issues/{issue_id}/runs":
+                return 200, runs
+            if path == "/api/heartbeat-runs/run-setup-failure":
+                return 200, {
+                    "id": "run-setup-failure",
+                    "status": "failed",
+                    "agentId": "agent-1",
+                }
+            if path == "/api/heartbeat-runs/run-setup-failure/events":
+                return 200, []
+            if path == f"/api/issues/{issue_id}/diagnostics/wakes":
+                return 200, []
+            if path == "/api/environment-leases/lease-1":
+                return 200, older_lease
+            raise AssertionError(path)
+
+        with mock.patch.object(self.module, "paperclip_request", side_effect=request):
+            result = self.module.native_issue_projection(
+                "http://paperclip.invalid", {}, issue_id
+            )
+
+        self.assertEqual(result["native"]["heartbeatRunId"], "run-setup-failure")
+        self.assertEqual(result["environment"]["environmentLeaseId"], "lease-1")
+        self.assertEqual(result["environment"]["sandboxId"], "sandbox-1")
+        self.assertEqual(result["environment"]["executionWorkspaceId"], "workspace-1")
+
+    def test_native_projection_groups_duplicate_leases_by_provider_resource(self):
+        issue_id = "issue-duplicates"
+        successful = {
+            "id": "lease-success",
+            "provider": "daytona",
+            "providerLeaseId": "sandbox-shared",
+            "executionWorkspaceId": "workspace-1",
+            "workspacePath": "/workspace/repo",
+            "status": "expired",
+            "cleanupStatus": "success",
+        }
+        duplicate = {
+            **successful,
+            "id": "lease-duplicate",
+            "status": "pending_cleanup",
+            "cleanupStatus": "failed",
+        }
+        other = {
+            **successful,
+            "id": "lease-other",
+            "providerLeaseId": "sandbox-other",
+        }
+        runs = [
+            {"runId": "run-1", "createdAt": "2026-07-19T10:00:00Z", "environmentLease": successful},
+            {"runId": "run-2", "createdAt": "2026-07-19T10:01:00Z", "environmentLease": duplicate},
+            {"runId": "run-3", "createdAt": "2026-07-19T10:02:00Z", "environmentLease": other},
+        ]
+
+        def request(_base, _values, _method, path, **_kwargs):
+            if path == f"/api/issues/{issue_id}":
+                return 200, {"id": issue_id, "status": "done"}
+            if path == f"/api/issues/{issue_id}/runs":
+                return 200, runs
+            if path == "/api/heartbeat-runs/run-3":
+                return 200, {"id": "run-3", "status": "succeeded", "agentId": "agent-1"}
+            if path == "/api/heartbeat-runs/run-3/events":
+                return 200, []
+            if path == f"/api/issues/{issue_id}/diagnostics/wakes":
+                return 200, []
+            if path == "/api/environment-leases/lease-success":
+                return 200, successful
+            if path == "/api/environment-leases/lease-duplicate":
+                return 200, duplicate
+            if path == "/api/environment-leases/lease-other":
+                return 200, other
+            raise AssertionError(path)
+
+        with mock.patch.object(self.module, "paperclip_request", side_effect=request):
+            result = self.module.native_issue_projection("http://paperclip.invalid", {}, issue_id)
+
+        self.assertEqual(len(result["environmentLeaseGroups"]), 2)
+        group = next(
+            item
+            for item in result["environmentLeaseGroups"]
+            if item["providerLeaseId"] == "sandbox-shared"
+        )
+        self.assertEqual(group["providerLeaseId"], "sandbox-shared")
+        self.assertEqual(group["successfulLeaseIds"], ["lease-success"])
+        self.assertEqual(group["duplicateTerminalLeaseIds"], ["lease-duplicate"])
+        self.assertEqual(group["unexpectedLeaseIds"], [])
+        self.assertTrue(group["successfulExpiredLeaseObserved"])
+        self.assertTrue(
+            self.module.valid_provider_lease_cleanup(group, "sandbox-shared")
+        )
+
+        only_failed = {
+            **group,
+            "successfulLeaseIds": [],
+            "duplicateTerminalLeaseIds": group["leaseIds"],
+            "successfulExpiredLeaseObserved": False,
+        }
+        only_failed["leaseGroupFingerprintSha256"] = hashlib.sha256(
+            json.dumps(
+                {
+                    key: value
+                    for key, value in only_failed.items()
+                    if key != "leaseGroupFingerprintSha256"
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        self.assertFalse(
+            self.module.valid_provider_lease_cleanup(only_failed, "sandbox-shared")
+        )
+
+    def test_global_cleanup_rejects_only_exact_run_owned_residuals(self):
         e2e = {"githubOwner": "example", "githubRepository": "canary"}
+        cleanup_rows = [
+            {
+                "resources": {
+                    "sandboxId": "owned-sandbox",
+                    "providerLeaseId": "owned-sandbox",
+                    "daytona": {
+                        "providerResources": [
+                            {
+                                "sandboxId": "owned-sandbox",
+                                "providerLeaseId": "owned-sandbox",
+                            }
+                        ]
+                    },
+                },
+                "branchRef": "refs/heads/agent/paperclip-e2e-owned",
+                "pullRequestNumber": 7,
+            }
+        ]
         with (
             mock.patch.object(
                 self.module, "daytona_environment_sandboxes", return_value=[]
@@ -1579,7 +2464,10 @@ class ServerE2ECanaryTests(unittest.TestCase):
             mock.patch.object(self.module, "public_github", return_value=[]),
         ):
             result = self.module.global_cleanup_absence(
-                e2e, {"DAYTONA_API_KEY": "not-emitted"}, "environment-1"
+                e2e,
+                {"DAYTONA_API_KEY": "not-emitted"},
+                "environment-1",
+                cleanup_rows,
             )
         self.assertEqual(result["status"], "passed")
         self.assertEqual(result["daytonaSandboxIds"], [])
@@ -1592,10 +2480,28 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 return_value=[{"id": "leftover"}],
             ),
             mock.patch.object(self.module, "public_github", return_value=[]),
+        ):
+            unrelated = self.module.global_cleanup_absence(
+                e2e,
+                {"DAYTONA_API_KEY": "not-emitted"},
+                "environment-1",
+                cleanup_rows,
+            )
+        self.assertTrue(unrelated["unrelatedParallelResourcesIgnored"])
+        with (
+            mock.patch.object(
+                self.module,
+                "daytona_environment_sandboxes",
+                return_value=[{"id": "owned-sandbox"}],
+            ),
+            mock.patch.object(self.module, "public_github", return_value=[]),
             self.assertRaises(self.module.CanaryError) as raised,
         ):
             self.module.global_cleanup_absence(
-                e2e, {"DAYTONA_API_KEY": "not-emitted"}, "environment-1"
+                e2e,
+                {"DAYTONA_API_KEY": "not-emitted"},
+                "environment-1",
+                cleanup_rows,
             )
         self.assertEqual(raised.exception.code, "global_cleanup_incomplete")
         with (
@@ -1607,18 +2513,16 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 "public_github",
                 side_effect=[
                     [],
-                    [
-                        {
-                            "number": 9,
-                            "head": {"ref": "agent/paperclip-e2e-leftover"},
-                        }
-                    ],
+                    [{"number": 7, "head": {"ref": "some-other-branch"}}],
                 ],
             ),
             self.assertRaises(self.module.CanaryError) as raised,
         ):
             self.module.global_cleanup_absence(
-                e2e, {"DAYTONA_API_KEY": "not-emitted"}, "environment-1"
+                e2e,
+                {"DAYTONA_API_KEY": "not-emitted"},
+                "environment-1",
+                cleanup_rows,
             )
         self.assertEqual(raised.exception.code, "global_cleanup_incomplete")
 
@@ -1656,6 +2560,86 @@ class ServerE2ECanaryTests(unittest.TestCase):
         self.assertTrue(
             calls[1][0].endswith("/micro_task_engine.e2e/paperclip-github-e2e")
         )
+
+    def test_trigger_recovery_fails_closed_on_ambiguous_correlation(self):
+        correlation = "mte-e2e-" + "a" * 32
+        duplicate = {
+            "id": "execution-1",
+            "namespace": "micro_task_engine.e2e",
+            "flowId": "paperclip-github-e2e",
+            "inputs": {"controller_correlation_id": correlation},
+        }
+        with (
+            mock.patch.object(
+                self.module,
+                "kestra_request",
+                return_value={
+                    "results": [duplicate, {**duplicate, "id": "execution-2"}]
+                },
+            ),
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.discover_execution_by_correlation(
+                "http://kestra.invalid",
+                {},
+                correlation,
+                attempts=1,
+                poll_interval=0,
+            )
+        self.assertEqual(raised.exception.code, "trigger_recovery_ambiguous")
+
+    def test_trigger_recovery_proves_unique_execution_or_bounded_absence(self):
+        correlation = "mte-e2e-" + "b" * 32
+        execution = {
+            "id": "execution-1",
+            "namespace": "micro_task_engine.e2e",
+            "flowId": "paperclip-github-e2e",
+            "inputs": {"controller_correlation_id": correlation},
+        }
+        with mock.patch.object(
+            self.module,
+            "kestra_request",
+            side_effect=[{"results": []}, {"results": [execution]}],
+        ):
+            recovered, proof = self.module.discover_execution_by_correlation(
+                "http://kestra.invalid",
+                {},
+                correlation,
+                attempts=2,
+                poll_interval=0,
+            )
+        self.assertEqual(recovered, execution)
+        self.assertEqual(proof["status"], "recovered")
+        self.assertEqual(proof["searchAttempts"], 2)
+        self.assertNotIn(correlation, json.dumps(proof))
+
+        with mock.patch.object(
+            self.module, "kestra_request", return_value={"results": []}
+        ):
+            recovered, proof = self.module.discover_execution_by_correlation(
+                "http://kestra.invalid",
+                {},
+                correlation,
+                attempts=2,
+                poll_interval=0,
+            )
+        self.assertIsNone(recovered)
+        self.assertEqual(proof["status"], "absent")
+        self.assertEqual(proof["searchAttempts"], 2)
+
+    def test_trigger_recovery_rejects_malformed_controller_identity(self):
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.discover_execution_by_correlation(
+                "http://kestra.invalid", {}, "operator-supplied", attempts=1
+            )
+        self.assertEqual(raised.exception.code, "trigger_correlation_invalid")
+
+    def test_direct_sync_contract_contains_no_legacy_deploy_engine_dependency(self):
+        source = SCRIPT.read_text()
+        self.assertNotIn(".deploy/current-release.json", source)
+        self.assertNotIn("GovernedSourceActivation", source)
+        self.assertNotIn("deployment_release_binding", source)
+        self.assertIn("DirectSyncCanonicalContract", source)
 
     def test_daytona_profile_refs_are_explicit_and_recursive(self):
         details = {
@@ -1744,6 +2728,11 @@ class ServerE2ECanaryTests(unittest.TestCase):
                         "success",
                         json.dumps(
                             {
+                                "request": {
+                                    "messages": [
+                                        {"content": "run marker kestra:execution-1"}
+                                    ]
+                                },
                                 "providerResponse": {
                                     "id": "trace-123",
                                     "usage": {
@@ -1778,6 +2767,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     "codex_local",
                     "mte-minimax/MiniMax-M2.7-highspeed",
                     router,
+                    "kestra:execution-1",
                 )
                 self.assertEqual(result["status"], "passed")
                 self.assertEqual(result["requestIds"], [11])
@@ -1790,6 +2780,10 @@ class ServerE2ECanaryTests(unittest.TestCase):
                     result["requestBinding"]["completionFingerprintsSha256"],
                     [hashlib.sha256(b"done").hexdigest()],
                 )
+                self.assertEqual(
+                    result["requestBinding"]["correlationNonceSha256"],
+                    hashlib.sha256(b"kestra:execution-1").hexdigest(),
+                )
                 self.assertRegex(
                     result["attributionFingerprintSha256"], r"^[0-9a-f]{64}$"
                 )
@@ -1801,13 +2795,124 @@ class ServerE2ECanaryTests(unittest.TestCase):
                         "codex_local",
                         "mte-minimax/MiniMax-M2.7-highspeed",
                         router,
+                        "kestra:execution-1",
                     )
             self.assertEqual(raised.exception.code, "router_server_attribution_failed")
+            values["NINEROUTER_MINIMAX_CONNECTION_ID"] = connection_id
+            with (
+                mock.patch.dict(
+                    self.module.os.environ,
+                    {"MTE_NINEROUTER_DB_PATH": str(database_path)},
+                ),
+                self.assertRaises(self.module.CanaryError) as raised,
+            ):
+                self.module.router_server_attribution(
+                    values,
+                    profile,
+                    "codex_local",
+                    "mte-minimax/MiniMax-M2.7-highspeed",
+                    router,
+                    "kestra:different-execution",
+                )
+            self.assertEqual(raised.exception.code, "router_run_correlation_failed")
 
     def test_usage_requests_accepts_only_aggregate_counts(self):
         self.assertEqual(self.module.usage_requests({"requests": 7}), 7)
         self.assertEqual(self.module.usage_requests({"count": 3}), 3)
         self.assertEqual(self.module.usage_requests("secret-shaped-string"), 0)
+
+    def test_failed_execution_preserves_task_and_root_cause_without_success_outputs(self):
+        root_cause = (
+            "Native Paperclip issue did not finish within the bounded 35-minute, "
+            "at-most-32-run identity-stable heartbeat chain."
+        )
+        execution = {
+            "id": "execution-1",
+            "namespace": "micro_task_engine.e2e",
+            "flowId": "paperclip-github-e2e",
+            "state": {
+                "current": "FAILED",
+                "startDate": "2026-07-19T00:00:00Z",
+                "endDate": "2026-07-19T00:01:00Z",
+            },
+            "taskRunList": [
+                {
+                    "taskId": "assert_agent_succeeded",
+                    "state": {"current": "FAILED"},
+                },
+                {
+                    "taskId": "error_summary",
+                    "state": {"current": "SUCCESS"},
+                    "outputs": {
+                        "values": {
+                            "failedTaskId": "assert_agent_succeeded",
+                            "paperclipIssueId": "issue-1",
+                            "errorLogs": json.dumps(
+                                [
+                                    {
+                                        "taskId": "assert_agent_succeeded",
+                                        "level": "ERROR",
+                                        "message": root_cause,
+                                        "untrusted": "must-not-be-harvested",
+                                    }
+                                ]
+                            ),
+                        }
+                    },
+                },
+            ],
+        }
+
+        error = self.module.failed_execution_error(execution)
+
+        self.assertEqual(error.code, "kestra_execution_failed")
+        self.assertEqual(error.evidence["failedTaskId"], "assert_agent_succeeded")
+        self.assertEqual(error.evidence["rootCause"], root_cause)
+        self.assertNotIn("untrusted", json.dumps(error.evidence))
+        self.assertNotIn("artifacts", json.dumps(error.evidence).lower())
+
+    def test_failed_execution_rejects_mismatched_error_output(self):
+        execution = {
+            "id": "execution-1",
+            "state": {"current": "FAILED"},
+            "taskRunList": [
+                {
+                    "taskId": "assert_agent_succeeded",
+                    "state": {"current": "FAILED"},
+                },
+                {
+                    "taskId": "error_summary",
+                    "outputs": {"values": {"failedTaskId": "downstream_artifact"}},
+                },
+            ],
+        }
+        with self.assertRaises(self.module.CanaryError) as raised:
+            self.module.failed_execution_error(execution)
+        self.assertEqual(raised.exception.code, "kestra_failure_evidence_invalid")
+
+    def test_failure_harvesting_reuses_terminal_execution_without_another_get(self):
+        execution = {
+            "id": "execution-1",
+            "state": {"current": "FAILED"},
+            "outputs": {},
+            "taskRunList": [
+                {
+                    "taskId": "error_summary",
+                    "outputs": {"values": {"paperclipIssueId": "issue-1"}},
+                }
+            ],
+        }
+        with mock.patch.object(self.module, "kestra_request") as request:
+            issue_id = self.module.paperclip_issue_id_from_execution(
+                "http://kestra.invalid", {}, "execution-1", execution
+            )
+            cleanup = self.module.cleanup_kestra_execution(
+                "http://kestra.invalid", {}, "execution-1", execution
+            )
+        self.assertEqual(issue_id, "issue-1")
+        self.assertTrue(cleanup["completed"])
+        self.assertFalse(cleanup["requested"])
+        request.assert_not_called()
 
     def test_nonterminal_paperclip_cleanup_is_independent_and_confirmed(self):
         with (
@@ -1840,6 +2945,109 @@ class ServerE2ECanaryTests(unittest.TestCase):
         self.assertTrue(result["requested"])
         self.assertEqual(request.call_args_list[0].args[2], "POST")
         self.assertEqual(request.call_args_list[1].args[2], "PATCH")
+
+    def test_failure_cleanup_recovers_the_unique_issue_before_poll_issue_runs(self):
+        execution_id = "execution-1"
+        with mock.patch.object(
+            self.module,
+            "kestra_request",
+            return_value={
+                "outputs": {"paperclip_issue_id": "issue-1"},
+                "taskRunList": [
+                    {
+                        "taskId": "issues_after",
+                        "outputs": {
+                            "body": json.dumps(
+                                {
+                                    "data": [
+                                        {
+                                            "id": "issue-1",
+                                            "title": f"[kestra:{execution_id}] E2E",
+                                        }
+                                    ]
+                                }
+                            )
+                        },
+                    },
+                    {
+                        "taskId": "error_summary",
+                        "outputs": {"values": {"paperclipIssueId": "issue-1"}},
+                    },
+                ],
+            },
+        ):
+            self.assertEqual(
+                self.module.paperclip_issue_id_from_execution(
+                    "http://kestra.invalid", {}, execution_id
+                ),
+                "issue-1",
+            )
+
+    def test_failure_cleanup_rejects_ambiguous_issue_recovery(self):
+        with (
+            mock.patch.object(
+                self.module,
+                "kestra_request",
+                return_value={
+                    "outputs": {"paperclip_issue_id": "issue-1"},
+                    "taskRunList": [
+                        {
+                            "taskId": "error_summary",
+                            "outputs": {"values": {"paperclipIssueId": "issue-2"}},
+                        }
+                    ],
+                },
+            ),
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.paperclip_issue_id_from_execution(
+                "http://kestra.invalid", {}, "execution-1"
+            )
+        self.assertEqual(raised.exception.code, "paperclip_issue_identity_ambiguous")
+
+    def test_stuck_execution_cancel_path_requires_observed_terminal_state(self):
+        with mock.patch.object(
+            self.module,
+            "kestra_request",
+            side_effect=[
+                {},
+                {"state": {"current": "RUNNING"}},
+                {"state": {"current": "KILLED"}},
+            ],
+        ) as request:
+            proof = self.module.cancel_stuck_execution(
+                "http://kestra.invalid",
+                {"Authorization": "Basic fake"},
+                "execution-1",
+                last_state="RUNNING",
+                timeout_seconds=3600,
+                attempts=2,
+                poll_interval=0,
+            )
+        self.assertEqual(proof["terminalState"], "KILLED")
+        self.assertTrue(proof["killAccepted"])
+        self.assertRegex(proof["cancellationFingerprintSha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(request.call_args_list[0].args[2], "DELETE")
+
+        with (
+            mock.patch.object(
+                self.module,
+                "kestra_request",
+                side_effect=[{}, {"state": {"current": "RUNNING"}}],
+            ),
+            self.assertRaises(self.module.CanaryError) as raised,
+        ):
+            self.module.cancel_stuck_execution(
+                "http://kestra.invalid",
+                {},
+                "execution-2",
+                last_state="RUNNING",
+                timeout_seconds=1,
+                attempts=1,
+                poll_interval=0,
+            )
+        self.assertEqual(raised.exception.code, "execution_timeout_cancel_failed")
+        self.assertEqual(raised.exception.evidence["lastCancelState"], "RUNNING")
 
 
 if __name__ == "__main__":

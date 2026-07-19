@@ -12,6 +12,7 @@ branch.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from datetime import datetime, timezone
 import hashlib
@@ -23,6 +24,7 @@ import re
 import secrets
 import sqlite3
 import subprocess
+import tempfile
 import time
 from typing import Any
 import urllib.error
@@ -44,27 +46,57 @@ FLOW = ROOT / "manifests/kestra/flows/paperclip-github-e2e.yaml"
 # inputs and must never silently replace these paths.
 PROFILE_SOURCE = ROOT / "templates/profiles/profiles.yaml"
 PROFILES = ROOT / "runtime/profiles/profiles.yaml"
-PAPERCLIP_RUNTIME_SOURCE = ROOT / "steps/50-paperclip.sh"
+PAPERCLIP_RUNTIME_SOURCE = ROOT / "steps/paperclip.sh"
 DAYTONA_EVIDENCE = ROOT / "evidence/paperclip-daytona-control-plane.json"
 DAYTONA_VERIFY_EVIDENCE = ROOT / "evidence/paperclip-daytona-verify.json"
 DAYTONA_IMAGES_EVIDENCE = ROOT / "evidence/daytona-images.json"
 DAYTONA_LIFECYCLE_EVIDENCE = ROOT / "evidence/daytona-lifecycle.json"
 EVIDENCE = ROOT / "evidence/kestra-paperclip-github-e2e.json"
 VERIFICATION_EVIDENCE = ROOT / "evidence/kestra-paperclip-github-e2e-verify.json"
+PORTABLE_EVIDENCE_BUNDLE = ROOT / "evidence/kestra-paperclip-github-e2e-bundle.json"
 GATEWAY_SOURCE = ROOT / "bin/agent-plane-gateway.py"
 PROFILE_RECONCILE_EVIDENCE = ROOT / "evidence/profile-reconcile.json"
 PROFILE_RECONCILE_SOURCE = ROOT / "bin/server-profile-reconcile.py"
-DAYTONA_STEP_SOURCE = ROOT / "steps/60-daytona.sh"
+DAYTONA_STEP_SOURCE = ROOT / "steps/daytona.sh"
 GITHUB_API = "https://api.github.com"
 TERMINAL = {"SUCCESS", "WARNING", "FAILED", "KILLED", "CANCELLED"}
 PASS_CONCLUSIONS = {"success"}
 EVIDENCE_MAX_AGE_SECONDS = 600
+MAX_TRIPLE_RUN_DURATION_SECONDS = 3 * 3600 + 1800
 FUTURE_SKEW_SECONDS = 60
 FULL_SHA256 = re.compile(r"[0-9a-f]{64}")
 FULL_GIT_SHA = re.compile(r"[0-9a-f]{40}")
+HARNESS_VERSION_PATTERNS = {
+    "codex": re.compile(r"(?:codex(?:-cli)?\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)"),
+    "claude": re.compile(
+        r"(?:claude\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)(?: \(Claude Code\))?"
+    ),
+    "pi": re.compile(r"(?:pi\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)"),
+}
+
+
+def normalized_harness_version(name: str, output: object) -> str | None:
+    """Return the sole exact CLI semantic version, or fail closed."""
+    pattern = HARNESS_VERSION_PATTERNS.get(name)
+    match = pattern.fullmatch(str(output or "").strip()) if pattern else None
+    return match.group(1) if match else None
+CANONICAL_ENV_REF = re.compile(r"[A-Z][A-Z0-9_]*")
+GITHUB_OWNER_SLUG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+GITHUB_REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?")
+SAFE_GITHUB_BRANCH_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}")
+SAFE_PAPERCLIP_ISSUE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 E2E_EVIDENCE_SCHEMA = "paperclip-agent-platform/e2e-evidence/v2"
 HARNESS_EVIDENCE_SCHEMA = "paperclip-agent-platform/harness-evidence/v3"
 REQUIRED_GITHUB_CHECK_NAME = "paperclip-e2e"
+REQUIRED_GITHUB_APP_ID = 15368
+REQUIRED_GITHUB_APP_SLUG = "github-actions"
+REQUIRED_GITHUB_APP_NAME = "GitHub Actions"
+CONTROLLER_MARKER = "PAPERCLIP_DAYTONA_E2E"
+DAYTONA_PROBE_ENV_KEYS = (
+    "DAYTONA_API_KEY",
+    "MTE_DAYTONA_API_URL",
+    "DAYTONA_TARGET",
+)
 ALLOWED_GITHUB_PATHS = (
     ".github/workflows/paperclip-e2e.yml",
     "paperclip-e2e/marker.py",
@@ -80,13 +112,99 @@ NATIVE_VERSION_REFS = {
     "claude_local": "CLAUDE_CODE_CLI_VERSION",
     "pi_local": "PI_CLI_VERSION",
 }
+# The first release deliberately exercises every supported coding harness, not
+# just one "representative" runner.  Keep the protocol here as a controller
+# contract so a profile cannot silently switch its native API while preserving
+# a matching name or model string.
+R1_E2E_PROFILE_CONTRACTS: dict[str, dict[str, str]] = {
+    "coding-daytona-codex": {
+        "nativeAdapter": "codex_local",
+        "protocol": "openai-responses",
+        "routerProvider": "9router",
+        "modelNamespace": "mte-minimax/",
+    },
+    "coding-daytona-claude": {
+        "nativeAdapter": "claude_local",
+        "protocol": "anthropic-messages",
+        "routerProvider": "9router",
+        "modelNamespace": "mte-minimax/",
+    },
+    "coding-daytona-pi": {
+        "nativeAdapter": "pi_local",
+        "protocol": "openai-chat-completions",
+        "routerProvider": "9router",
+        "modelNamespace": "mte-minimax/",
+    },
+}
+R1_E2E_PROFILES = tuple(R1_E2E_PROFILE_CONTRACTS)
+R1_RUNTIME_AUTH_POLICY = {
+    "oauthInImage": False,
+    "persistentSecretsInImage": False,
+    "runtimeSecretRefsOnly": True,
+}
 
 
 class CanaryError(RuntimeError):
-    def __init__(self, code: str, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
+        self.evidence = evidence
+
+
+def validate_r1_profile_contracts(
+    profiles: list[str],
+    contracts: dict[str, Any],
+    catalog: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Reject an R1 run unless all native harnesses retain their MiniMax route."""
+    expected_profiles = list(R1_E2E_PROFILES)
+    if profiles != expected_profiles:
+        raise CanaryError(
+            "r1_profile_selection_invalid",
+            "R1 E2E must run Codex, Claude Code, and Pi in the canonical order",
+        )
+    if set(contracts) != set(expected_profiles):
+        raise CanaryError(
+            "r1_profile_contract_invalid",
+            "R1 E2E profile contracts must describe every selected harness exactly once",
+        )
+
+    for ref in expected_profiles:
+        expected = R1_E2E_PROFILE_CONTRACTS[ref]
+        contract = contracts.get(ref)
+        if (
+            not isinstance(contract, dict)
+            or contract.get("nativeAdapter") != expected["nativeAdapter"]
+            or not isinstance(contract.get("requireExplicitProvider"), bool)
+        ):
+            raise CanaryError(
+                "r1_profile_contract_invalid",
+                f"R1 profile contract is invalid for {ref}",
+            )
+        if catalog is None:
+            continue
+        profile = catalog.get(ref)
+        if (
+            not isinstance(profile, dict)
+            or profile.get("adapter") != expected["nativeAdapter"]
+            or profile.get("protocol") != expected["protocol"]
+            or profile.get("routerProvider") != expected["routerProvider"]
+            or expected["modelNamespace"] not in str(profile.get("model") or "")
+            or profile.get("authPolicy") != R1_RUNTIME_AUTH_POLICY
+        ):
+            raise CanaryError(
+                "minimax_profile_invalid",
+                "R1 profile does not retain its exact native protocol, no-OAuth auth policy, and 9router MiniMax route: "
+                + ref,
+            )
 
 
 def utcnow() -> str:
@@ -100,6 +218,39 @@ def sha256_file(path: Path) -> str:
         raise CanaryError(
             "source_missing", f"cannot read canonical source {path}"
         ) from exc
+
+
+def validate_github_target(owner: str, repository: str, branch: str) -> None:
+    """Reject unsafe or ambiguous operator-owned GitHub target values."""
+
+    if not GITHUB_OWNER_SLUG.fullmatch(owner):
+        raise CanaryError("unsafe_config", "E2E GitHub owner is not a safe slug")
+    if not GITHUB_REPOSITORY_SLUG.fullmatch(repository) or repository in {".", ".."}:
+        raise CanaryError("unsafe_config", "E2E GitHub repository is not a safe slug")
+    invalid_branch = (
+        not SAFE_GITHUB_BRANCH_REF.fullmatch(branch)
+        or branch == "HEAD"
+        or branch.startswith(("-", ".", "/"))
+        or branch.endswith((".", "/", ".lock"))
+        or ".." in branch
+        or "@{" in branch
+        or "//" in branch
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            or character in "~^:?*[\\"
+            for character in branch
+        )
+        or any(
+            not segment
+            or segment.startswith((".", "-"))
+            or segment.endswith((".", ".lock"))
+            for segment in branch.split("/")
+        )
+    )
+    if invalid_branch:
+        raise CanaryError("unsafe_config", "E2E GitHub base branch is unsafe")
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -130,10 +281,11 @@ def require_fresh_timestamp(
     field: str,
     *,
     max_age_seconds: int = EVIDENCE_MAX_AGE_SECONDS,
+    relative_to: datetime | None = None,
 ) -> datetime:
     moment = parse_timestamp(value, field)
-    now = datetime.now(timezone.utc)
-    age = (now - moment).total_seconds()
+    reference = relative_to or datetime.now(timezone.utc)
+    age = (reference - moment).total_seconds()
     if age < -FUTURE_SKEW_SECONDS or age > max_age_seconds:
         raise CanaryError(
             "evidence_stale", f"{field} is outside the live evidence window"
@@ -161,6 +313,59 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     temporary.chmod(0o600)
     temporary.replace(path)
     path.chmod(0o600)
+
+
+def generated_env_projection(
+    values: dict[str, str], keys: tuple[str, ...]
+) -> tuple[Path, dict[str, Any]]:
+    """Create a short-lived 0600 dotenv containing exactly an allowlisted subset."""
+    if not keys or len(set(keys)) != len(keys):
+        raise CanaryError(
+            "credential_projection_invalid",
+            "projection keys must be non-empty and unique",
+        )
+    rows: list[str] = []
+    for key in keys:
+        value = values.get(key, "")
+        if (
+            not re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+            or not value
+            or "\n" in value
+            or "\r" in value
+        ):
+            raise CanaryError(
+                "credential_projection_invalid",
+                f"allowlisted projection value is missing or unsafe: {key}",
+            )
+        rows.append(f"{key}={value}\n")
+    projection_root = ROOT / "runtime/e2e-projections"
+    projection_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    projection_root.chmod(0o700)
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix="daytona-probe-",
+        suffix=".env",
+        dir=projection_root,
+        delete=False,
+    )
+    try:
+        handle.writelines(rows)
+        handle.flush()
+        os.fchmod(handle.fileno(), 0o600)
+    finally:
+        handle.close()
+    path = Path(handle.name)
+    return path, {
+        "status": "passed",
+        "sourceCanonicalSha256": sha256_file(PLATFORM_ENV),
+        "allowlistedKeys": list(keys),
+        "allowlistedKeyCount": len(keys),
+        "projectionSha256": sha256_file(path),
+        "projectionMode": "0600",
+        "canonicalEnvironmentMounted": False,
+        "temporaryProjectionRemoved": False,
+    }
 
 
 def write_verification_attestation(
@@ -204,7 +409,9 @@ def write_verification_attestation(
     else:
         if (
             not isinstance(runs, list)
-            or len(runs) != 3
+            or len(runs) != len(R1_E2E_PROFILES)
+            or [row.get("profile") for row in runs if isinstance(row, dict)]
+            != list(R1_E2E_PROFILES)
             or cleanup_verified is not True
             or not isinstance(toolhive_gateway_audit, dict)
             or toolhive_gateway_audit.get("status") != "passed"
@@ -214,7 +421,7 @@ def write_verification_attestation(
         ):
             raise CanaryError(
                 "verification_evidence_incomplete",
-                "passed verification must contain exactly three cleaned-up runs",
+                "passed R1 verification must contain all cleaned-up 9router MiniMax harness runs",
             )
         payload.update(
             {
@@ -230,6 +437,46 @@ def write_verification_attestation(
     scan_for_secrets(payload, values)
     atomic_json(VERIFICATION_EVIDENCE, payload)
     return payload
+
+
+def verified_run_summary(
+    *,
+    profile: str,
+    execution_id: str,
+    paperclip_issue_id: str,
+    pull_request_url: str,
+    commit_sha: str,
+    check_conclusions: list[str],
+    claim_lease_id: str,
+    semantic_check: str,
+    toolhive_semantic_check: str,
+    router_server_request_ids: list[int],
+    router_request_binding: dict[str, Any],
+    kestra_proof: dict[str, Any],
+    github_proof: dict[str, Any],
+    workspace_identity: dict[str, Any],
+    workspace_operation: dict[str, Any],
+    resource_cleanup: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the native Paperclip-ID verification row consumed by acceptance."""
+    return {
+        "profile": profile,
+        "executionId": execution_id,
+        "paperclipIssueId": paperclip_issue_id,
+        "pullRequestUrl": pull_request_url,
+        "commitSha": commit_sha,
+        "checkConclusions": check_conclusions,
+        "claimLeaseId": claim_lease_id,
+        "semanticCheck": semantic_check,
+        "toolhiveSemanticCheck": toolhive_semantic_check,
+        "routerServerRequestIds": router_server_request_ids,
+        "routerRequestBinding": router_request_binding,
+        "kestraProof": kestra_proof,
+        "githubProof": github_proof,
+        "workspaceIdentity": workspace_identity,
+        "workspaceOperation": workspace_operation,
+        "resourceCleanup": resource_cleanup,
+    }
 
 
 def request_json(
@@ -316,6 +563,43 @@ def object_rows(value: Any, *keys: str) -> list[dict[str, Any]]:
     return []
 
 
+def valid_provider_lease_cleanup(group: Any, provider_lease_id: str) -> bool:
+    """Validate cleanup once per provider resource, not once per duplicate row."""
+
+    if not isinstance(group, dict) or not provider_lease_id:
+        return False
+    lease_ids = group.get("leaseIds")
+    successful = group.get("successfulLeaseIds")
+    duplicates = group.get("duplicateTerminalLeaseIds")
+    unexpected = group.get("unexpectedLeaseIds")
+    if not all(isinstance(value, list) for value in (lease_ids, successful, duplicates, unexpected)):
+        return False
+    if (
+        group.get("providerLeaseId") != provider_lease_id
+        or not lease_ids
+        or not successful
+        or group.get("successfulExpiredLeaseObserved") is not True
+        or unexpected
+        or any(not isinstance(value, str) or not value for value in lease_ids)
+        or len(lease_ids) != len(set(lease_ids))
+        or set(successful) & set(duplicates)
+        or set(successful) | set(duplicates) != set(lease_ids)
+    ):
+        return False
+    expected_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in group.items()
+                if key != "leaseGroupFingerprintSha256"
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return group.get("leaseGroupFingerprintSha256") == expected_fingerprint
+
+
 def first_value(*values: Any) -> Any:
     return next((value for value in values if value not in (None, "")), None)
 
@@ -355,11 +639,28 @@ def native_issue_projection(
         raise CanaryError("invalid_paperclip_response", "issue is not an object")
     runs = object_rows(runs_value, "runs", "items", "data")
     run = max(runs, key=lambda row: str(row.get("createdAt") or ""), default=None)
+    # Current Paperclip list responses expose ``runId`` while individual run
+    # resources expose ``id``.  Normalize both shapes.  Cleanup also needs the
+    # newest lease-bearing run: bounded recovery may append a setup failure
+    # without a lease after the real Daytona workspace has already been used.
+    run_id = str(first_value((run or {}).get("id"), (run or {}).get("runId")) or "")
+    environment_run = max(
+        (
+            row
+            for row in runs
+            if isinstance(row.get("environmentLease"), dict)
+            and first_value(
+                row["environmentLease"].get("id"),
+                row["environmentLease"].get("providerLeaseId"),
+            )
+        ),
+        key=lambda row: str(row.get("createdAt") or ""),
+        default=run,
+    )
     heartbeat: dict[str, Any] = {}
     events: list[dict[str, Any]] = []
     wakes: list[dict[str, Any]] = []
-    if run and run.get("id"):
-        run_id = str(run["id"])
+    if run_id:
         _, heartbeat_value = paperclip_request(
             base, values, "GET", f"/api/heartbeat-runs/{run_id}"
         )
@@ -373,7 +674,6 @@ def native_issue_projection(
         events = object_rows(events_value, "events", "items", "data")
         wakes = object_rows(wakes_value, "events", "wakes", "items", "data")
 
-    run_id = str((run or {}).get("id") or "")
     ordered_events = sorted(
         (row for row in events if row.get("createdAt") and row.get("seq") is not None),
         key=lambda row: (int(row.get("seq") or 0), str(row.get("createdAt") or "")),
@@ -437,11 +737,33 @@ def native_issue_projection(
     ).hexdigest()
 
     environment_summary = (
-        (run or {}).get("environmentLease")
-        if isinstance((run or {}).get("environmentLease"), dict)
+        (environment_run or {}).get("environmentLease")
+        if isinstance((environment_run or {}).get("environmentLease"), dict)
         else {}
     )
     environment_lease_id = str(environment_summary.get("id") or "")
+    lease_summaries = [
+        row["environmentLease"]
+        for row in runs
+        if isinstance(row.get("environmentLease"), dict)
+        and row["environmentLease"].get("id")
+    ]
+    provider_lease_id = str(environment_summary.get("providerLeaseId") or "")
+    lease_details: list[dict[str, Any]] = []
+    for lease_id in sorted(
+        {
+            str(row.get("id") or "")
+            for row in lease_summaries
+        }
+    ):
+        _, lease_value = paperclip_request(
+            base, values, "GET", f"/api/environment-leases/{lease_id}"
+        )
+        if not isinstance(lease_value, dict):
+            raise CanaryError(
+                "invalid_paperclip_response", "environment lease is not an object"
+            )
+        lease_details.append(lease_value)
     environment_lease: dict[str, Any] = {}
     if environment_lease_id:
         _, lease_value = paperclip_request(
@@ -514,6 +836,55 @@ def native_issue_projection(
     environment["sandboxId"] = first_value(
         metadata.get("sandboxId"), environment["providerLeaseId"]
     )
+    lease_groups: list[dict[str, Any]] = []
+    for group_provider_id in sorted(
+        {str(row.get("providerLeaseId") or "") for row in lease_details}
+    ):
+        group_rows = [
+            row
+            for row in lease_details
+            if str(row.get("providerLeaseId") or "") == group_provider_id
+        ]
+        successful_lease_ids = sorted(
+            str(row.get("id") or "")
+            for row in group_rows
+            if row.get("provider") == "daytona"
+            and row.get("status") == "expired"
+            and row.get("cleanupStatus") == "success"
+        )
+        duplicate_terminal_lease_ids = sorted(
+            str(row.get("id") or "")
+            for row in group_rows
+            if row.get("provider") == "daytona"
+            and row.get("status") in {"expired", "released", "pending_cleanup"}
+            and row.get("cleanupStatus") in {"pending_cleanup", "failed"}
+        )
+        unexpected_lease_ids = sorted(
+            str(row.get("id") or "")
+            for row in group_rows
+            if str(row.get("id") or "")
+            not in set(successful_lease_ids) | set(duplicate_terminal_lease_ids)
+        )
+        group = {
+            "providerLeaseId": group_provider_id or None,
+            "leaseIds": sorted(str(row.get("id") or "") for row in group_rows),
+            "successfulLeaseIds": successful_lease_ids,
+            "duplicateTerminalLeaseIds": duplicate_terminal_lease_ids,
+            "unexpectedLeaseIds": unexpected_lease_ids,
+            "successfulExpiredLeaseObserved": bool(successful_lease_ids),
+        }
+        group["leaseGroupFingerprintSha256"] = hashlib.sha256(
+            json.dumps(group, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        lease_groups.append(group)
+    lease_group = next(
+        (
+            group
+            for group in lease_groups
+            if group.get("providerLeaseId") == provider_lease_id
+        ),
+        {},
+    )
     silence = (run or {}).get("outputSilence") or {}
     return {
         "id": issue_id,
@@ -539,6 +910,8 @@ def native_issue_projection(
         "heartbeatSequence": heartbeat_sequence,
         "finalResult": final_result,
         "environment": environment,
+        "environmentLeaseGroup": lease_group,
+        "environmentLeaseGroups": lease_groups,
         "_issue": issue_value,
         "_run": run,
     }
@@ -792,6 +1165,7 @@ def router_server_attribution(
     adapter: str,
     model: str,
     router: dict[str, Any],
+    correlation_nonce: str,
 ) -> dict[str, Any]:
     key_ref = f"NINEROUTER_PROFILE_{safe_slug(profile)}_API_KEY"
     api_key = values.get(key_ref, "")
@@ -820,6 +1194,7 @@ def router_server_attribution(
         or after_id <= before_id
         or after_at <= before_at
         or expected_endpoint is None
+        or not re.fullmatch(r"kestra:[A-Za-z0-9_.:-]{1,160}", correlation_nonce)
     ):
         raise CanaryError(
             "router_server_attribution_failed",
@@ -929,6 +1304,17 @@ def router_server_attribution(
             "router_request_binding_failed",
             "9router has no server-side request detail in the profile run interval",
         )
+    correlated_details = [
+        (row, digest, document)
+        for row, digest, document in detail_documents
+        if correlation_nonce
+        in json.dumps(document, sort_keys=True, separators=(",", ":"))
+    ]
+    if not correlated_details:
+        raise CanaryError(
+            "router_run_correlation_failed",
+            "9router requestDetails does not contain the controller run nonce",
+        )
     usage_ids: set[int] = set()
 
     def collect_usage_ids(value: Any) -> None:
@@ -941,7 +1327,7 @@ def router_server_attribution(
             for nested in value:
                 collect_usage_ids(nested)
 
-    for _, _, detail_document in detail_documents:
+    for _, _, detail_document in correlated_details:
         collect_usage_ids(detail_document)
     row_ids = {int(row["id"]) for row in rows}
     if len(rows) == 1:
@@ -984,7 +1370,7 @@ def router_server_attribution(
             for nested in value:
                 collect_usage(nested)
 
-    for _, _, detail_document in detail_documents:
+    for _, _, detail_document in correlated_details:
         collect_usage(detail_document)
     positive_usages = sorted(
         usage
@@ -1046,7 +1432,7 @@ def router_server_attribution(
             for nested in value:
                 collect_completion_hashes(nested)
 
-    for _, _, detail_document in detail_documents:
+    for _, _, detail_document in correlated_details:
         collect_completion_hashes(detail_document)
     if not completion_hashes:
         raise CanaryError(
@@ -1071,6 +1457,11 @@ def router_server_attribution(
             for value in positive_usages
         ],
         "completionFingerprintsSha256": sorted(completion_hashes),
+        "correlationNonceSha256": hashlib.sha256(
+            correlation_nonce.encode()
+        ).hexdigest(),
+        "correlatedDetailCount": len(correlated_details),
+        "correlatedDetailDataSha256": [digest for _, digest, _ in correlated_details],
     }
     proof = {
         "status": "passed",
@@ -1111,35 +1502,31 @@ def e2e_context() -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
         "paperclipContainerHost",
         "kestraPortRef",
         "kestraLoopbackHost",
-        "githubOwner",
-        "githubRepository",
-        "baseBranch",
+        "githubOwnerRef",
+        "githubRepositoryRef",
+        "baseBranchRef",
     )
     missing = [key for key in required if not str(e2e.get(key, "")).strip()]
     if missing:
         raise CanaryError(
             "invalid_config", "missing e2eCanary values: " + ", ".join(missing)
         )
-    profiles = e2e.get("profiles")
+    configured_profiles = e2e.get("profiles")
     if (
-        not isinstance(profiles, list)
-        or not profiles
+        not isinstance(configured_profiles, list)
+        or not configured_profiles
         or any(
             not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", item)
-            for item in profiles
+            for item in configured_profiles
         )
     ):
         raise CanaryError(
             "invalid_config", "e2eCanary.profiles must be a non-empty list of safe refs"
         )
-    if len(profiles) != len(set(profiles)):
+    if len(configured_profiles) != len(set(configured_profiles)):
         raise CanaryError("invalid_config", "e2eCanary.profiles contains duplicates")
-    if len(profiles) != 3:
-        raise CanaryError(
-            "invalid_config", "e2eCanary must run exactly three native profiles"
-        )
     contracts = e2e.get("profileContracts")
-    if not isinstance(contracts, dict) or set(contracts) != set(profiles):
+    if not isinstance(contracts, dict) or set(contracts) != set(configured_profiles):
         raise CanaryError(
             "invalid_config",
             "e2eCanary.profileContracts must describe every requested profile exactly once",
@@ -1155,18 +1542,39 @@ def e2e_context() -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
             raise CanaryError(
                 "invalid_config", f"invalid profile contract for {profile}"
             )
-    native_adapters = [str(contracts[profile]["nativeAdapter"]) for profile in profiles]
+    native_adapters = [
+        str(contracts[profile]["nativeAdapter"]) for profile in configured_profiles
+    ]
     if len(native_adapters) != len(set(native_adapters)):
         raise CanaryError(
             "invalid_config",
-            "e2eCanary profiles must use three distinct native adapters",
+            "e2eCanary profiles must use distinct native adapters",
         )
-    for key in ("githubOwner", "githubRepository", "baseBranch"):
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(e2e[key])):
-            raise CanaryError(
-                "unsafe_config", f"e2eCanary.{key} contains unsafe characters"
-            )
+    validate_r1_profile_contracts(configured_profiles, contracts)
     values = dotenv(PLATFORM_ENV)
+    github_target: dict[str, str] = {}
+    for target_key, ref_key in (
+        ("githubOwner", "githubOwnerRef"),
+        ("githubRepository", "githubRepositoryRef"),
+        ("baseBranch", "baseBranchRef"),
+    ):
+        env_ref = str(e2e[ref_key])
+        if not CANONICAL_ENV_REF.fullmatch(env_ref):
+            raise CanaryError(
+                "invalid_config", f"e2eCanary.{ref_key} is not a canonical env ref"
+            )
+        github_target[target_key] = values.get(env_ref, "").strip()
+    missing_targets = [key for key, value in github_target.items() if not value]
+    if missing_targets:
+        raise CanaryError(
+            "missing_endpoint",
+            "canonical E2E GitHub target refs are empty: " + ", ".join(missing_targets),
+        )
+    validate_github_target(
+        github_target["githubOwner"],
+        github_target["githubRepository"],
+        github_target["baseBranch"],
+    )
     credential_refs = [
         *e2e.get("llmCredentialRefs", []),
         *e2e.get("githubCredentialRefs", []),
@@ -1209,7 +1617,10 @@ def e2e_context() -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
             )
     e2e = {
         **e2e,
+        "profiles": list(configured_profiles),
+        "profileContracts": {ref: dict(contracts[ref]) for ref in configured_profiles},
         **paperclip_ids,
+        **github_target,
         "paperclipBaseUrl": (
             f"http://{e2e['paperclipLoopbackHost']}:{resolved_ports['paperclipPortRef']}"
         ),
@@ -1234,11 +1645,16 @@ def source_evidence(config: dict[str, Any], e2e: dict[str, Any]) -> dict[str, An
         "daytonaImagesEvidenceSha256": sha256_file(DAYTONA_IMAGES_EVIDENCE),
         "daytonaLifecycleEvidenceSha256": sha256_file(DAYTONA_LIFECYCLE_EVIDENCE),
         "runnerSha256": sha256_file(Path(__file__)),
-        "deploymentRelease": deployment_release_binding(),
+        "directSync": direct_sync_binding(),
         "profileRefs": list(e2e["profiles"]),
         "profileContracts": e2e.get("profileContracts", {}),
         "endpointSource": "spec.e2eCanary Paperclip/Kestra refs + canonical platform.env",
-        "repositorySource": "spec.e2eCanary.githubOwner/githubRepository/baseBranch",
+        "repositorySource": "spec.e2eCanary GitHub refs + canonical platform.env",
+        "repositoryRefs": {
+            "owner": e2e["githubOwnerRef"],
+            "repository": e2e["githubRepositoryRef"],
+            "baseBranch": e2e["baseBranchRef"],
+        },
         "credentialRefs": sorted(
             str(item)
             for item in [
@@ -1249,61 +1665,65 @@ def source_evidence(config: dict[str, Any], e2e: dict[str, Any]) -> dict[str, An
     }
 
 
-def deployment_release_binding() -> dict[str, Any]:
-    """Bind the canary to the exact active governed-source activation."""
+def direct_sync_binding() -> dict[str, Any]:
+    """Bind evidence to the exact files promoted by the direct-sync installer.
 
-    state_path = ROOT / ".deploy/current-release.json"
-    require_private_evidence_file(state_path)
-    state = load_json(state_path)
-    release_id = str(state.get("releaseId") or "")
-    manifest_path = ROOT / ".deploy/releases" / release_id / "source-manifest.json"
-    manifest = load_json(manifest_path)
-    source_sha = str(state.get("sourceSha256") or "")
-    if (
-        state.get("apiVersion")
-        not in {
-            "paperclip-agent-platform/v1alpha1",
-            "micro-task-engine/v1alpha1",
-        }
-        or state.get("kind") != "GovernedSourceActivation"
-        or state.get("status") != "active"
-        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}", release_id)
-        or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}",
-            str(state.get("runId") or ""),
+    Direct Compose deployment has no release engine and therefore no synthetic
+    activation record.  The canonical contract is the root-owned, non-linked
+    file set that the operator synchronizes immediately before invoking this
+    controller.  Verification recomputes this same manifest and fails closed
+    on any content, mode, owner, or inventory drift.
+    """
+
+    sources = {
+        "renderedConfig": CONFIG,
+        "kestraFlow": FLOW,
+        "profileTemplate": PROFILE_SOURCE,
+        "profileProjection": PROFILES,
+        "paperclipRuntime": PAPERCLIP_RUNTIME_SOURCE,
+        "daytonaRuntime": DAYTONA_STEP_SOURCE,
+        "e2eController": Path(__file__).resolve(),
+    }
+    rows: list[dict[str, Any]] = []
+    expected_uid = os.geteuid()
+    for name, path in sources.items():
+        try:
+            stat = path.lstat()
+        except OSError as exc:
+            raise CanaryError(
+                "direct_sync_source_invalid",
+                f"direct-sync source is missing: {name}",
+            ) from exc
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or stat.st_uid != expected_uid
+            or stat.st_mode & 0o022
+        ):
+            raise CanaryError(
+                "direct_sync_source_invalid",
+                f"direct-sync source ownership or mode is unsafe: {name}",
+            )
+        rows.append(
+            {
+                "name": name,
+                "path": str(path),
+                "mode": f"{stat.st_mode & 0o777:04o}",
+                "sha256": sha256_file(path),
+            }
         )
-        or not re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}",
-            str(state.get("activationId") or ""),
-        )
-        or not FULL_SHA256.fullmatch(source_sha)
-        or manifest.get("apiVersion")
-        not in {
-            "paperclip-agent-platform/v1alpha1",
-            "micro-task-engine/v1alpha1",
-        }
-        or manifest.get("kind") != "GovernedSourceManifest"
-        or manifest.get("sourceSha256") != source_sha
-        or not isinstance(manifest.get("files"), list)
-        or not manifest.get("files")
-        or not isinstance(state.get("fileCount"), int)
-        or state.get("fileCount") != len(manifest.get("files") or [])
-    ):
-        raise CanaryError(
-            "deployment_release_invalid",
-            "active governed-source release identity is incomplete or inconsistent",
-        )
+    rows.sort(key=lambda row: str(row["name"]))
+    source_sha = hashlib.sha256(
+        json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     return {
-        "apiVersion": state.get("apiVersion"),
-        "kind": state.get("kind"),
-        "status": "active",
-        "runId": state.get("runId"),
-        "releaseId": release_id,
-        "activationId": state.get("activationId"),
+        "apiVersion": "paperclip-agent-platform/v1alpha1",
+        "kind": "DirectSyncCanonicalContract",
+        "status": "bound",
+        "sourceRoot": str(ROOT),
+        "fileCount": len(rows),
+        "files": rows,
         "sourceSha256": source_sha,
-        "fileCount": state.get("fileCount"),
-        "currentStateSha256": sha256_file(state_path),
-        "releaseManifestSha256": sha256_file(manifest_path),
     }
 
 
@@ -1319,13 +1739,18 @@ def profile_catalog() -> dict[str, dict[str, Any]]:
         raise CanaryError(
             "invalid_profile_catalog", "profile catalog has no profiles array"
         )
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for row in rows:
         if not isinstance(row, dict) or not row.get("ref"):
             continue
         adapter = row.get("nativeAdapterConfig")
         if not isinstance(adapter, dict) or not adapter.get("model"):
             continue
+        runtime_contract = (
+            row.get("runtimeContract")
+            if isinstance(row.get("runtimeContract"), dict)
+            else {}
+        )
         routing = (
             row.get("llmRouting") if isinstance(row.get("llmRouting"), dict) else {}
         )
@@ -1335,6 +1760,9 @@ def profile_catalog() -> dict[str, dict[str, Any]]:
         result[str(row["ref"])] = {
             "adapter": str(row.get("nativeAdapter", "")),
             "model": str(adapter["model"]),
+            "protocol": str(runtime_contract.get("protocol") or ""),
+            "routerProvider": str(routing.get("provider") or ""),
+            "authPolicy": row.get("authPolicy"),
             "provider": str(
                 adapter.get("provider")
                 or adapter.get("modelProvider")
@@ -1356,7 +1784,7 @@ def profile_api_contract_drift(
     value: Any,
     required_profiles: set[str],
     expected_adapters: dict[str, str],
-    catalog: dict[str, dict[str, str]],
+    catalog: dict[str, dict[str, Any]],
     contracts: dict[str, dict[str, Any]],
 ) -> tuple[set[str], list[str]]:
     rows = value.get("profiles") if isinstance(value, dict) else None
@@ -1385,6 +1813,7 @@ def profile_api_contract_drift(
         if (
             str(row.get("nativeAdapter", "")) != expected_adapters[ref]
             or str(adapter_config.get("model", "")) != catalog[ref]["model"]
+            or str(routing.get("provider") or "") != catalog[ref]["routerProvider"]
             or (
                 contracts[ref]["requireExplicitProvider"]
                 and api_provider != catalog[ref]["provider"]
@@ -1475,12 +1904,18 @@ def trigger_flow(
     auth: dict[str, str],
     e2e: dict[str, Any],
     profile: str,
+    correlation_id: str,
 ) -> dict[str, Any]:
+    if not re.fullmatch(r"mte-e2e-[0-9a-f]{32}", correlation_id):
+        raise CanaryError(
+            "trigger_correlation_invalid", "controller correlation id is malformed"
+        )
     fields = {
         "paperclip_base_url": str(e2e["kestraPaperclipBaseUrl"]),
         "paperclip_company_id": str(e2e["paperclipCompanyId"]),
         "paperclip_project_id": str(e2e["paperclipProjectId"]),
         "profile": profile,
+        "controller_correlation_id": correlation_id,
         "github_owner": str(e2e["githubOwner"]),
         "github_repository": str(e2e["githubRepository"]),
         "base_branch": str(e2e["baseBranch"]),
@@ -1498,6 +1933,130 @@ def trigger_flow(
     if not isinstance(value, dict) or not value.get("id"):
         raise CanaryError("execution_create_failed", "Kestra returned no execution id")
     return value
+
+
+def discover_execution_by_correlation(
+    kestra: str,
+    auth: dict[str, str],
+    correlation_id: str,
+    *,
+    attempts: int = 12,
+    poll_interval: float = 1,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Recover an execution after an ambiguous trigger transport failure.
+
+    The correlation is a controller-generated non-secret input.  Search is
+    bounded and accepts exactly one matching execution; ambiguous results fail
+    closed instead of guessing which resources may be mutated.
+    """
+
+    if (
+        not re.fullmatch(r"mte-e2e-[0-9a-f]{32}", correlation_id)
+        or attempts < 1
+        or attempts > 60
+        or poll_interval < 0
+    ):
+        raise CanaryError(
+            "trigger_correlation_invalid", "execution recovery bounds are invalid"
+        )
+    correlation_sha = hashlib.sha256(correlation_id.encode()).hexdigest()
+    query = urllib.parse.urlencode(
+        {
+            "namespace": "micro_task_engine.e2e",
+            "flowId": "paperclip-github-e2e",
+            "page": "1",
+            "size": "100",
+        }
+    )
+    for attempt in range(1, attempts + 1):
+        value = kestra_request(
+            kestra,
+            auth,
+            "GET",
+            "/api/v1/main/executions/search?" + query,
+        )
+        rows = object_rows(value, "results", "executions", "items", "data")
+        matches = [
+            row
+            for row in rows
+            if isinstance(row.get("inputs"), dict)
+            and row["inputs"].get("controller_correlation_id") == correlation_id
+            and row.get("namespace") == "micro_task_engine.e2e"
+            and row.get("flowId") == "paperclip-github-e2e"
+            and isinstance(row.get("id"), str)
+            and row.get("id")
+        ]
+        if len(matches) > 1:
+            raise CanaryError(
+                "trigger_recovery_ambiguous",
+                "more than one Kestra execution owns the controller correlation",
+            )
+        if len(matches) == 1:
+            return matches[0], {
+                "status": "recovered",
+                "correlationSha256": correlation_sha,
+                "searchAttempts": attempt,
+                "executionId": matches[0]["id"],
+            }
+        if attempt < attempts:
+            time.sleep(poll_interval)
+    return None, {
+        "status": "absent",
+        "correlationSha256": correlation_sha,
+        "searchAttempts": attempts,
+        "executionId": None,
+    }
+
+
+def cleanup_kestra_execution(
+    kestra: str,
+    auth: dict[str, str],
+    execution_id: str,
+    observed_execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Cancel an exact recovered execution before downstream cleanup."""
+
+    value = observed_execution
+    if not isinstance(value, dict) or value.get("id") != execution_id:
+        value = kestra_request(
+            kestra,
+            auth,
+            "GET",
+            "/api/v1/main/executions/" + urllib.parse.quote(execution_id),
+        )
+    state = (
+        str((value.get("state") or {}).get("current", ""))
+        if isinstance(value, dict)
+        else ""
+    )
+    if not state:
+        raise CanaryError(
+            "trigger_recovery_execution_invalid",
+            "recovered Kestra execution has no observable state",
+        )
+    if state in TERMINAL:
+        return {
+            "requested": False,
+            "completed": True,
+            "executionId": execution_id,
+            "statusBefore": state,
+            "statusAfter": state,
+            "observedAt": utcnow(),
+        }
+    proof = cancel_stuck_execution(
+        kestra,
+        auth,
+        execution_id,
+        last_state=state,
+        timeout_seconds=0,
+    )
+    return {
+        "requested": True,
+        "completed": True,
+        "statusBefore": state,
+        "statusAfter": proof["terminalState"],
+        **proof,
+    }
 
 
 def poll_execution(
@@ -1535,6 +2094,32 @@ def poll_execution(
         if state in TERMINAL:
             return value
         time.sleep(5)
+    cancellation = cancel_stuck_execution(
+        kestra,
+        auth,
+        execution_id,
+        last_state=last_state,
+        timeout_seconds=timeout_seconds,
+    )
+    raise CanaryError(
+        "execution_timeout",
+        "Kestra execution exceeded the canary timeout and was cancelled",
+        evidence=cancellation,
+    )
+
+
+def cancel_stuck_execution(
+    kestra: str,
+    auth: dict[str, str],
+    execution_id: str,
+    *,
+    last_state: str,
+    timeout_seconds: int,
+    attempts: int = 12,
+    poll_interval: float = 1,
+) -> dict[str, Any]:
+    """Kill a timed-out execution and prove its controller-observed terminal state."""
+    requested_at = utcnow()
     try:
         kestra_request(
             kestra,
@@ -1543,10 +2128,69 @@ def poll_execution(
             "/api/v1/main/executions/" + urllib.parse.quote(execution_id) + "/kill",
             timeout=30,
         )
-    except CanaryError:
-        pass
+    except CanaryError as exc:
+        raise CanaryError(
+            "execution_timeout_cancel_failed",
+            "Kestra rejected cancellation of a timed-out execution",
+            evidence={
+                "status": "failed",
+                "reason": "poll_deadline_exceeded",
+                "executionId": execution_id,
+                "lastObservedState": last_state,
+                "timeoutSeconds": timeout_seconds,
+                "killRequestedAt": requested_at,
+                "killAccepted": False,
+            },
+        ) from exc
+    observed_state = ""
+    observed_at = ""
+    for attempt in range(1, attempts + 1):
+        value = kestra_request(
+            kestra,
+            auth,
+            "GET",
+            "/api/v1/main/executions/" + urllib.parse.quote(execution_id),
+        )
+        observed_state = (
+            str((value.get("state") or {}).get("current", ""))
+            if isinstance(value, dict)
+            else ""
+        )
+        observed_at = utcnow()
+        if observed_state in {"KILLED", "CANCELLED"}:
+            proof = {
+                "status": "passed",
+                "reason": "poll_deadline_exceeded",
+                "executionId": execution_id,
+                "lastObservedState": last_state,
+                "timeoutSeconds": timeout_seconds,
+                "killRequestedAt": requested_at,
+                "killAccepted": True,
+                "terminalState": observed_state,
+                "terminalObservedAt": observed_at,
+                "pollAttempts": attempt,
+            }
+            proof["cancellationFingerprintSha256"] = hashlib.sha256(
+                json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            return proof
+        if attempt < attempts:
+            time.sleep(poll_interval)
     raise CanaryError(
-        "execution_timeout", "Kestra execution exceeded the canary timeout"
+        "execution_timeout_cancel_failed",
+        "Kestra did not reach KILLED or CANCELLED after a timed-out execution kill",
+        evidence={
+            "status": "failed",
+            "reason": "poll_deadline_exceeded",
+            "executionId": execution_id,
+            "lastObservedState": last_state,
+            "timeoutSeconds": timeout_seconds,
+            "killRequestedAt": requested_at,
+            "killAccepted": True,
+            "lastCancelState": observed_state,
+            "lastCancelObservedAt": observed_at,
+            "pollAttempts": attempts,
+        },
     )
 
 
@@ -1585,6 +2229,118 @@ def execution_summary(value: dict[str, Any]) -> dict[str, Any]:
         "outputs": allowed_outputs,
         "taskRuns": task_runs,
     }
+
+
+def _task_output_values(execution: dict[str, Any], task_id: str) -> dict[str, Any]:
+    """Return one task's OutputValues payload without evaluating flow outputs."""
+
+    candidates: list[dict[str, Any]] = []
+    for row in execution.get("taskRunList", []):
+        if not isinstance(row, dict) or row.get("taskId") != task_id:
+            continue
+        outputs = row.get("outputs") if isinstance(row.get("outputs"), dict) else {}
+        values = outputs.get("values")
+        if isinstance(values, dict):
+            candidates.append(values)
+    if not candidates:
+        return {}
+    if any(candidate != candidates[0] for candidate in candidates[1:]):
+        raise CanaryError(
+            "kestra_failure_evidence_ambiguous",
+            f"Kestra recorded conflicting {task_id} outputs",
+        )
+    return candidates[0]
+
+
+def _safe_failure_logs(value: Any) -> list[dict[str, str]]:
+    """Allowlist bounded Kestra log fields; never persist arbitrary log objects."""
+
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            value = [{"message": value}]
+    if not isinstance(value, list) or len(value) > 64:
+        return []
+    logs: list[dict[str, str]] = []
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        allowed: dict[str, str] = {}
+        for source, target in (
+            ("taskId", "taskId"),
+            ("level", "level"),
+            ("timestamp", "timestamp"),
+            ("message", "message"),
+        ):
+            item = row.get(source)
+            if isinstance(item, str) and 0 < len(item) <= 8192:
+                allowed[target] = item
+        if allowed:
+            logs.append(allowed)
+    return logs
+
+
+def failed_execution_error(execution: dict[str, Any]) -> CanaryError:
+    """Preserve a terminal Kestra root cause without touching success artifacts."""
+
+    summary = execution_summary(execution)
+    terminal_state = str(summary.get("state") or "")
+    failed_task_ids = [
+        str(row.get("taskId"))
+        for row in summary.get("taskRuns", [])
+        if isinstance(row, dict)
+        and row.get("state") == "FAILED"
+        and isinstance(row.get("taskId"), str)
+        and row.get("taskId")
+    ]
+    values = _task_output_values(execution, "error_summary") or _task_output_values(
+        execution, "failure_values"
+    )
+    flow_outputs = (
+        execution.get("outputs")
+        if isinstance(execution.get("outputs"), dict)
+        else {}
+    )
+    if not values:
+        values = {
+            "failedTaskId": flow_outputs.get("failure_task_id"),
+            "errorLogs": flow_outputs.get("failure_logs"),
+        }
+    reported_task_id = str(values.get("failedTaskId") or "")
+    if reported_task_id and reported_task_id not in failed_task_ids:
+        raise CanaryError(
+            "kestra_failure_evidence_invalid",
+            "Kestra failure output does not match the failed task run",
+        )
+    failed_task_id = reported_task_id or (
+        failed_task_ids[0] if len(failed_task_ids) == 1 else ""
+    )
+    logs = _safe_failure_logs(values.get("errorLogs"))
+    matching_messages = [
+        row["message"]
+        for row in logs
+        if "message" in row
+        and (not row.get("taskId") or row.get("taskId") == failed_task_id)
+    ]
+    root_cause = matching_messages[-1] if matching_messages else None
+    if terminal_state not in TERMINAL - {"SUCCESS"} or not failed_task_id:
+        raise CanaryError(
+            "kestra_failure_evidence_invalid",
+            "Kestra terminal failure lacks one attributable failed task",
+        )
+    return CanaryError(
+        "kestra_execution_failed",
+        f"Kestra task {failed_task_id} failed",
+        evidence={
+            "executionId": summary.get("id"),
+            "terminalState": terminal_state,
+            "failedTaskId": failed_task_id,
+            "failedTaskIds": failed_task_ids,
+            "rootCause": root_cause,
+            "failureLogs": logs,
+        },
+    )
 
 
 def public_github(path: str) -> Any:
@@ -1650,7 +2406,30 @@ def find_pr(
         raise CanaryError(
             "invalid_github_response", "GitHub pulls response is not an array"
         )
-    return next((row for row in value if isinstance(row, dict)), None)
+    candidates = [
+        row for row in value if github_pull_matches_branch(row, owner, branch)
+    ]
+    if len(candidates) > 1:
+        raise CanaryError(
+            "github_pr_ambiguous",
+            "GitHub returned more than one PR for the exact canary branch",
+        )
+    return candidates[0] if candidates else None
+
+
+def github_pull_matches_branch(value: Any, owner: str, branch: str) -> bool:
+    """Accept only the exact same-repository PR head owned by this canary."""
+    if not isinstance(value, dict):
+        return False
+    head = value.get("head") if isinstance(value.get("head"), dict) else {}
+    label = str(head.get("label") or "")
+    head_owner, separator, head_branch = label.partition(":")
+    return (
+        head.get("ref") == branch
+        and separator == ":"
+        and head_owner.casefold() == owner.casefold()
+        and head_branch == branch
+    )
 
 
 def check_runs(e2e: dict[str, Any], sha: str) -> list[dict[str, Any]]:
@@ -1723,6 +2502,212 @@ def github_commit(e2e: dict[str, Any], sha: str) -> dict[str, Any]:
             "invalid_github_response", "GitHub commit response is invalid"
         )
     return value
+
+
+def github_blob(e2e: dict[str, Any], sha: str) -> str:
+    owner = str(e2e["githubOwner"])
+    repo = str(e2e["githubRepository"])
+    if not FULL_GIT_SHA.fullmatch(sha):
+        raise CanaryError("github_blob_invalid", "GitHub blob SHA is malformed")
+    value = public_github(f"/repos/{owner}/{repo}/git/blobs/{sha}")
+    if (
+        not isinstance(value, dict)
+        or value.get("sha") != sha
+        or value.get("encoding") != "base64"
+        or not isinstance(value.get("content"), str)
+    ):
+        raise CanaryError("github_blob_invalid", "GitHub blob response is incomplete")
+    try:
+        encoded = value["content"]
+        if re.search(r"[^A-Za-z0-9+/=\r\n]", encoded):
+            raise ValueError("invalid base64 character")
+        raw = base64.b64decode("".join(encoded.splitlines()), validate=True)
+        content = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise CanaryError(
+            "github_blob_invalid", "GitHub blob is not canonical UTF-8 base64"
+        ) from exc
+    if len(raw) > 65536 or "\x00" in content:
+        raise CanaryError("github_blob_invalid", "GitHub canary blob is unsafe")
+    return content
+
+
+def controller_github_artifact_identity(contents: dict[str, str]) -> dict[str, Any]:
+    """Validate controller-owned marker and workflow semantics from immutable blobs."""
+    if set(contents) != set(ALLOWED_GITHUB_PATHS):
+        raise CanaryError(
+            "github_artifact_identity_invalid",
+            "GitHub artifact content set differs from the controller allowlist",
+        )
+    marker_source = contents["paperclip-e2e/marker.py"]
+    test_source = contents["paperclip-e2e/test_marker.py"]
+    workflow_source = contents[".github/workflows/paperclip-e2e.yml"]
+    try:
+        marker_tree = ast.parse(marker_source)
+        test_tree = ast.parse(test_source)
+        workflow = yaml.safe_load(workflow_source)
+    except (SyntaxError, yaml.YAMLError) as exc:
+        raise CanaryError(
+            "github_artifact_identity_invalid",
+            "GitHub canary marker, test, or workflow cannot be parsed",
+        ) from exc
+    marker_functions = [
+        node for node in marker_tree.body if isinstance(node, ast.FunctionDef)
+    ]
+    marker_ok = (
+        len(marker_tree.body) == 1
+        and len(marker_functions) == 1
+        and marker_functions[0].name == "marker"
+        and not marker_functions[0].decorator_list
+        and not marker_functions[0].args.args
+        and not marker_functions[0].args.kwonlyargs
+        and marker_functions[0].args.vararg is None
+        and marker_functions[0].args.kwarg is None
+        and len(marker_functions[0].body) == 1
+        and isinstance(marker_functions[0].body[0], ast.Return)
+        and isinstance(marker_functions[0].body[0].value, ast.Constant)
+        and marker_functions[0].body[0].value.value == CONTROLLER_MARKER
+    )
+    test_methods = [
+        node
+        for node in ast.walk(test_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ]
+    test_classes = [
+        node
+        for node in test_tree.body
+        if isinstance(node, ast.ClassDef)
+        and any(
+            (isinstance(base, ast.Name) and base.id == "TestCase")
+            or (
+                isinstance(base, ast.Attribute)
+                and isinstance(base.value, ast.Name)
+                and base.value.id == "unittest"
+                and base.attr == "TestCase"
+            )
+            for base in node.bases
+        )
+    ]
+    unittest_imports = [
+        node
+        for node in test_tree.body
+        if isinstance(node, ast.Import)
+        and len(node.names) == 1
+        and node.names[0].name == "unittest"
+        and node.names[0].asname is None
+    ]
+    marker_imports = [
+        node
+        for node in test_tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "marker"
+        and node.level == 0
+        and len(node.names) == 1
+        and node.names[0].name == "marker"
+        and node.names[0].asname is None
+    ]
+    exact_module_body = (
+        len(test_tree.body) == 3
+        and len(unittest_imports) == 1
+        and len(marker_imports) == 1
+        and len(test_classes) == 1
+        and set(map(id, test_tree.body))
+        == {id(unittest_imports[0]), id(marker_imports[0]), id(test_classes[0])}
+        and not test_classes[0].decorator_list
+        and not test_classes[0].keywords
+        and len(test_classes[0].body) == 1
+    )
+    assertion: ast.Call | None = None
+    if (
+        exact_module_body
+        and len(test_methods) == 1
+        and isinstance(test_methods[0], ast.FunctionDef)
+        and len(test_classes) == 1
+        and test_methods[0] in test_classes[0].body
+        and not test_methods[0].decorator_list
+        and len(test_methods[0].args.args) == 1
+        and test_methods[0].args.args[0].arg == "self"
+        and test_methods[0].args.vararg is None
+        and test_methods[0].args.kwarg is None
+        and len(test_methods[0].body) == 1
+        and isinstance(test_methods[0].body[0], ast.Expr)
+        and isinstance(test_methods[0].body[0].value, ast.Call)
+    ):
+        assertion = test_methods[0].body[0].value
+    assertion_args = assertion.args if isinstance(assertion, ast.Call) else []
+    test_ok = (
+        isinstance(assertion, ast.Call)
+        and isinstance(assertion.func, ast.Attribute)
+        and isinstance(assertion.func.value, ast.Name)
+        and assertion.func.value.id == "self"
+        and assertion.func.attr == "assertEqual"
+        and len(assertion_args) == 2
+        and isinstance(assertion_args[0], ast.Call)
+        and isinstance(assertion_args[0].func, ast.Name)
+        and assertion_args[0].func.id == "marker"
+        and not assertion_args[0].args
+        and not assertion_args[0].keywords
+        and isinstance(assertion_args[1], ast.Constant)
+        and assertion_args[1].value == CONTROLLER_MARKER
+        and not assertion.keywords
+    )
+    jobs = workflow.get("jobs") if isinstance(workflow, dict) else None
+    job = jobs.get(REQUIRED_GITHUB_CHECK_NAME) if isinstance(jobs, dict) else None
+    steps = job.get("steps") if isinstance(job, dict) else None
+    run_commands = [
+        str(step.get("run") or "").strip()
+        for step in (steps if isinstance(steps, list) else [])
+        if isinstance(step, dict) and step.get("run")
+    ]
+    trigger = (
+        workflow.get("on", workflow.get(True)) if isinstance(workflow, dict) else None
+    )
+    pull_request_only = (
+        trigger == "pull_request"
+        or trigger == ["pull_request"]
+        or isinstance(trigger, dict)
+        and set(trigger) == {"pull_request"}
+        and trigger.get("pull_request") in (None, {})
+    )
+    workflow_ok = (
+        isinstance(workflow, dict)
+        and workflow.get("name") == REQUIRED_GITHUB_CHECK_NAME
+        and set(workflow) in ({"name", "on", "jobs"}, {"name", True, "jobs"})
+        and pull_request_only
+        and isinstance(jobs, dict)
+        and set(jobs) == {REQUIRED_GITHUB_CHECK_NAME}
+        and isinstance(job, dict)
+        and set(job) == {"name", "runs-on", "steps"}
+        and job.get("name") == REQUIRED_GITHUB_CHECK_NAME
+        and job.get("runs-on") == "ubuntu-latest"
+        and isinstance(steps, list)
+        and len(steps) == 2
+        and isinstance(steps[0], dict)
+        and set(steps[0]) <= {"name", "uses"}
+        and steps[0].get("uses") == "actions/checkout@v4"
+        and isinstance(steps[1], dict)
+        and set(steps[1]) <= {"name", "run"}
+        and run_commands == ["cd paperclip-e2e && python -m unittest test_marker.py"]
+    )
+    if not marker_ok or not test_ok or not workflow_ok:
+        raise CanaryError(
+            "github_artifact_identity_invalid",
+            "GitHub blobs do not implement the controller marker/workflow contract",
+        )
+    semantic = {
+        "markerFunction": "marker",
+        "markerValueSha256": hashlib.sha256(CONTROLLER_MARKER.encode()).hexdigest(),
+        "workflowName": REQUIRED_GITHUB_CHECK_NAME,
+        "jobId": REQUIRED_GITHUB_CHECK_NAME,
+        "jobName": REQUIRED_GITHUB_CHECK_NAME,
+        "testCommand": "cd paperclip-e2e && python -m unittest test_marker.py",
+        "testCallsMarker": True,
+    }
+    semantic["identitySha256"] = hashlib.sha256(
+        json.dumps(semantic, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return semantic
 
 
 def allowed_artifacts(value: Any) -> list[dict[str, Any]]:
@@ -2071,7 +3056,9 @@ def validated_workspace_identity(
     sandbox_id = str(environment.get("sandboxId") or "")
     workspace_id = str(environment.get("executionWorkspaceId") or "")
     remote_cwd = str(environment.get("remoteCwd") or "")
-    path_hash = hashlib.sha256(remote_cwd.encode()).hexdigest()
+    remote_cwd_hash = hashlib.sha256(remote_cwd.encode()).hexdigest()
+    worktree_path = str(workspace.get("worktreePath") or "")
+    worktree_path_hash = hashlib.sha256(worktree_path.encode()).hexdigest()
     if (
         environment.get("provider") != "daytona"
         or not expected_environment_id
@@ -2079,12 +3066,15 @@ def validated_workspace_identity(
         or environment.get("providerLeaseId") != sandbox_id
         or not sandbox_id
         or not workspace_id
-        or not remote_cwd.startswith("/")
+        or not re.fullmatch(r"/home/daytona/paperclip-workspace(?:/[^/]+)*", remote_cwd)
         or ".." in Path(remote_cwd).parts
         or resource_environment != environment
         or workspace.get("id") != workspace_id
-        or workspace.get("worktreePath") != remote_cwd
-        or workspace.get("worktreePathFingerprintSha256") != path_hash
+        or not re.fullmatch(
+            r"/data/instances/default/projects/[^/]+/[^/]+/_default", worktree_path
+        )
+        or ".." in Path(worktree_path).parts
+        or workspace.get("worktreePathFingerprintSha256") != worktree_path_hash
         or not str(workspace.get("worktreePathSource") or "").startswith("paperclip.")
         or resources.get("paperclipEnvironmentReleased") is not False
     ):
@@ -2100,6 +3090,7 @@ def validated_workspace_identity(
                 sandbox_id,
                 workspace_id,
                 remote_cwd,
+                worktree_path,
             )
         ).encode()
     ).hexdigest()
@@ -2112,7 +3103,9 @@ def validated_workspace_identity(
         "sandboxId": sandbox_id,
         "executionWorkspaceId": workspace_id,
         "remoteCwd": remote_cwd,
-        "worktreePathFingerprintSha256": path_hash,
+        "remoteCwdFingerprintSha256": remote_cwd_hash,
+        "worktreePath": worktree_path,
+        "worktreePathFingerprintSha256": worktree_path_hash,
         "identityFingerprintSha256": fingerprint,
     }
 
@@ -2141,6 +3134,8 @@ def validated_recorded_workspace_identity(
             "sandboxId",
             "executionWorkspaceId",
             "remoteCwd",
+            "remoteCwdFingerprintSha256",
+            "worktreePath",
             "worktreePathFingerprintSha256",
         )
     }
@@ -2153,6 +3148,7 @@ def validated_recorded_workspace_identity(
                 comparable["sandboxId"],
                 comparable["executionWorkspaceId"],
                 comparable["remoteCwd"],
+                comparable["worktreePath"],
             )
         ).encode()
     ).hexdigest()
@@ -2161,8 +3157,18 @@ def validated_recorded_workspace_identity(
         or comparable.get("provider") != "daytona"
         or comparable.get("environmentId") != expected_environment_id
         or comparable.get("providerLeaseId") != comparable.get("sandboxId")
-        or comparable.get("worktreePathFingerprintSha256")
+        or not re.fullmatch(
+            r"/home/daytona/paperclip-workspace(?:/[^/]+)*",
+            str(comparable.get("remoteCwd") or ""),
+        )
+        or comparable.get("remoteCwdFingerprintSha256")
         != hashlib.sha256(str(comparable.get("remoteCwd") or "").encode()).hexdigest()
+        or not re.fullmatch(
+            r"/data/instances/default/projects/[^/]+/[^/]+/_default",
+            str(comparable.get("worktreePath") or ""),
+        )
+        or comparable.get("worktreePathFingerprintSha256")
+        != hashlib.sha256(str(comparable.get("worktreePath") or "").encode()).hexdigest()
         or recorded.get("identityFingerprintSha256") != expected_fingerprint
         or set(recorded) != {*comparable, "identityFingerprintSha256"}
         or environment.get("provider") != "daytona"
@@ -2191,7 +3197,7 @@ def daytona_workspace_operation(
     sandbox_id = str(identity.get("sandboxId") or "")
     workspace_id = str(identity.get("executionWorkspaceId") or "")
     remote_cwd = str(identity.get("remoteCwd") or "")
-    image = values.get("PAPERCLIP_NODE_IMAGE", "")
+    image = values.get("MTE_PAPERCLIP_IMAGE", "")
     requested_name = str(NATIVE_EXECUTABLES.get(expected_adapter) or "")
     expected_version = str(
         values.get(NATIVE_VERSION_REFS.get(expected_adapter, "")) or ""
@@ -2202,7 +3208,7 @@ def daytona_workspace_operation(
         or ".." in Path(remote_cwd).parts
         or not workspace_id
         or not FULL_GIT_SHA.fullmatch(commit_sha)
-        or not re.fullmatch(r"[A-Za-z0-9._/@:-]+", image)
+        or not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image)
         or requested_name not in set(NATIVE_EXECUTABLES.values())
         or not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}", expected_version)
     ):
@@ -2215,12 +3221,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 const [sandboxId, workspaceId, cwd, commit, requestedName] = process.argv.slice(2);
 const values = Object.fromEntries(
-  fs.readFileSync("/run/secrets/platform.env", "utf8").split(/\n/)
+  fs.readFileSync("/run/secrets/daytona-probe.env", "utf8").split(/\n/)
     .filter((line) => line && !line.startsWith("#") && line.includes("="))
     .map((line) => { const i=line.indexOf("="); return [line.slice(0,i),line.slice(i+1)]; })
 );
-const { Daytona } = await import("file:///paperclip-home/.paperclip/plugins/node_modules/@daytonaio/sdk/src/index.js");
-const daytona = new Daytona({apiKey:values.DAYTONA_API_KEY,apiUrl:values.MTE_DAYTONA_API_URL,target:values.DAYTONA_TARGET});
+const { Daytona } = await import("@daytonaio/sdk");
+const daytona = new Daytona({apiKey:values.DAYTONA_API_KEY,apiUrl:values.MTE_DAYTONA_API_URL});
 const sandbox = await daytona.get(sandboxId);
 const command = `set -eu; test "$(git rev-parse HEAD)" = "${commit}"; resolved=$(command -v "${requestedName}"); resolved=$(readlink -f "$resolved"); test -x "$resolved"; case "$resolved" in /prototype/*|*/paperclip-harness-runtime/*) exit 73;; esac; python3 -m unittest paperclip-e2e/test_marker.py; printf 'marker '; sha256sum paperclip-e2e/marker.py; printf 'executable '; sha256sum "$resolved"; printf 'realpath '; printf '%s' "$resolved" | base64 | tr -d '\n'; printf '\n'; version_file=$(mktemp); trap 'rm -f "$version_file"' EXIT; "$resolved" --version >"$version_file" 2>&1; printf 'version '; sha256sum "$version_file" | awk '{print $1}'; printf 'version-text '; base64 "$version_file" | tr -d '\n'; printf '\n'; rm -f "$version_file"; trap - EXIT`;
 const result = await sandbox.process.executeCommand(command, cwd, undefined, 180);
@@ -2236,6 +3242,9 @@ const safeVersion = /^[A-Za-z0-9 ._+()/@:-]{1,160}$/.test(versionText) ? version
 const proof = {sandboxId,workspaceId,cwd,commitSha:commit,exitCode:result.exitCode,markerFileSha256:markerSha,executableRealpath,executableSha256:executableSha,versionOutputSha256:versionSha,executableVersion:safeVersion,outputSha256:crypto.createHash("sha256").update(output).digest("hex")};
 process.stdout.write(JSON.stringify(proof));
 """
+    projection_path, projection_proof = generated_env_projection(
+        values, DAYTONA_PROBE_ENV_KEYS
+    )
     try:
         completed = subprocess.run(
             [
@@ -2248,9 +3257,7 @@ process.stdout.write(JSON.stringify(proof));
                 "--user",
                 "0:0",
                 "-v",
-                f"{PLATFORM_ENV}:/run/secrets/platform.env:ro",
-                "-v",
-                "mte-paperclip-native-home:/paperclip-home:ro",
+                f"{projection_path}:/run/secrets/daytona-probe.env:ro",
                 image,
                 "node",
                 "--input-type=module",
@@ -2273,6 +3280,15 @@ process.stdout.write(JSON.stringify(proof));
             "workspace_operation_failed",
             "independent Daytona workspace operation failed",
         ) from exc
+    finally:
+        try:
+            projection_path.unlink()
+        except OSError as exc:
+            raise CanaryError(
+                "credential_projection_cleanup_failed",
+                "temporary Daytona probe credential projection was not removed",
+            ) from exc
+        projection_proof["temporaryProjectionRemoved"] = True
     if (
         not isinstance(proof, dict)
         or proof.get("sandboxId") != sandbox_id
@@ -2320,6 +3336,7 @@ process.stdout.write(JSON.stringify(proof));
         "nativeExecutableVersionOutputSha256": proof["versionOutputSha256"],
         "nativeExecutableVersion": proof["executableVersion"],
         "outputSha256": proof["outputSha256"],
+        "credentialProjection": projection_proof,
     }
     safe["operationFingerprintSha256"] = hashlib.sha256(
         json.dumps(safe, sort_keys=True, separators=(",", ":")).encode()
@@ -2360,6 +3377,7 @@ def validated_stored_workspace_operation(
             "nativeExecutableVersionOutputSha256",
             "nativeExecutableVersion",
             "outputSha256",
+            "credentialProjection",
         )
     }
     expected_fingerprint = hashlib.sha256(
@@ -2367,6 +3385,11 @@ def validated_stored_workspace_operation(
     ).hexdigest()
     executable_name = NATIVE_EXECUTABLES.get(expected_adapter)
     executable_realpath = str(comparable.get("nativeExecutableRealpath") or "")
+    projection = (
+        comparable.get("credentialProjection")
+        if isinstance(comparable.get("credentialProjection"), dict)
+        else {}
+    )
     if (
         comparable.get("status") != "passed"
         or comparable.get("provider") != "daytona"
@@ -2402,6 +3425,25 @@ def validated_stored_workspace_operation(
             str(comparable.get("nativeExecutableVersion") or ""),
         )
         or not FULL_SHA256.fullmatch(str(comparable.get("outputSha256") or ""))
+        or set(projection)
+        != {
+            "status",
+            "sourceCanonicalSha256",
+            "allowlistedKeys",
+            "allowlistedKeyCount",
+            "projectionSha256",
+            "projectionMode",
+            "canonicalEnvironmentMounted",
+            "temporaryProjectionRemoved",
+        }
+        or projection.get("status") != "passed"
+        or projection.get("sourceCanonicalSha256") != sha256_file(PLATFORM_ENV)
+        or projection.get("allowlistedKeys") != list(DAYTONA_PROBE_ENV_KEYS)
+        or projection.get("allowlistedKeyCount") != len(DAYTONA_PROBE_ENV_KEYS)
+        or not FULL_SHA256.fullmatch(str(projection.get("projectionSha256") or ""))
+        or projection.get("projectionMode") != "0600"
+        or projection.get("canonicalEnvironmentMounted") is not False
+        or projection.get("temporaryProjectionRemoved") is not True
         or operation.get("operationFingerprintSha256") != expected_fingerprint
         or set(operation) != {*comparable, "operationFingerprintSha256"}
     ):
@@ -2415,7 +3457,7 @@ def validated_stored_workspace_operation(
 def validated_kestra_execution(
     execution: dict[str, Any],
     expected_revision: Any,
-    normalized_run_id: str,
+    paperclip_issue_id: str,
     commit_sha: str,
     pull_url: str,
 ) -> dict[str, Any]:
@@ -2451,7 +3493,7 @@ def validated_kestra_execution(
         or revision != expected_revision
         or finished_at <= started_at
         or outputs.get("result") != "PASS"
-        or outputs.get("paperclip_issue_id") != normalized_run_id
+        or outputs.get("paperclip_issue_id") != paperclip_issue_id
         or outputs.get("commit_sha") != commit_sha
         or outputs.get("pull_request_url") != pull_url
         or not critical_tasks <= observed_tasks
@@ -2477,7 +3519,7 @@ def validated_kestra_execution(
         "criticalTasks": sorted(critical_tasks),
         "outputs": {
             "result": "PASS",
-            "paperclipIssueId": normalized_run_id,
+            "paperclipIssueId": paperclip_issue_id,
             "commitSha": commit_sha,
             "pullRequestUrl": pull_url,
         },
@@ -2518,17 +3560,34 @@ def validated_github_evidence(
         raise CanaryError("github_pr_invalid", "draft PR identity is incomplete")
     safe_checks: list[dict[str, Any]] = []
     for row in checks:
+        app = row.get("app") if isinstance(row.get("app"), dict) else {}
         started = parse_timestamp(row.get("started_at"), "check.started_at")
         completed = parse_timestamp(row.get("completed_at"), "check.completed_at")
         if row.get("conclusion") not in PASS_CONCLUSIONS:
             raise CanaryError(
                 "github_checks_failed", "at least one GitHub check did not pass"
             )
+        if row.get("name") == REQUIRED_GITHUB_CHECK_NAME and (
+            app.get("id") != REQUIRED_GITHUB_APP_ID
+            or app.get("slug") != REQUIRED_GITHUB_APP_SLUG
+            or app.get("name") != REQUIRED_GITHUB_APP_NAME
+        ):
+            raise CanaryError(
+                "github_required_check_identity_invalid",
+                "paperclip-e2e check is not owned by the controller GitHub app",
+            )
         if (
             not isinstance(row.get("id"), int)
             or not row.get("name")
             or row.get("head_sha") != commit_sha
             or row.get("status") != "completed"
+            or not isinstance(app.get("id"), int)
+            or isinstance(app.get("id"), bool)
+            or app.get("id") <= 0
+            or not isinstance(app.get("slug"), str)
+            or not app.get("slug")
+            or not isinstance(app.get("name"), str)
+            or not app.get("name")
             or started < execution_started
             or completed < started
             or completed > execution_finished
@@ -2547,6 +3606,11 @@ def validated_github_evidence(
                 "startedAt": row.get("started_at"),
                 "completedAt": row.get("completed_at"),
                 "url": row.get("html_url"),
+                "app": {
+                    "id": app.get("id"),
+                    "slug": app.get("slug"),
+                    "name": app.get("name"),
+                },
             }
         )
     required_checks = [
@@ -2554,6 +3618,12 @@ def validated_github_evidence(
         for row in safe_checks
         if row.get("name") == REQUIRED_GITHUB_CHECK_NAME
         and row.get("conclusion") == "success"
+        and row.get("app")
+        == {
+            "id": REQUIRED_GITHUB_APP_ID,
+            "slug": REQUIRED_GITHUB_APP_SLUG,
+            "name": REQUIRED_GITHUB_APP_NAME,
+        }
     ]
     if len(required_checks) != 1:
         raise CanaryError(
@@ -2594,6 +3664,7 @@ def validated_github_evidence(
             "canary PR changed files outside the exact three-path allowlist",
         )
     safe_files: list[dict[str, Any]] = []
+    file_contents: dict[str, str] = {}
     for row in sorted(observed_files, key=lambda item: str(item.get("filename") or "")):
         patch = row.get("patch")
         if (
@@ -2611,16 +3682,29 @@ def validated_github_evidence(
                 "github_diff_invalid",
                 "canary PR file evidence lacks an exact added blob and patch",
             )
+        path = str(row["filename"])
+        content = row.get("content")
+        if content is None:
+            content = github_blob(e2e, str(row["sha"]))
+        if not isinstance(content, str) or len(content.encode()) > 65536:
+            raise CanaryError(
+                "github_artifact_identity_invalid",
+                "canary PR blob content is missing or too large",
+            )
+        row["content"] = content
+        file_contents[path] = content
         safe_files.append(
             {
-                "path": row["filename"],
+                "path": path,
                 "status": "added",
                 "blobSha": row["sha"],
                 "additions": row["additions"],
                 "deletions": 0,
                 "patchSha256": hashlib.sha256(patch.encode()).hexdigest(),
+                "contentSha256": hashlib.sha256(content.encode()).hexdigest(),
             }
         )
+    artifact_identity = controller_github_artifact_identity(file_contents)
     return {
         "status": "passed",
         "repository": f"{e2e['githubOwner']}/{e2e['githubRepository']}",
@@ -2634,21 +3718,22 @@ def validated_github_evidence(
         "checks": safe_checks,
         "requiredCheck": required_checks[0],
         "files": safe_files,
+        "controllerArtifactIdentity": artifact_identity,
     }
 
 
 def validated_cross_run_identity(
     runs: list[dict[str, Any]], profiles: list[str], flow_revision: int
 ) -> dict[str, Any]:
-    """Prove three isolated profile runs instead of three views of one run."""
+    """Prove each selected R1 native harness has an isolated run identity."""
     if (
-        len(profiles) != 3
-        or len(runs) != 3
+        profiles != list(R1_E2E_PROFILES)
+        or len(runs) != len(R1_E2E_PROFILES)
         or [row.get("profile") for row in runs] != profiles
     ):
         raise CanaryError(
             "cross_run_identity_invalid",
-            "E2E must contain exactly one run for each of the three canonical profiles",
+            "R1 E2E must contain one ordered run for Codex, Claude Code, and Pi",
         )
 
     fields: dict[str, list[Any]] = {
@@ -2741,13 +3826,12 @@ def validated_cross_run_identity(
         check_ids.extend(int(check["id"]) for check in checks)
 
     for name, identities in fields.items():
-        if (
-            any(value in {None, ""} for value in identities)
-            or len(set(identities)) != 3
-        ):
+        if any(value in {None, ""} for value in identities) or len(
+            set(identities)
+        ) != len(profiles):
             raise CanaryError(
                 "cross_run_identity_invalid",
-                f"{name} are not three distinct identities",
+                f"{name} do not form one exact R1 run identity",
             )
     if len(set(check_ids)) != len(check_ids):
         raise CanaryError(
@@ -2826,7 +3910,7 @@ def validated_toolhive_profile(
     catalog_row: dict[str, Any],
     *,
     profile: str,
-    normalized_run_id: str,
+    paperclip_issue_id: str,
 ) -> dict[str, Any]:
     """Validate the native runner's profile-scoped ToolHive protocol proof.
 
@@ -2845,6 +3929,7 @@ def validated_toolhive_profile(
     credential_ref = str(access.get("credentialRef") or "")
     endpoint = values.get(endpoint_ref, "")
     credential = values.get(credential_ref, "")
+    gateway_host = values.get("MTE_AGENT_GATEWAY_HOST", "")
     parsed_endpoint = urllib.parse.urlparse(endpoint)
     wrong_profile_endpoint_ref = {
         "coding-daytona-codex": "MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_URL",
@@ -2853,7 +3938,7 @@ def validated_toolhive_profile(
     }.get(profile, "")
     wrong_profile_endpoint = values.get(wrong_profile_endpoint_ref, "")
     parsed_wrong_profile_endpoint = urllib.parse.urlparse(wrong_profile_endpoint)
-    marker = f"mte-c010:{profile}:{normalized_run_id}"
+    marker = f"mte-c010:{profile}:{paperclip_issue_id}"
     marker_hash = hashlib.sha256(marker.encode()).hexdigest()
     hash_fields = (
         "markerSha256",
@@ -2870,7 +3955,7 @@ def validated_toolhive_profile(
     )
     if (
         not all(isinstance(value, str) and value for value in contract_values)
-        or not endpoint.startswith("http://172.20.0.1:")
+        or parsed_endpoint.hostname != gateway_host
         or not endpoint.endswith("/mcp")
         or parsed_endpoint.scheme != "http"
         or parsed_endpoint.hostname is None
@@ -2892,7 +3977,7 @@ def validated_toolhive_profile(
         or parsed_wrong_profile_endpoint.fragment
         or not credential
         or proof.get("profileRef") != profile
-        or proof.get("runId") != normalized_run_id
+        or proof.get("runId") != paperclip_issue_id
         or proof.get("bundleId") != access.get("bundleId")
         or proof.get("workloadId") != access.get("workloadId")
         or proof.get("endpointRef") != endpoint_ref
@@ -2930,7 +4015,7 @@ def validated_toolhive_profile(
         "check": "runner-toolhive-profile",
         "status": "passed",
         "profileRef": profile,
-        "runId": normalized_run_id,
+        "runId": paperclip_issue_id,
         "bundleId": access["bundleId"],
         "workloadId": access["workloadId"],
         "endpointRef": endpoint_ref,
@@ -2962,12 +4047,6 @@ def validated_daytona_gateway_evidence(
     values: dict[str, str], runtime_network: dict[str, Any]
 ) -> str:
     document = load_json(DAYTONA_EVIDENCE)
-    gateway = (
-        document.get("agentGateway")
-        if isinstance(document.get("agentGateway"), dict)
-        else {}
-    )
-    rows = gateway.get("profiles") if isinstance(gateway.get("profiles"), list) else []
     expected_networks = sorted(
         {
             "mte-daytona-net",
@@ -2975,51 +4054,56 @@ def validated_daytona_gateway_evidence(
             "mte-tool-runtime",
         }
     )
-    expected_rows = []
-    for profile_ref, harness in (
-        ("coding-daytona-codex", "CODEX"),
-        ("coding-daytona-claude", "CLAUDE"),
-        ("coding-daytona-pi", "PI"),
-    ):
-        upstream_ref = f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_UPSTREAM"
-        upstream = urllib.parse.urlparse(values.get(upstream_ref, ""))
-        gateway_port = values.get(f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_PORT", "")
-        expected_rows.append(
-            {
-                "profileRef": profile_ref,
-                "upstreamRef": upstream_ref,
-                "host": "tool-runtime",
-                "port": upstream.port,
-                "gatewayPort": int(gateway_port) if gateway_port.isdigit() else None,
-                "httpStatus": 200,
-                "initialize": True,
-            }
-        )
-    runner_id = str(gateway.get("runnerContainerId") or "")
-    gateway_id = str(gateway.get("gatewayContainerId") or "")
     if (
-        document.get("apiVersion") != "micro-task-engine/v1alpha1"
+        set(document)
+        != {
+            "apiVersion",
+            "kind",
+            "status",
+            "generatedAt",
+            "producerSha256",
+            "canonicalSourceSha256",
+            "composeServices",
+            "runtimeEvidence",
+            "secretValuesPrinted",
+        }
+        or document.get("apiVersion") != "micro-task-engine/v1alpha1"
         or document.get("kind") != "PaperclipDaytonaControlPlaneEvidence"
         or document.get("status") != "ready"
         or document.get("canonicalSourceSha256") != sha256_file(PLATFORM_ENV)
-        or document.get("producerPath") != str(DAYTONA_STEP_SOURCE)
         or document.get("producerSha256") != sha256_file(DAYTONA_STEP_SOURCE)
         or document.get("secretValuesPrinted") is not False
-        or gateway.get("status") != "passed"
-        or gateway.get("profileCount") != 3
-        or not runner_id
-        or not gateway_id
-        or gateway.get("gatewayNetworkMode") != f"container:{runner_id}"
-        or gateway.get("runnerNetworks") != expected_networks
-        or gateway.get("expectedRunnerNetworks") != expected_networks
-        or gateway.get("privateToolRuntimeNetwork") != "mte-tool-runtime"
-        or gateway.get("noPublishedPorts") is not True
-        or rows != expected_rows
-        or runtime_network.get("runnerContainerId") != runner_id
-        or runtime_network.get("gatewayContainerId") != gateway_id
+        or document.get("composeServices")
+        != [
+            "agent-gateway",
+            "api",
+            "db",
+            "dex",
+            "minio",
+            "proxy",
+            "redis",
+            "registry",
+            "runner",
+            "ssh-gateway",
+        ]
+        or document.get("runtimeEvidence")
+        != {
+            "images": str(DAYTONA_IMAGES_EVIDENCE),
+            "lifecycle": str(DAYTONA_LIFECYCLE_EVIDENCE),
+        }
         or runtime_network.get("runnerNetworkNames") != expected_networks
         or runtime_network.get("gatewaySharesRunnerNamespace") is not True
         or runtime_network.get("publishedPorts") != []
+        or runtime_network.get("canonicalEnvironmentMounted") is not False
+        or not FULL_SHA256.fullmatch(
+            str(runtime_network.get("runnerContainerId") or "")
+        )
+        or not FULL_SHA256.fullmatch(
+            str(runtime_network.get("gatewayContainerId") or "")
+        )
+        or not FULL_SHA256.fullmatch(
+            str(runtime_network.get("mountInventorySha256") or "")
+        )
     ):
         raise CanaryError(
             "daytona_gateway_evidence_invalid",
@@ -3121,7 +4205,8 @@ def toolhive_gateway_audit(
             or audit_row["wrongProfileDenied"] is not True
             or audit_row["wrongProfileStatus"] != 401
             or not re.fullmatch(r"[0-9a-f]{64}", str(audit_row["markerSha256"] or ""))
-            or audit_row["gatewayReachableHost"] != "172.20.0.1"
+            or audit_row["gatewayReachableHost"]
+            != values.get("MTE_AGENT_GATEWAY_HOST", "")
             or not isinstance(audit_row["gatewayReachablePort"], int)
             or upstream.scheme != "http"
             or upstream.hostname != "tool-runtime"
@@ -3230,15 +4315,36 @@ def gateway_runtime_network_proof() -> dict[str, Any]:
         for name in ((runner.get("NetworkSettings") or {}).get("Networks") or {})
     )
     published: list[str] = []
+    mount_rows: list[str] = []
+    canonical_mounts: list[str] = []
     for name, document in ((containers[0], runner), (containers[1], gateway)):
         bindings = (document.get("HostConfig") or {}).get("PortBindings") or {}
         published.extend(f"{name}:{port}" for port, rows in bindings.items() if rows)
+        mounts = (
+            document.get("Mounts") if isinstance(document.get("Mounts"), list) else []
+        )
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                continue
+            source = str(mount.get("Source") or "")
+            destination = str(mount.get("Destination") or "")
+            mount_rows.append(f"{name}|{mount.get('Type')}|{source}|{destination}")
+            if (
+                source == str(PLATFORM_ENV)
+                or destination == "/run/secrets/platform.env"
+            ):
+                canonical_mounts.append(f"{name}:{destination}")
     expected_networks = ["mte-agent-plane", "mte-daytona-net", "mte-tool-runtime"]
     shares_runner = bool(runner_id) and gateway_mode == f"container:{runner_id}"
-    if runner_networks != expected_networks or not shares_runner or published:
+    if (
+        runner_networks != expected_networks
+        or not shares_runner
+        or published
+        or canonical_mounts
+    ):
         raise CanaryError(
             "toolhive_gateway_runtime_network_invalid",
-            "gateway is not isolated on the exact private runtime network contract",
+            "runner/gateway is not isolated from public ports and canonical env mounts",
         )
     return {
         "runnerContainer": containers[0],
@@ -3248,6 +4354,10 @@ def gateway_runtime_network_proof() -> dict[str, Any]:
         "runnerNetworkNames": runner_networks,
         "gatewaySharesRunnerNamespace": True,
         "publishedPorts": [],
+        "canonicalEnvironmentMounted": False,
+        "mountInventorySha256": hashlib.sha256(
+            "\n".join(sorted(mount_rows)).encode()
+        ).hexdigest(),
     }
 
 
@@ -3373,6 +4483,98 @@ def scan_for_secrets(payload: dict[str, Any], values: dict[str, str]) -> None:
         )
 
 
+def portable_redaction(value: Any) -> Any:
+    """Replace host-specific paths while preserving a deterministic JSON document."""
+    if isinstance(value, dict):
+        return {str(key): portable_redaction(nested) for key, nested in value.items()}
+    if isinstance(value, list):
+        return [portable_redaction(nested) for nested in value]
+    if isinstance(value, str):
+        platform_env = str(PLATFORM_ENV)
+        root = str(ROOT).rstrip("/")
+        if value == platform_env:
+            return "$MTE_PLATFORM_ENV"
+        if root and (value == root or value.startswith(root + "/")):
+            suffix = value[len(root) :].lstrip("/")
+            return "$MTE_ROOT" + (f"/{suffix}" if suffix else "")
+    return value
+
+
+def write_portable_evidence_bundle(values: dict[str, str]) -> dict[str, Any]:
+    """Embed redacted apply/verify evidence so the proof survives host relocation."""
+    require_private_evidence_file(EVIDENCE)
+    raw_apply_document = load_json(EVIDENCE)
+    apply_sha = sha256_file(EVIDENCE)
+    canonical_sha = sha256_file(PLATFORM_ENV)
+    producer_sha = sha256_file(Path(__file__))
+    apply_document = portable_redaction(raw_apply_document)
+    verification_document: dict[str, Any] | None = None
+    verification_bound = False
+    if VERIFICATION_EVIDENCE.is_file():
+        require_private_evidence_file(VERIFICATION_EVIDENCE)
+        raw_verification_document = load_json(VERIFICATION_EVIDENCE)
+        verification_bound = (
+            raw_verification_document.get("status") == "passed"
+            and raw_verification_document.get("subjectEvidencePath") == str(EVIDENCE)
+            and raw_verification_document.get("subjectEvidenceSha256") == apply_sha
+            and raw_verification_document.get("canonicalSourceSha256") == canonical_sha
+            and raw_verification_document.get("producerSha256") == producer_sha
+            and raw_verification_document.get("applyFinishedAt")
+            == raw_apply_document.get("finishedAt")
+        )
+        verification_document = portable_redaction(raw_verification_document)
+    documents = {"apply.json": apply_document}
+    if verification_document is not None:
+        documents["verify.json"] = verification_document
+    document_hashes = {
+        name: hashlib.sha256(
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        for name, document in documents.items()
+    }
+    bundle: dict[str, Any] = {
+        "apiVersion": "micro-task-engine/v1alpha1",
+        "kind": "PortableKestraPaperclipGitHubE2EEvidenceBundle",
+        "schemaVersion": E2E_EVIDENCE_SCHEMA,
+        "status": (
+            "passed"
+            if apply_document.get("status") == "passed"
+            and isinstance(verification_document, dict)
+            and verification_bound
+            else "failed"
+            if apply_document.get("status") == "failed"
+            else "unverified"
+        ),
+        "generatedAt": utcnow(),
+        "redaction": {
+            "status": "passed",
+            "hostPathsReplaced": True,
+            "rawSecretsPresent": False,
+            "canonicalEnvironmentIncluded": False,
+        },
+        "documents": documents,
+        "documentSha256": document_hashes,
+        "sourceSha256": {
+            "canonical": canonical_sha,
+            "producer": producer_sha,
+        },
+    }
+    bundle["bundleSha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                "documents": documents,
+                "documentSha256": document_hashes,
+                "sourceSha256": bundle["sourceSha256"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    scan_for_secrets(bundle, values)
+    atomic_json(PORTABLE_EVIDENCE_BUNDLE, bundle)
+    return bundle
+
+
 def cleanup_github(
     e2e: dict[str, Any], token: str, branch: str, pull: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -3391,20 +4593,58 @@ def cleanup_github(
             raise CanaryError(
                 "github_cleanup_lookup_failed", "could not verify canary PR state"
             )
-        pull = next((row for row in candidates if isinstance(row, dict)), None)
-    if pull and pull.get("number") and pull.get("state") == "open":
-        github_cleanup_request(
-            token,
-            "PATCH",
-            f"/repos/{owner}/{repo}/pulls/{int(pull['number'])}",
-            {"state": "closed"},
+        matching = [
+            row for row in candidates if github_pull_matches_branch(row, owner, branch)
+        ]
+        if len(matching) > 1:
+            raise CanaryError(
+                "github_cleanup_ambiguous",
+                "cleanup found multiple PRs for the exact canary branch",
+            )
+        pull = matching[0] if matching else None
+    elif not github_pull_matches_branch(pull, owner, branch):
+        raise CanaryError(
+            "github_cleanup_identity_invalid",
+            "cleanup refuses to mutate a PR outside the exact canary branch",
         )
+
+    pull_number: int | None = None
+    if pull is not None:
+        number = pull.get("number")
+        if (
+            not isinstance(number, int)
+            or isinstance(number, bool)
+            or number <= 0
+            or pull.get("state") not in {"open", "closed"}
+        ):
+            raise CanaryError(
+                "github_cleanup_identity_invalid",
+                "cleanup PR identity or state is invalid",
+            )
+        pull_number = number
+        if pull.get("state") == "open":
+            close_status, closed_pull = github_cleanup_request(
+                token,
+                "PATCH",
+                f"/repos/{owner}/{repo}/pulls/{pull_number}",
+                {"state": "closed"},
+            )
+            if (
+                close_status != 200
+                or not isinstance(closed_pull, dict)
+                or closed_pull.get("number") != pull_number
+                or closed_pull.get("state") != "closed"
+            ):
+                raise CanaryError(
+                    "github_cleanup_close_failed",
+                    "GitHub did not confirm that the exact canary PR was closed",
+                )
+
     delete_ref_path = f"/repos/{owner}/{repo}/git/refs/heads/{branch}"
     get_ref_path = f"/repos/{owner}/{repo}/git/ref/heads/{branch}"
     github_cleanup_request(token, "DELETE", delete_ref_path)
     ref_status, _ = github_cleanup_request(token, "GET", get_ref_path)
     deleted = ref_status == 404
-    pull_number = int(pull["number"]) if pull and pull.get("number") else None
     pr_status: int | None = None
     current_state: str | None = None
     if pull_number is not None:
@@ -3509,9 +4749,83 @@ def daytona_environment_sandboxes(
     return rows
 
 
+def admit_single_coding_sandbox(
+    values: dict[str, str], environment_id: str
+) -> dict[str, int]:
+    """Refuse a canary that would overlap another active coding sandbox.
+
+    The shell resource gate owns host headroom. This authenticated check owns
+    the provider state, where the resolved Paperclip environment ID is known.
+    Stopped or archived reusable leases do not consume the one active-sandbox
+    E2E allowance.
+    """
+
+    if not environment_id:
+        raise CanaryError(
+            "daytona_environment_missing",
+            "Daytona E2E admission requires a resolved coding environment",
+        )
+    active_states = {"creating", "starting", "started", "stopping"}
+    active_count = sum(
+        1
+        for row in daytona_environment_sandboxes(values, environment_id)
+        if str(row.get("state") or "").lower() in active_states
+    )
+    if active_count:
+        raise CanaryError(
+            "coding_sandbox_capacity_exhausted",
+            "Daytona E2E requires no pre-existing active coding sandbox",
+        )
+    return {"maxActiveCodingSandboxes": 1, "activeBefore": active_count}
+
+
 def global_cleanup_absence(
-    e2e: dict[str, Any], values: dict[str, str], environment_id: str
+    e2e: dict[str, Any],
+    values: dict[str, str],
+    environment_id: str,
+    cleanup_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    provider_resources = [
+        provider_row
+        for row in cleanup_rows
+        if isinstance(row, dict)
+        and isinstance(row.get("resources"), dict)
+        and isinstance((row.get("resources") or {}).get("daytona"), dict)
+        for provider_row in (row.get("resources") or {}).get("daytona", {}).get(
+            "providerResources", []
+        )
+        if isinstance(provider_row, dict)
+    ]
+    expected_sandbox_ids = {
+        str(row.get("sandboxId") or "") for row in provider_resources
+    }
+    expected_provider_lease_ids = {
+        str(row.get("providerLeaseId") or "") for row in provider_resources
+    }
+    expected_refs = {
+        str(row.get("branchRef") or "") for row in cleanup_rows if isinstance(row, dict)
+    }
+    expected_pull_numbers = {
+        int(row["pullRequestNumber"])
+        for row in cleanup_rows
+        if isinstance(row, dict)
+        and isinstance(row.get("pullRequestNumber"), int)
+        and not isinstance(row.get("pullRequestNumber"), bool)
+    }
+    if (
+        not cleanup_rows
+        or "" in expected_sandbox_ids
+        or "" in expected_refs
+        or "" in expected_provider_lease_ids
+        or expected_provider_lease_ids != expected_sandbox_ids
+        or len(expected_sandbox_ids) != len(provider_resources)
+        or len(expected_refs) != len(cleanup_rows)
+        or len(expected_pull_numbers) != len(cleanup_rows)
+    ):
+        raise CanaryError(
+            "global_cleanup_scope_invalid",
+            "global cleanup requires exact run-owned sandbox, branch, and PR identities",
+        )
     sandboxes = daytona_environment_sandboxes(values, environment_id)
     owner = str(e2e["githubOwner"])
     repo = str(e2e["githubRepository"])
@@ -3541,7 +4855,7 @@ def global_cleanup_absence(
     matching_refs = [
         str(item.get("ref"))
         for item in refs
-        if str(item.get("ref") or "").startswith(ref_prefix)
+        if str(item.get("ref") or "") in expected_refs
     ]
     for page in range(1, 11):
         query = urllib.parse.urlencode(
@@ -3567,20 +4881,42 @@ def global_cleanup_absence(
         for item in pulls
         if isinstance(item.get("number"), int)
         and isinstance(item.get("head"), dict)
-        and str(item["head"].get("ref") or "").startswith("agent/paperclip-e2e-")
+        and int(item["number"]) in expected_pull_numbers
     ]
-    if sandboxes or matching_refs or matching_pulls:
+    matching_sandboxes = [
+        str(item.get("id") or "")
+        for item in sandboxes
+        if str(item.get("id") or "") in expected_sandbox_ids
+    ]
+    if matching_sandboxes or matching_refs or matching_pulls:
         raise CanaryError(
             "global_cleanup_incomplete",
-            "global canary sandbox/ref/open-PR lookup found residual resources",
+            "run-owned sandbox/ref/open-PR lookup found residual resources",
         )
+    scope_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "sandboxIds": sorted(expected_sandbox_ids),
+                "providerLeaseIds": sorted(expected_provider_lease_ids),
+                "refs": sorted(expected_refs),
+                "pullRequestNumbers": sorted(expected_pull_numbers),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
     return {
         "status": "passed",
+        "scope": "exact-run-owned-identities",
+        "scopeFingerprintSha256": scope_fingerprint,
+        "ownedResourceCount": len(provider_resources),
+        "unrelatedParallelResourcesIgnored": True,
         "daytonaEnvironmentId": environment_id,
         "daytonaLabelFingerprintSha256": hashlib.sha256(
             f"paperclip-environment-id={environment_id}".encode()
         ).hexdigest(),
         "daytonaSandboxIds": [],
+        "paperclipProviderLeaseIds": sorted(expected_provider_lease_ids),
         "githubRepository": f"{owner}/{repo}",
         "githubRefPrefix": ref_prefix,
         "githubRefs": [],
@@ -3593,6 +4929,8 @@ def paperclip_resource_state(
 ) -> dict[str, Any]:
     projection = native_issue_projection(paperclip, values, issue_id)
     environment = projection.get("environment") or {}
+    lease_group = projection.get("environmentLeaseGroup") or {}
+    lease_groups = projection.get("environmentLeaseGroups") or []
     workspace_id = str(environment.get("executionWorkspaceId") or "")
     workspace: dict[str, Any] = {}
     if workspace_id:
@@ -3610,12 +4948,72 @@ def paperclip_resource_state(
         workspace.get("path"),
         environment.get("remoteCwd"),
     )
-    lease_released = environment.get("status") in {"released", "expired"} and (
-        environment.get("cleanupStatus") in {None, "success"}
+    worktree_absent: bool | None = None
+    filesystem_probe = "unverified"
+    resolved_worktree_path = (
+        str(Path(str(worktree_path)).resolve(strict=False)) if worktree_path else ""
+    )
+    if worktree_path and re.fullmatch(
+        r"/data/instances/default/projects/[^/]+/[^/]+/_default",
+        str(worktree_path),
+    ) and (
+        ".." not in Path(str(worktree_path)).parts
+        and resolved_worktree_path == str(worktree_path)
+    ):
+        try:
+            exists_probe = subprocess.run(
+                ["docker", "exec", "mte-paperclip", "test", "-e", str(worktree_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            absent_probe = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "mte-paperclip",
+                    "test",
+                    "!",
+                    "-e",
+                    str(worktree_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                check=False,
+            )
+            if (exists_probe.returncode, absent_probe.returncode) == (0, 1):
+                worktree_absent = False
+                filesystem_probe = "present"
+            elif (exists_probe.returncode, absent_probe.returncode) == (1, 0):
+                worktree_absent = True
+                filesystem_probe = "absent"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    lease_released = (
+        bool(lease_groups)
+        and all(
+            valid_provider_lease_cleanup(
+                group, str(group.get("providerLeaseId") or "")
+            )
+            for group in lease_groups
+            if isinstance(group, dict)
+        )
+        and len(lease_groups)
+        == len(
+            {
+                str(group.get("providerLeaseId") or "")
+                for group in lease_groups
+                if isinstance(group, dict)
+            }
+        )
     )
     return {
         "runId": issue_id,
         "environment": environment,
+        "environmentLeaseGroup": lease_group,
+        "environmentLeaseGroups": lease_groups,
         "paperclipWorkspace": {
             "id": workspace_id or None,
             "status": workspace.get("status"),
@@ -3628,8 +5026,9 @@ def paperclip_resource_state(
                 if worktree_path
                 else None
             ),
-            "worktreeAbsent": None,
-            "filesystemAbsenceVerified": False,
+            "worktreeAbsent": worktree_absent,
+            "filesystemAbsenceVerified": worktree_absent is True,
+            "filesystemProbe": filesystem_probe,
         },
         "paperclipEnvironmentReleased": lease_released,
     }
@@ -3647,6 +5046,11 @@ def cleanup_paperclip_daytona(
     environment = (
         before.get("environment") if isinstance(before.get("environment"), dict) else {}
     )
+    lease_group = (
+        before.get("environmentLeaseGroup")
+        if isinstance(before.get("environmentLeaseGroup"), dict)
+        else {}
+    )
     workspace = (
         before.get("paperclipWorkspace")
         if isinstance(before.get("paperclipWorkspace"), dict)
@@ -3659,6 +5063,7 @@ def cleanup_paperclip_daytona(
     environment_lease_id = str(environment.get("environmentLeaseId") or "")
     provider_lease_id = str(environment.get("providerLeaseId") or "")
     remote_cwd = str(environment.get("remoteCwd") or "")
+    remote_cwd_fingerprint = hashlib.sha256(remote_cwd.encode()).hexdigest()
     worktree_path = str(workspace.get("worktreePath") or "")
     worktree_path_fingerprint = str(
         workspace.get("worktreePathFingerprintSha256") or ""
@@ -3669,8 +5074,17 @@ def cleanup_paperclip_daytona(
         or not workspace_id
         or not environment_lease_id
         or not provider_lease_id
-        or not remote_cwd
-        or worktree_path != remote_cwd
+        or provider_lease_id != sandbox_id
+        or workspace.get("id") != environment.get("executionWorkspaceId")
+        or not re.fullmatch(
+            r"/home/daytona/paperclip-workspace(?:/[^/]+)*", remote_cwd
+        )
+        or ".." in Path(remote_cwd).parts
+        or lease_group.get("providerLeaseId") != provider_lease_id
+        or not re.fullmatch(
+            r"/data/instances/default/projects/[^/]+/[^/]+/_default", worktree_path
+        )
+        or ".." in Path(worktree_path).parts
         or not re.fullmatch(r"[0-9a-f]{64}", worktree_path_fingerprint)
         or worktree_path_fingerprint
         != hashlib.sha256(worktree_path.encode()).hexdigest()
@@ -3688,6 +5102,7 @@ def cleanup_paperclip_daytona(
                 sandbox_id,
                 workspace_id,
                 remote_cwd,
+                worktree_path,
             )
         ).encode()
     ).hexdigest()
@@ -3731,8 +5146,9 @@ def cleanup_paperclip_daytona(
             and current_workspace.get("worktreePath") == worktree_path
             and current_workspace.get("worktreePathFingerprintSha256")
             == worktree_path_fingerprint
-            and current_workspace.get("worktreeAbsent") is not True
-            and current_workspace.get("filesystemAbsenceVerified") is not True
+            and current_workspace.get("worktreeAbsent") is True
+            and current_workspace.get("filesystemAbsenceVerified") is True
+            and current_workspace.get("filesystemProbe") == "absent"
             and paperclip_after.get("paperclipEnvironmentReleased") is True
         ):
             break
@@ -3743,39 +5159,75 @@ def cleanup_paperclip_daytona(
             "Paperclip workspace/worktree and environment lease were not released",
         )
 
-    daytona_status, _ = daytona_request(values, "GET", sandbox_id)
-    delete_requested = daytona_status == 200
+    current_lease_groups = paperclip_after.get("environmentLeaseGroups") or []
+    current_provider_ids = [
+        str((group or {}).get("providerLeaseId") or "")
+        for group in current_lease_groups
+        if isinstance(group, dict)
+    ]
+    if (
+        not current_lease_groups
+        or "" in current_provider_ids
+        or len(current_provider_ids) != len(current_lease_groups)
+        or len(current_provider_ids) != len(set(current_provider_ids))
+        or any(
+            not valid_provider_lease_cleanup(
+                group, str((group or {}).get("providerLeaseId") or "")
+            )
+            for group in current_lease_groups
+        )
+    ):
+        raise CanaryError(
+            "paperclip_resource_cleanup_failed",
+            "Paperclip did not prove cleanup for every unique provider resource",
+        )
     daytona_delete_attempts = 0
-    if delete_requested:
-        delete_error: CanaryError | None = None
-        for _ in range(3):
-            daytona_delete_attempts += 1
-            try:
-                daytona_request(values, "DELETE", sandbox_id)
-                delete_error = None
+    daytona_poll_attempts = 0
+    provider_resources: list[dict[str, Any]] = []
+    for group in current_lease_groups:
+        current_sandbox_id = str(group.get("providerLeaseId") or "")
+        daytona_status, _ = daytona_request(values, "GET", current_sandbox_id)
+        delete_requested = daytona_status == 200
+        if delete_requested:
+            delete_error: CanaryError | None = None
+            for _ in range(3):
+                daytona_delete_attempts += 1
+                try:
+                    daytona_request(values, "DELETE", current_sandbox_id)
+                    delete_error = None
+                    break
+                except CanaryError as exc:
+                    delete_error = exc
+                    time.sleep(poll_interval)
+            if delete_error is not None:
+                raise CanaryError(
+                    "daytona_sandbox_cleanup_failed",
+                    "Daytona did not accept bounded sandbox deletion retries",
+                ) from delete_error
+        for _ in range(attempts):
+            daytona_poll_attempts += 1
+            daytona_status, _ = daytona_request(values, "GET", current_sandbox_id)
+            if daytona_status == 404:
                 break
-            except CanaryError as exc:
-                delete_error = exc
-                time.sleep(poll_interval)
-        if delete_error is not None:
+            time.sleep(poll_interval)
+        else:
             raise CanaryError(
                 "daytona_sandbox_cleanup_failed",
-                "Daytona did not accept bounded sandbox deletion retries",
-            ) from delete_error
-    daytona_poll_attempts = 0
-    for _ in range(attempts):
-        daytona_poll_attempts += 1
-        daytona_status, _ = daytona_request(values, "GET", sandbox_id)
-        if daytona_status == 404:
-            break
-        time.sleep(poll_interval)
-    else:
-        raise CanaryError(
-            "daytona_sandbox_cleanup_failed",
-            "Daytona sandbox still exists after bounded cleanup",
+                "Daytona sandbox still exists after bounded cleanup",
+            )
+        provider_resources.append(
+            {
+                "providerLeaseId": current_sandbox_id,
+                "sandboxId": current_sandbox_id,
+                "providerLeaseCleanup": group,
+                "deleteRequested": delete_requested,
+                "providerGetStatus": 404,
+                "sandboxAbsent": True,
+            }
         )
 
     current_workspace = paperclip_after["paperclipWorkspace"]
+    current_lease_group = paperclip_after.get("environmentLeaseGroup") or {}
     return {
         "requested": True,
         "completed": True,
@@ -3786,6 +5238,7 @@ def cleanup_paperclip_daytona(
         "sandboxId": sandbox_id,
         "executionWorkspaceId": workspace_id,
         "remoteCwd": remote_cwd,
+        "remoteCwdFingerprintSha256": remote_cwd_fingerprint,
         "worktreePath": worktree_path,
         "worktreePathFingerprintSha256": worktree_path_fingerprint,
         "resourceFingerprintSha256": fingerprint,
@@ -3798,20 +5251,31 @@ def cleanup_paperclip_daytona(
         "paperclip": {
             "workspaceStatus": current_workspace.get("status"),
             "workspaceApiObserved": True,
-            "worktreeAbsent": True,
-            "filesystemAbsenceVerified": True,
+            "worktreeAbsent": current_workspace.get("worktreeAbsent"),
+            "filesystemAbsenceVerified": current_workspace.get(
+                "filesystemAbsenceVerified"
+            ),
             "filesystemProof": {
-                "method": "exact_path_bound_to_absent_daytona_sandbox",
+                "method": "canonical_paths_bound_to_released_workspace_and_absent_sandbox",
+                "workspaceFilesystemProbe": current_workspace.get("filesystemProbe"),
+                "remoteCwdFingerprintSha256": remote_cwd_fingerprint,
                 "worktreePathFingerprintSha256": worktree_path_fingerprint,
                 "sandboxId": sandbox_id,
                 "providerGetStatus": 404,
             },
             "environmentLeaseReleased": True,
+            "providerLeaseCleanup": current_lease_group,
+            "providerLeaseCleanups": current_lease_groups,
         },
         "daytona": {
-            "deleteRequested": delete_requested,
+            "deleteRequested": next(
+                row["deleteRequested"]
+                for row in provider_resources
+                if row["providerLeaseId"] == provider_lease_id
+            ),
             "providerGetStatus": 404,
             "sandboxAbsent": True,
+            "providerResources": provider_resources,
         },
     }
 
@@ -3833,8 +5297,41 @@ def verify_resource_absence(
         if isinstance(current.get("environment"), dict)
         else {}
     )
+    lease_group = (
+        current.get("environmentLeaseGroup")
+        if isinstance(current.get("environmentLeaseGroup"), dict)
+        else {}
+    )
+    lease_groups = (
+        current.get("environmentLeaseGroups")
+        if isinstance(current.get("environmentLeaseGroups"), list)
+        else []
+    )
+    recorded_provider_resources = (
+        (recorded.get("daytona") or {}).get("providerResources")
+        if isinstance(recorded.get("daytona"), dict)
+        and isinstance((recorded.get("daytona") or {}).get("providerResources"), list)
+        else []
+    )
+    recorded_provider_ids = [
+        str(row.get("providerLeaseId") or "")
+        for row in recorded_provider_resources
+        if isinstance(row, dict)
+    ]
+    recorded_paperclip = (
+        recorded.get("paperclip")
+        if isinstance(recorded.get("paperclip"), dict)
+        else {}
+    )
+    filesystem_proof = (
+        recorded_paperclip.get("filesystemProof")
+        if isinstance(recorded_paperclip.get("filesystemProof"), dict)
+        else {}
+    )
     sandbox_id = str(recorded.get("sandboxId") or "")
     worktree_path = str(recorded.get("worktreePath") or "")
+    remote_cwd = str(recorded.get("remoteCwd") or "")
+    remote_cwd_fingerprint = str(recorded.get("remoteCwdFingerprintSha256") or "")
     worktree_path_fingerprint = str(recorded.get("worktreePathFingerprintSha256") or "")
     expected_fingerprint = hashlib.sha256(
         "|".join(
@@ -3844,47 +5341,112 @@ def verify_resource_absence(
                 str(recorded.get("providerLeaseId") or ""),
                 sandbox_id,
                 str(recorded.get("executionWorkspaceId") or ""),
-                str(recorded.get("remoteCwd") or ""),
+                remote_cwd,
+                worktree_path,
             )
         ).encode()
     ).hexdigest()
     if (
         recorded.get("completed") is not True
+        or not recorded_provider_ids
+        or "" in recorded_provider_ids
+        or len(recorded_provider_ids) != len(recorded_provider_resources)
+        or len(recorded_provider_ids) != len(set(recorded_provider_ids))
         or recorded.get("resourceFingerprintSha256") != expected_fingerprint
         or workspace.get("id") != recorded.get("executionWorkspaceId")
         or environment.get("environmentLeaseId") != recorded.get("environmentLeaseId")
         or environment.get("providerLeaseId") != recorded.get("providerLeaseId")
+        or recorded.get("providerLeaseId") != sandbox_id
         or environment.get("sandboxId") != sandbox_id
-        or environment.get("remoteCwd") != recorded.get("remoteCwd")
+        or environment.get("executionWorkspaceId")
+        != recorded.get("executionWorkspaceId")
+        or environment.get("remoteCwd") != remote_cwd
+        or not re.fullmatch(
+            r"/home/daytona/paperclip-workspace(?:/[^/]+)*", remote_cwd
+        )
+        or ".." in Path(remote_cwd).parts
+        or not re.fullmatch(r"[0-9a-f]{64}", remote_cwd_fingerprint)
+        or remote_cwd_fingerprint != hashlib.sha256(remote_cwd.encode()).hexdigest()
         or workspace.get("status") != "archived"
         or workspace.get("worktreePath") != worktree_path
         or workspace.get("worktreePathFingerprintSha256") != worktree_path_fingerprint
-        or worktree_path != recorded.get("remoteCwd")
+        or not re.fullmatch(
+            r"/data/instances/default/projects/[^/]+/[^/]+/_default", worktree_path
+        )
+        or ".." in Path(worktree_path).parts
         or not re.fullmatch(r"[0-9a-f]{64}", worktree_path_fingerprint)
         or worktree_path_fingerprint
         != hashlib.sha256(worktree_path.encode()).hexdigest()
-        or (recorded.get("paperclip") or {}).get("workspaceApiObserved") is not True
-        or (recorded.get("paperclip") or {}).get("worktreeAbsent") is not True
-        or (recorded.get("paperclip") or {}).get("filesystemAbsenceVerified")
-        is not True
+        or recorded_paperclip.get("workspaceApiObserved") is not True
+        or recorded_paperclip.get("worktreeAbsent") is not True
+        or recorded_paperclip.get("filesystemAbsenceVerified") is not True
+        or filesystem_proof.get("workspaceFilesystemProbe") != "absent"
+        or filesystem_proof.get("remoteCwdFingerprintSha256")
+        != remote_cwd_fingerprint
+        or filesystem_proof.get("worktreePathFingerprintSha256")
+        != worktree_path_fingerprint
         or current.get("paperclipEnvironmentReleased") is not True
+        or workspace.get("filesystemProbe") != "absent"
+        or not valid_provider_lease_cleanup(
+            lease_group, str(recorded.get("providerLeaseId") or "")
+        )
+        or recorded_paperclip.get("providerLeaseCleanup") != lease_group
+        or recorded_paperclip.get("providerLeaseCleanups") != lease_groups
+        or {
+            str(row.get("providerLeaseId") or "")
+            for row in recorded_provider_resources
+            if isinstance(row, dict)
+        }
+        != {
+            str(group.get("providerLeaseId") or "")
+            for group in lease_groups
+            if isinstance(group, dict)
+        }
     ):
         raise CanaryError(
             "resource_cleanup_drift",
             "Paperclip workspace or lease cleanup no longer matches recorded evidence",
         )
-    daytona_status, _ = daytona_request(values, "GET", sandbox_id)
-    if daytona_status != 404:
-        raise CanaryError("resource_cleanup_drift", "recorded Daytona sandbox exists")
+    for row in recorded_provider_resources:
+        provider_id = str(row.get("providerLeaseId") or "")
+        group = next(
+            (
+                item
+                for item in lease_groups
+                if isinstance(item, dict)
+                and item.get("providerLeaseId") == provider_id
+            ),
+            None,
+        )
+        if (
+            not provider_id
+            or row.get("sandboxId") != provider_id
+            or row.get("providerLeaseCleanup") != group
+            or row.get("providerGetStatus") != 404
+            or row.get("sandboxAbsent") is not True
+        ):
+            raise CanaryError(
+                "resource_cleanup_drift",
+                "recorded provider-resource cleanup proof is incomplete",
+            )
+        daytona_status, _ = daytona_request(values, "GET", provider_id)
+        if daytona_status != 404:
+            raise CanaryError(
+                "resource_cleanup_drift", "recorded Daytona sandbox exists"
+            )
     return {
         "environmentLeaseId": recorded.get("environmentLeaseId"),
         "providerLeaseId": recorded.get("providerLeaseId"),
         "sandboxId": sandbox_id,
         "executionWorkspaceId": recorded.get("executionWorkspaceId"),
+        "remoteCwdFingerprintSha256": remote_cwd_fingerprint,
         "worktreePathFingerprintSha256": worktree_path_fingerprint,
         "resourceFingerprintSha256": recorded.get("resourceFingerprintSha256"),
         "paperclipWorktreeAbsent": True,
         "paperclipFilesystemAbsenceVerified": True,
+        "providerLeaseCleanup": lease_group,
+        "providerLeaseCleanups": lease_groups,
+        "providerResources": recorded_provider_resources,
         "daytonaSandboxAbsent": True,
     }
 
@@ -3893,36 +5455,90 @@ def paperclip_issue_id_from_execution(
     kestra: str,
     auth: dict[str, str],
     execution_id: str,
+    observed_execution: dict[str, Any] | None = None,
 ) -> str:
-    execution = kestra_request(
-        kestra,
-        auth,
-        "GET",
-        "/api/v1/main/executions/" + urllib.parse.quote(execution_id),
-    )
+    """Recover only the uniquely marker-bound native issue from a failed flow.
+
+    A Kestra failure can happen before ``poll_issue`` writes its output.  The
+    error handler and the earlier reconciliation response still contain the
+    same durable issue identity.  Looking at all three locations means the
+    outer controller can cancel and clean up a run that failed mid-flight,
+    without ever guessing or acting on an unrelated issue.
+    """
+    execution = observed_execution
+    if not isinstance(execution, dict) or execution.get("id") != execution_id:
+        execution = kestra_request(
+            kestra,
+            auth,
+            "GET",
+            "/api/v1/main/executions/" + urllib.parse.quote(execution_id),
+        )
     if not isinstance(execution, dict):
         raise CanaryError(
             "invalid_execution", "Kestra execution response is not an object"
         )
-    issue_id = ""
+    marker = f"[kestra:{execution_id}]"
+    candidates: set[str] = set()
+
+    def add_candidate(value: Any) -> None:
+        if isinstance(value, str) and SAFE_PAPERCLIP_ISSUE_ID.fullmatch(value):
+            candidates.add(value)
+
+    execution_outputs = (
+        execution.get("outputs") if isinstance(execution.get("outputs"), dict) else {}
+    )
+    add_candidate(execution_outputs.get("paperclip_issue_id"))
+
     for task_run in execution.get("taskRunList", []):
-        if not isinstance(task_run, dict) or task_run.get("taskId") != "poll_issue":
+        if not isinstance(task_run, dict):
             continue
         outputs = (
             task_run.get("outputs") if isinstance(task_run.get("outputs"), dict) else {}
         )
+        task_id = str(task_run.get("taskId") or "")
+        values = (
+            outputs.get("values") if isinstance(outputs.get("values"), dict) else {}
+        )
+        if task_id in {"failure_values", "error_summary"}:
+            add_candidate(values.get("paperclipIssueId"))
+        if task_id not in {"submit", "poll_issue", "issues_after"}:
+            continue
         body = outputs.get("body")
         if isinstance(body, str):
             try:
                 body = json.loads(body)
             except json.JSONDecodeError:
                 body = None
-        if isinstance(body, dict) and body.get("id"):
-            issue_id = str(body["id"])
-            break
-    if not issue_id:
+        if task_id in {"submit", "poll_issue"} and isinstance(body, dict):
+            add_candidate(body.get("id"))
+        elif task_id == "issues_after":
+            rows = (
+                body
+                if isinstance(body, list)
+                else body.get("data")
+                if isinstance(body, dict)
+                else []
+            )
+            marker_rows = [
+                row
+                for row in rows
+                if isinstance(row, dict) and marker in str(row.get("title") or "")
+            ]
+            if len(marker_rows) == 1:
+                add_candidate(marker_rows[0].get("id"))
+            elif len(marker_rows) > 1:
+                raise CanaryError(
+                    "paperclip_issue_identity_ambiguous",
+                    "Kestra reconciliation recorded duplicate durable issue markers",
+                )
+    if not candidates:
         return ""
-    return issue_id
+    if len(candidates) != 1:
+        raise CanaryError(
+            "paperclip_issue_identity_ambiguous",
+            "Kestra failure evidence identifies more than one native Paperclip issue",
+        )
+    return next(iter(candidates))
 
 
 def cleanup_nonterminal_paperclip_run(
@@ -3931,18 +5547,30 @@ def cleanup_nonterminal_paperclip_run(
     paperclip: str,
     values: dict[str, str],
     execution_id: str,
+    observed_execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    issue_id = paperclip_issue_id_from_execution(kestra, auth, execution_id)
+    issue_id = paperclip_issue_id_from_execution(
+        kestra, auth, execution_id, observed_execution
+    )
     if not issue_id:
-        return {"requested": False, "reason": "not_submitted"}
+        return {
+            "requested": False,
+            "reason": "not_submitted",
+            "executionId": execution_id,
+            "observedAt": utcnow(),
+        }
     run = native_issue_projection(paperclip, values, issue_id)
     if run.get("status") in {"succeeded", "failed", "cancelled", "timed_out"}:
         return {
             "requested": False,
             "paperclipIssueId": issue_id,
+            "statusBefore": run.get("status"),
             "statusAfter": run.get("status"),
+            "observedAt": utcnow(),
         }
     run_id = str((run.get("native") or {}).get("heartbeatRunId") or "")
+    requested_at = utcnow()
+    heartbeat_cancel_requested = False
     if run_id:
         paperclip_request(
             paperclip,
@@ -3951,6 +5579,7 @@ def cleanup_nonterminal_paperclip_run(
             f"/api/heartbeat-runs/{run_id}/cancel",
             body={},
         )
+        heartbeat_cancel_requested = True
     paperclip_request(
         paperclip,
         values,
@@ -3967,11 +5596,25 @@ def cleanup_nonterminal_paperclip_run(
         raise CanaryError(
             "paperclip_cancel_failed", "nonterminal Paperclip run was not cancelled"
         )
-    return {
+    proof = {
         "requested": True,
+        "reason": "nonterminal_failure_cleanup",
+        "executionId": execution_id,
         "paperclipIssueId": issue_id,
+        "statusBefore": run.get("status"),
+        "heartbeatRunIdSha256": (
+            hashlib.sha256(run_id.encode()).hexdigest() if run_id else None
+        ),
+        "heartbeatCancelRequested": heartbeat_cancel_requested,
+        "issueCancelRequested": True,
+        "requestedAt": requested_at,
         "statusAfter": after.get("status"),
+        "observedAt": utcnow(),
     }
+    proof["cancellationFingerprintSha256"] = hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return proof
 
 
 def daytona_profile_refs(details: dict[str, Any]) -> set[str]:
@@ -3999,14 +5642,19 @@ def daytona_profile_refs(details: dict[str, Any]) -> set[str]:
 
 
 def validated_daytona_runtime_evidence(
-    values: dict[str, str], required_profiles: set[str]
+    values: dict[str, str],
+    required_profiles: set[str],
+    *,
+    freshness_reference: datetime | None = None,
 ) -> dict[str, Any]:
     """Bind E2E to the fresh Paperclip verify and its immutable runtime proofs."""
     canonical_sha = sha256_file(PLATFORM_ENV)
     require_private_evidence_file(DAYTONA_VERIFY_EVIDENCE)
     verify = load_json(DAYTONA_VERIFY_EVIDENCE)
     require_fresh_timestamp(
-        verify.get("generatedAt"), "paperclip-daytona-verify.generatedAt"
+        verify.get("generatedAt"),
+        "paperclip-daytona-verify.generatedAt",
+        relative_to=freshness_reference,
     )
     details = verify.get("details") if isinstance(verify.get("details"), dict) else {}
     if (
@@ -4019,7 +5667,7 @@ def validated_daytona_runtime_evidence(
         or not FULL_SHA256.fullmatch(str(verify.get("producerSha256") or ""))
         or details.get("provider") != "daytona"
         or details.get("probe") != "passed"
-        or set(details.get("profileRefs") or []) != required_profiles
+        or not required_profiles <= set(details.get("profileRefs") or [])
         or not details.get("environmentId")
     ):
         raise CanaryError(
@@ -4054,7 +5702,7 @@ def validated_daytona_runtime_evidence(
             or document.get("kind") != kind
             or document.get("status") != "ready"
             or document.get("canonicalSourceSha256") != canonical_sha
-            or not FULL_SHA256.fullmatch(str(document.get("producerSha256") or ""))
+            or document.get("producerSha256") != sha256_file(DAYTONA_STEP_SOURCE)
             or parse_timestamp(document.get("generatedAt"), f"{path.name}.generatedAt")
             > datetime.now(timezone.utc)
         ):
@@ -4083,27 +5731,121 @@ def validated_daytona_runtime_evidence(
         ),
         None,
     )
+    lifecycle_harnesses = lifecycle.get("harnesses")
+    expected_lifecycle_versions = (
+        ("codex", values.get("MTE_CODEX_VERSION")),
+        ("claude", values.get("MTE_CLAUDE_CODE_VERSION")),
+        ("pi", values.get("MTE_PI_VERSION")),
+    )
+    valid_lifecycle_harnesses = (
+        isinstance(lifecycle_harnesses, list)
+        and len(lifecycle_harnesses) == 3
+        and all(
+            isinstance(row, dict)
+            and set(row) == {"name", "commandPath", "realpath", "versionOutput"}
+            and row.get("name") == name
+            and row.get("commandPath") == f"/usr/local/bin/{name}"
+            and str(row.get("realpath") or "").startswith(
+                "/opt/mte-harness/node_modules/"
+            )
+            and normalized_harness_version(name, row.get("versionOutput"))
+            == version
+            for row, (name, version) in zip(
+                lifecycle_harnesses, expected_lifecycle_versions
+            )
+        )
+    )
+    expected_lifecycle_keys = {
+        "apiVersion",
+        "kind",
+        "status",
+        "generatedAt",
+        "producerSha256",
+        "canonicalSourceSha256",
+        "provider",
+        "target",
+        "snapshot",
+        "sandboxId",
+        "workspace",
+        "harnesses",
+        "credentialFileProbe",
+        "credentialEnvProbe",
+        "resources",
+        "credentialsBakedIntoImage",
+        "states",
+        "cleanupDeleted",
+        "delete",
+    }
+    expected_image_keys = {
+        "apiVersion",
+        "kind",
+        "status",
+        "generatedAt",
+        "producerSha256",
+        "canonicalSourceSha256",
+        "snapshotContractHash",
+        "sandboxImage",
+        "source",
+        "snapshots",
+        "resources",
+        "harnessVersions",
+        "credentialsBakedIntoImage",
+    }
     if (
-        len(snapshots) != 2
+        set(images) != expected_image_keys
+        or len(snapshots) != 2
         or not isinstance(snapshot, dict)
         or snapshot.get("state") != "active"
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(snapshot.get("digest") or ""))
+        or snapshot.get("ref") != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+        or images.get("sandboxImage") != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+        or not re.fullmatch(
+            r"[^\s@]+@sha256:[0-9a-f]{64}", str(images.get("sandboxImage") or "")
+        )
+        or images.get("source")
+        != {
+            "url": values.get("MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL"),
+            "revision": values.get("MTE_DAYTONA_SANDBOX_IMAGE_REVISION"),
+        }
+        or images.get("harnessVersions")
+        != {
+            "codex": values.get("MTE_CODEX_VERSION"),
+            "claudeCode": values.get("MTE_CLAUDE_CODE_VERSION"),
+            "pi": values.get("MTE_PI_VERSION"),
+        }
+        or images.get("snapshotContractHash")
+        != hashlib.sha256(
+            json.dumps(
+                {
+                    "sandboxImage": images.get("sandboxImage"),
+                    "sandboxImageRevision": values.get(
+                        "MTE_DAYTONA_SANDBOX_IMAGE_REVISION"
+                    ),
+                    "resources": images.get("resources"),
+                    "harnessVersions": images.get("harnessVersions"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         or images.get("credentialsBakedIntoImage") is not False
+        or set(lifecycle) != expected_lifecycle_keys
         or lifecycle.get("snapshot") != coding_snapshot
+        or lifecycle.get("workspace") != "/home/daytona/paperclip-workspace"
+        or not valid_lifecycle_harnesses
+        or [
+            (row.get("phase"), row.get("state"))
+            for row in lifecycle.get("states", [])
+            if isinstance(row, dict)
+        ]
+        != [("create", "started"), ("execute", "passed"), ("delete", "deleted")]
         or lifecycle.get("cleanupDeleted") is not True
         or (lifecycle.get("delete") or {}).get("getAfterDeleteStatus") != 404
-        or (lifecycle.get("fileRoundTrip") or {}).get("verified") is not True
-        or (lifecycle.get("persistence") or {}).get("verified") is not True
         or (lifecycle.get("credentialFileProbe") or {}).get("credentialFree")
         is not True
-        or (lifecycle.get("github") or {}).get("cliVersion")
-        != values.get("MTE_GITHUB_CLI_VERSION")
-        or (lifecycle.get("github") or {}).get("authentication")
-        != "GH_TOKEN-runtime-env"
-        or (lifecycle.get("github") or {}).get("gitCredentialHelper")
-        != "gh auth git-credential"
-        or (lifecycle.get("github") or {}).get("tokenInRemoteUrl") is not False
-        or (lifecycle.get("github") or {}).get("credentialFilePersisted") is not False
+        or (lifecycle.get("credentialFileProbe") or {}).get("foundPaths") != []
+        or (lifecycle.get("credentialEnvProbe") or {}).get("credentialFree") is not True
+        or (lifecycle.get("credentialEnvProbe") or {}).get("foundNames") != []
+        or (lifecycle.get("resources") or {}).get("equal") is not True
     ):
         raise CanaryError(
             "daytona_runtime_contract_invalid",
@@ -4114,7 +5856,7 @@ def validated_daytona_runtime_evidence(
         "verifyEvidenceSha256": sha256_file(DAYTONA_VERIFY_EVIDENCE),
         "environmentId": details.get("environmentId"),
         "snapshot": coding_snapshot,
-        "snapshotDigest": snapshot.get("digest"),
+        "snapshotRef": snapshot.get("ref"),
         "runtimeEvidence": summaries,
         "lifecycleDeleteStatus": 404,
         "credentialsBakedIntoImage": False,
@@ -4157,6 +5899,9 @@ def preflight(
             "requested profiles are absent from the canonical catalog: "
             + ", ".join(missing_catalog_profiles),
         )
+    validate_r1_profile_contracts(
+        list(e2e["profiles"]), e2e["profileContracts"], catalog
+    )
     tool_access_drift = []
     for ref in sorted(required_profiles):
         access = (
@@ -4178,7 +5923,8 @@ def preflight(
                     "canaryTool",
                 )
             )
-            or not endpoint.startswith("http://172.20.0.1:")
+            or urllib.parse.urlparse(endpoint).hostname
+            != values.get("MTE_AGENT_GATEWAY_HOST", "")
             or not endpoint.endswith("/mcp")
             or not values.get(credential_ref, "")
         ):
@@ -4203,18 +5949,6 @@ def preflight(
             "profile_adapter_drift",
             "requested profile adapter types do not match the acceptance contract: "
             + ", ".join(sorted(adapter_drift)),
-        )
-    implicit_routes = [
-        ref
-        for ref, contract in e2e["profileContracts"].items()
-        if contract["requireExplicitProvider"]
-        and (not catalog[ref].get("provider") or not catalog[ref].get("model"))
-    ]
-    if implicit_routes:
-        raise CanaryError(
-            "profile_route_implicit",
-            "profiles requiring explicit provider and model are incomplete: "
-            + ", ".join(sorted(implicit_routes)),
         )
     evidenced_profiles = daytona_profile_refs(details)
     if (
@@ -4279,8 +6013,10 @@ def preflight(
     _, router_health = request_json(router + "/api/health")
     if not isinstance(router_health, dict):
         raise CanaryError("router_not_ready", "9router health response is invalid")
+    environment_id = str(details.get("environmentId") or "")
     return {
-        "daytonaEnvironmentId": details.get("environmentId"),
+        "daytonaEnvironmentId": environment_id,
+        "daytonaE2EAdmission": admit_single_coding_sandbox(values, environment_id),
         "daytonaAgentId": details.get("agentId"),
         "daytonaPlugin": details.get("plugin"),
         "daytonaRuntime": daytona_runtime,
@@ -4292,10 +6028,11 @@ def preflight(
         "profileAdapters": {
             ref: catalog[ref]["adapter"] for ref in sorted(required_profiles)
         },
-        "explicitProviders": {
-            ref: catalog[ref]["provider"]
-            for ref, contract in e2e["profileContracts"].items()
-            if contract["requireExplicitProvider"]
+        "profileProtocols": {
+            ref: catalog[ref]["protocol"] for ref in sorted(required_profiles)
+        },
+        "routerProviders": {
+            ref: catalog[ref]["routerProvider"] for ref in sorted(required_profiles)
         },
         "kestraApi": "ready",
         "routerHealth": router_health.get("status", "ok"),
@@ -4373,23 +6110,56 @@ def run_apply() -> dict[str, Any]:
                 str(profile),
                 catalog[str(profile)]["model"],
             )
-            created = trigger_flow(kestra, auth, e2e, str(profile))
-            execution_id = str(created["id"])
-            branch = f"agent/paperclip-e2e-{execution_id}"
+            correlation_id = "mte-e2e-" + secrets.token_hex(16)
+            correlation_sha = hashlib.sha256(correlation_id.encode()).hexdigest()
+            execution_id = ""
+            branch = ""
             pull: dict[str, Any] | None = None
             paperclip_issue_id = ""
+            raw_execution: dict[str, Any] | None = None
             run_error: BaseException | None = None
             cleanup_error: BaseException | None = None
+            trigger_recovery: dict[str, Any] = {
+                "status": "not-needed",
+                "correlationSha256": correlation_sha,
+                "searchAttempts": 0,
+                "executionId": None,
+            }
+            try:
+                created = trigger_flow(kestra, auth, e2e, str(profile), correlation_id)
+                execution_id = str(created["id"])
+                branch = f"agent/paperclip-e2e-{execution_id}"
+                trigger_recovery["executionId"] = execution_id
+            except BaseException as exc:
+                run_error = exc
+                try:
+                    recovered, trigger_recovery = discover_execution_by_correlation(
+                        kestra, auth, correlation_id
+                    )
+                    if recovered is not None:
+                        execution_id = str(recovered["id"])
+                        branch = f"agent/paperclip-e2e-{execution_id}"
+                except BaseException as recovery_exc:
+                    cleanup_error = recovery_exc
             payload["current"] = {
                 "profile": profile,
-                "executionId": execution_id,
-                "branch": branch,
+                "executionId": execution_id or None,
+                "branch": branch or None,
+                "triggerCorrelationSha256": correlation_sha,
+                "triggerRecovery": trigger_recovery,
             }
             scan_for_secrets(payload, values)
             atomic_json(EVIDENCE, payload)
             try:
+                if run_error is not None:
+                    raise run_error
                 raw_execution = poll_execution(kestra, auth, execution_id)
                 execution = execution_summary(raw_execution)
+                if execution.get("state") != "SUCCESS":
+                    paperclip_issue_id = paperclip_issue_id_from_execution(
+                        kestra, auth, execution_id, raw_execution
+                    )
+                    raise failed_execution_error(raw_execution)
                 outputs = execution.get("outputs", {})
                 paperclip_issue_id = str(outputs.get("paperclip_issue_id", ""))
                 if not paperclip_issue_id:
@@ -4480,13 +6250,14 @@ def run_apply() -> dict[str, Any]:
                     str(e2e["profileContracts"][str(profile)]["nativeAdapter"]),
                     catalog[str(profile)]["model"],
                     router,
+                    f"kestra:{execution_id}",
                 )
                 toolhive_semantic = validated_toolhive_profile(
                     document,
                     values,
                     catalog[str(profile)],
                     profile=str(profile),
-                    normalized_run_id=paperclip_issue_id,
+                    paperclip_issue_id=paperclip_issue_id,
                 )
 
                 native = (
@@ -4564,11 +6335,27 @@ def run_apply() -> dict[str, Any]:
             except BaseException as exc:
                 run_error = exc
             finally:
+                kestra_cleanup: dict[str, Any] = {
+                    "requested": False,
+                    "reason": "run_succeeded" if run_error is None else "no_execution",
+                }
+                if run_error is not None and execution_id:
+                    try:
+                        kestra_cleanup = cleanup_kestra_execution(
+                            kestra, auth, execution_id, raw_execution
+                        )
+                    except BaseException as exc:
+                        cleanup_error = cleanup_error or exc
+                        kestra_cleanup = {
+                            "requested": True,
+                            "completed": False,
+                            "executionId": execution_id,
+                        }
                 paperclip_cleanup: dict[str, Any] = {
                     "requested": False,
-                    "reason": "run_succeeded",
+                    "reason": "run_succeeded" if run_error is None else "no_execution",
                 }
-                if run_error is not None:
+                if run_error is not None and execution_id:
                     try:
                         paperclip_cleanup = cleanup_nonterminal_paperclip_run(
                             kestra,
@@ -4576,29 +6363,58 @@ def run_apply() -> dict[str, Any]:
                             str(e2e["paperclipBaseUrl"]).rstrip("/"),
                             values,
                             execution_id,
+                            raw_execution,
                         )
                     except BaseException as exc:
                         cleanup_error = cleanup_error or exc
                         paperclip_cleanup = {"requested": True, "completed": False}
                 if e2e.get("cleanup", True):
-                    if not paperclip_issue_id:
+                    if not paperclip_issue_id and execution_id:
                         try:
                             paperclip_issue_id = paperclip_issue_id_from_execution(
-                                kestra, auth, execution_id
+                                kestra, auth, execution_id, raw_execution
                             )
                         except BaseException as exc:
                             cleanup_error = cleanup_error or exc
                     try:
-                        if not paperclip_issue_id:
+                        if (
+                            not execution_id
+                            and trigger_recovery.get("status") == "absent"
+                        ):
+                            resources_cleanup = {
+                                "requested": False,
+                                "completed": True,
+                                "reason": "trigger_execution_absent",
+                                "paperclipIssueId": None,
+                            }
+                        elif (
+                            not paperclip_issue_id
+                            and paperclip_cleanup.get("reason") == "not_submitted"
+                            and kestra_cleanup.get("completed") is True
+                        ):
+                            resources_cleanup = {
+                                "requested": False,
+                                "completed": True,
+                                "reason": "paperclip_issue_not_submitted",
+                                "paperclipIssueId": None,
+                            }
+                        elif not paperclip_issue_id:
                             raise CanaryError(
                                 "resource_cleanup_unaddressable",
                                 "submitted issue id is unavailable for resource cleanup",
                             )
-                        resources_cleanup = cleanup_paperclip_daytona(
-                            str(e2e["paperclipBaseUrl"]).rstrip("/"),
-                            values,
-                            paperclip_issue_id,
-                        )
+                        else:
+                            resources_cleanup = cleanup_paperclip_daytona(
+                                str(e2e["paperclipBaseUrl"]).rstrip("/"),
+                                values,
+                                paperclip_issue_id,
+                            )
+                            resources_cleanup["liveAbsence"] = verify_resource_absence(
+                                str(e2e["paperclipBaseUrl"]).rstrip("/"),
+                                values,
+                                paperclip_issue_id,
+                                resources_cleanup,
+                            )
                     except BaseException as exc:
                         cleanup_error = cleanup_error or exc
                         resources_cleanup = {
@@ -4607,9 +6423,25 @@ def run_apply() -> dict[str, Any]:
                             "paperclipIssueId": paperclip_issue_id or None,
                         }
                     try:
-                        cleanup = cleanup_github(
-                            e2e, values["GITHUB_TOKEN"], branch, pull
-                        )
+                        if (
+                            not execution_id
+                            and trigger_recovery.get("status") == "absent"
+                        ):
+                            cleanup = {
+                                "requested": False,
+                                "pullRequestNumber": None,
+                                "pullRequestGetStatus": None,
+                                "pullRequestState": "absent",
+                                "pullRequestClosed": True,
+                                "branchRef": None,
+                                "branchGetStatus": None,
+                                "branchDeleted": True,
+                                "reason": "trigger_execution_absent",
+                            }
+                        else:
+                            cleanup = cleanup_github(
+                                e2e, values["GITHUB_TOKEN"], branch, pull
+                            )
                     except BaseException as exc:
                         cleanup_error = exc
                         cleanup = {
@@ -4621,6 +6453,8 @@ def run_apply() -> dict[str, Any]:
                         {
                             "profile": profile,
                             "executionId": execution_id,
+                            "triggerRecovery": trigger_recovery,
+                            "kestra": kestra_cleanup,
                             "paperclip": paperclip_cleanup,
                             "resources": resources_cleanup,
                             **cleanup,
@@ -4628,9 +6462,20 @@ def run_apply() -> dict[str, Any]:
                                 cleanup.get("pullRequestClosed") is True
                                 and cleanup.get("branchDeleted") is True
                                 and resources_cleanup.get("completed") is True
+                                and (
+                                    run_error is None
+                                    or kestra_cleanup.get("completed") is True
+                                )
                             ),
                         }
                     )
+                    if run_error is not None:
+                        payload["cleanup"]["completed"] = bool(
+                            payload["cleanup"]["runs"]
+                        ) and all(
+                            row.get("completed") is True
+                            for row in payload["cleanup"]["runs"]
+                        )
                 payload.pop("current", None)
                 scan_for_secrets(payload, values)
                 atomic_json(EVIDENCE, payload)
@@ -4644,6 +6489,7 @@ def run_apply() -> dict[str, Any]:
                 e2e,
                 values,
                 str(preflight_result.get("daytonaEnvironmentId") or ""),
+                payload["cleanup"]["runs"],
             )
         payload["cleanup"]["completed"] = not e2e.get("cleanup", True) or (
             len(payload["cleanup"]["runs"]) == len(e2e["profiles"])
@@ -4714,27 +6560,30 @@ def run_apply() -> dict[str, Any]:
         ):
             raise CanaryError(
                 "semantic_check_failed",
-                "server-attributed-router did not prove three distinct sequential native routes",
+                "server-attributed-router did not prove every R1 9router MiniMax route",
             )
         payload["semanticChecks"]["server-attributed-router"]["status"] = "passed"
         payload.update({"status": "passed", "finishedAt": utcnow()})
         scan_for_secrets(payload, values)
         atomic_json(EVIDENCE, payload)
+        write_portable_evidence_bundle(values)
     except BaseException as exc:
+        failure: dict[str, Any] = {
+            "code": exc.code if isinstance(exc, CanaryError) else "unexpected_error",
+            "type": type(exc).__name__,
+        }
+        if isinstance(exc, CanaryError) and isinstance(exc.evidence, dict):
+            failure["evidence"] = exc.evidence
         payload.update(
             {
                 "status": "failed",
                 "finishedAt": utcnow(),
-                "failure": {
-                    "code": exc.code
-                    if isinstance(exc, CanaryError)
-                    else "unexpected_error",
-                    "type": type(exc).__name__,
-                },
+                "failure": failure,
             }
         )
         scan_for_secrets(payload, values)
         atomic_json(EVIDENCE, payload)
+        write_portable_evidence_bundle(values)
         raise
     return payload
 
@@ -4743,7 +6592,16 @@ def verify_existing() -> dict[str, Any]:
     config, e2e, values = e2e_context()
     require_private_evidence_file(EVIDENCE)
     evidence = load_json(EVIDENCE)
-    require_fresh_timestamp(evidence.get("finishedAt"), "e2e.finishedAt")
+    finished_at = require_fresh_timestamp(evidence.get("finishedAt"), "e2e.finishedAt")
+    started_at = parse_timestamp(evidence.get("startedAt"), "e2e.startedAt")
+    if (
+        finished_at <= started_at
+        or (finished_at - started_at).total_seconds() > MAX_TRIPLE_RUN_DURATION_SECONDS
+    ):
+        raise CanaryError(
+            "evidence_duration_invalid",
+            "E2E evidence duration exceeds the bounded R1 run window",
+        )
     subject_sha = sha256_file(EVIDENCE)
     producer_sha = sha256_file(Path(__file__))
     canonical_sha = sha256_file(PLATFORM_ENV)
@@ -4787,19 +6645,19 @@ def verify_existing() -> dict[str, Any]:
     ):
         if recorded_sources.get(key) != current_sources.get(key):
             raise CanaryError("source_drift", f"canonical source hash changed: {key}")
-    if recorded_sources.get("deploymentRelease") != current_sources.get(
-        "deploymentRelease"
-    ):
+    if recorded_sources.get("directSync") != current_sources.get("directSync"):
         raise CanaryError(
-            "deployment_release_drift",
-            "E2E evidence is not bound to the current release, activation, and manifest",
+            "direct_sync_source_drift",
+            "E2E evidence is not bound to the current direct-sync source contract",
         )
 
     kestra = str(e2e["kestraBaseUrl"]).rstrip("/")
     paperclip_base = str(e2e["paperclipBaseUrl"]).rstrip("/")
     catalog = profile_catalog()
     current_daytona_runtime = validated_daytona_runtime_evidence(
-        values, set(str(profile) for profile in e2e["profiles"])
+        values,
+        set(str(profile) for profile in e2e["profiles"]),
+        freshness_reference=started_at,
     )
     if (evidence.get("preflight") or {}).get(
         "daytonaRuntime"
@@ -4893,6 +6751,7 @@ def verify_existing() -> dict[str, Any]:
         e2e,
         values,
         str((evidence.get("preflight") or {}).get("daytonaEnvironmentId") or ""),
+        cleanup_rows,
     )
     if recorded_global_absence != current_global_absence:
         raise CanaryError(
@@ -5072,7 +6931,7 @@ def verify_existing() -> dict[str, Any]:
             values,
             catalog[profile],
             profile=profile,
-            normalized_run_id=issue_id,
+            paperclip_issue_id=issue_id,
         )
         verified_toolhive_rows.append(toolhive_semantic)
         server_attribution = router_server_attribution(
@@ -5081,6 +6940,7 @@ def verify_existing() -> dict[str, Any]:
             str(e2e["profileContracts"][profile]["nativeAdapter"]),
             catalog[profile]["model"],
             router,
+            f"kestra:{execution_id}",
         )
         stored_semantic = (
             (stored.get("semanticChecks") or {}).get("harness-scoped-router-auth")
@@ -5164,6 +7024,8 @@ def verify_existing() -> dict[str, Any]:
             != workspace_identity.get("executionWorkspaceId")
             or resources_recorded.get("remoteCwd")
             != workspace_identity.get("remoteCwd")
+            or resources_recorded.get("worktreePath")
+            != workspace_identity.get("worktreePath")
         ):
             raise CanaryError(
                 "resource_cleanup_identity_drift",
@@ -5182,24 +7044,28 @@ def verify_existing() -> dict[str, Any]:
             if status != 404:
                 raise CanaryError("cleanup_drift", "canary branch still exists")
         verified_runs.append(
-            {
-                "profile": stored.get("profile"),
-                "executionId": execution_id,
-                "paperclipIssueId": issue_id,
-                "pullRequestUrl": pull.get("html_url"),
-                "commitSha": sha,
-                "checkConclusions": [row.get("conclusion") for row in checks],
-                "claimLeaseId": claim.get("leaseId"),
-                "semanticCheck": semantic.get("check"),
-                "toolhiveSemanticCheck": toolhive_semantic.get("check"),
-                "routerServerRequestIds": server_attribution.get("requestIds"),
-                "routerRequestBinding": server_attribution.get("requestBinding"),
-                "kestraProof": kestra_proof,
-                "githubProof": github_live_proof,
-                "workspaceIdentity": workspace_identity,
-                "workspaceOperation": workspace_operation,
-                "resourceCleanup": resources_verified,
-            }
+            verified_run_summary(
+                profile=str(stored.get("profile") or ""),
+                execution_id=execution_id,
+                paperclip_issue_id=issue_id,
+                pull_request_url=str(pull.get("html_url") or ""),
+                commit_sha=sha,
+                check_conclusions=[str(row.get("conclusion") or "") for row in checks],
+                claim_lease_id=str(claim.get("leaseId") or ""),
+                semantic_check=str(semantic.get("check") or ""),
+                toolhive_semantic_check=str(toolhive_semantic.get("check") or ""),
+                router_server_request_ids=list(
+                    server_attribution.get("requestIds") or []
+                ),
+                router_request_binding=dict(
+                    server_attribution.get("requestBinding") or {}
+                ),
+                kestra_proof=kestra_proof,
+                github_proof=github_live_proof,
+                workspace_identity=workspace_identity,
+                workspace_operation=workspace_operation,
+                resource_cleanup=resources_verified,
+            )
         )
     verified_toolhive_audit = verify_stored_toolhive_gateway_audit(
         evidence.get("toolhiveGatewayAudit"), values, verified_toolhive_rows
@@ -5212,7 +7078,7 @@ def verify_existing() -> dict[str, Any]:
             "cross_run_identity_drift",
             "stored cross-run identity differs from the current strict validation",
         )
-    return write_verification_attestation(
+    verification = write_verification_attestation(
         status="passed",
         subject_sha=subject_sha,
         canonical_sha=canonical_sha,
@@ -5225,6 +7091,8 @@ def verify_existing() -> dict[str, Any]:
         apply_finished_at=str(evidence.get("finishedAt") or ""),
         cross_run_identity=cross_run_identity,
     )
+    write_portable_evidence_bundle(values)
+    return verification
 
 
 def status_existing() -> dict[str, Any]:

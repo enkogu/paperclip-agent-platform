@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 680" role="img" aria-labelledby="title description">
+  <title id="title">Paperclip Agent Platform architecture</title>
+  <desc id="description">Kestra and Hermes send work to Paperclip, running from an immutable digest-pinned image. Paperclip starts isolated Daytona workspaces running Codex, Claude Code, or Pi. Harness profiles use 9Router to reach MiniMax and use profile-private ToolHive MCP tools. PostgreSQL is the canonical data authority; its leased outbox connector writes the replaceable Notion projection. Cloudflare Access is per declared route, observability is internal, and recovery is deliberately bounded to logical PostgreSQL backups.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#4c5965"/></marker>
+    <marker id="arrow-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7656a6"/></marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .zone { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .node { fill: #ffffff; stroke: #64748b; stroke-width: 2; }
+      .control { fill: #fff7ed; stroke: #d97706; }
+      .runtime { fill: #f0fdf4; stroke: #15803d; }
+      .tools { fill: #eff6ff; stroke: #2563eb; }
+      .data { fill: #faf5ff; stroke: #7e22ce; }
+      .ops { fill: #f1f5f9; stroke: #475569; }
+      .arrow { fill: none; stroke: #4c5965; stroke-width: 2.5; marker-end: url(#arrow); }
+      .data-arrow { fill: none; stroke: #7656a6; stroke-width: 2.5; marker-end: url(#arrow-data); }
+      .dashed { stroke-dasharray: 8 6; }
+      .heading { fill: #0f172a; font: 700 22px Arial, sans-serif; }
+      .zone-label { fill: #475569; font: 700 12px Arial, sans-serif; letter-spacing: 1.6px; }
+      .node-title { fill: #0f172a; font: 700 16px Arial, sans-serif; }
+      .node-text { fill: #475569; font: 13px Arial, sans-serif; }
+      .small { fill: #64748b; font: 12px Arial, sans-serif; }
+      .caption { fill: #334155; font: 14px Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="680" rx="20"/>
+  <text class="heading" x="48" y="50">Paperclip Agent Platform: ownership and data flow</text>
+
+  <rect class="zone" x="38" y="82" width="300" height="330" rx="16"/>
+  <text class="zone-label" x="62" y="112">CONTROL PLANE</text>
+  <rect class="node control" x="62" y="138" width="112" height="78" rx="12"/>
+  <text class="node-title" x="118" y="169" text-anchor="middle">Kestra</text>
+  <text class="node-text" x="118" y="191" text-anchor="middle">schedule · retry</text>
+  <rect class="node control" x="202" y="138" width="112" height="78" rx="12"/>
+  <text class="node-title" x="258" y="169" text-anchor="middle">Hermes</text>
+  <text class="node-text" x="258" y="191" text-anchor="middle">operator gateway</text>
+  <rect class="node control" x="99" y="278" width="178" height="92" rx="12"/>
+  <text class="node-title" x="188" y="314" text-anchor="middle">Paperclip</text>
+  <text class="node-text" x="188" y="333" text-anchor="middle">Issues · heartbeats</text>
+  <text class="node-text" x="188" y="353" text-anchor="middle">digest-pinned runtime</text>
+
+  <path class="arrow" d="M118 216 V258 H160 V278"/>
+  <path class="arrow" d="M258 216 V258 H216 V278"/>
+
+  <rect class="zone" x="370" y="82" width="360" height="330" rx="16"/>
+  <text class="zone-label" x="394" y="112">ISOLATED EXECUTION</text>
+  <rect class="node runtime" x="468" y="140" width="164" height="78" rx="12"/>
+  <text class="node-title" x="550" y="171" text-anchor="middle">Daytona</text>
+  <text class="node-text" x="550" y="193" text-anchor="middle">workspace boundary</text>
+  <rect class="node runtime" x="400" y="284" width="300" height="86" rx="12"/>
+  <text class="node-title" x="550" y="318" text-anchor="middle">Codex · Claude Code · Pi</text>
+  <text class="node-text" x="550" y="341" text-anchor="middle">native profile harnesses</text>
+  <path class="arrow" d="M277 324 H424 V179 H468"/>
+  <path class="arrow" d="M550 218 V284"/>
+
+  <rect class="zone" x="762" y="82" width="400" height="330" rx="16"/>
+  <text class="zone-label" x="786" y="112">TOOLS AND EXTERNAL WORK</text>
+  <rect class="node tools" x="786" y="142" width="112" height="76" rx="12"/>
+  <text class="node-title" x="842" y="172" text-anchor="middle">9Router</text>
+  <text class="node-text" x="842" y="193" text-anchor="middle">route → MiniMax</text>
+  <rect class="node tools" x="916" y="142" width="112" height="76" rx="12"/>
+  <text class="node-title" x="972" y="172" text-anchor="middle">ToolHive</text>
+  <text class="node-text" x="972" y="193" text-anchor="middle">private MCP</text>
+  <rect class="node tools" x="1046" y="142" width="92" height="76" rx="12"/>
+  <text class="node-title" x="1092" y="172" text-anchor="middle">GitHub</text>
+  <text class="node-text" x="1092" y="193" text-anchor="middle">PR/check</text>
+  <rect class="node" x="816" y="285" width="268" height="72" rx="12"/>
+  <text class="node-title" x="950" y="315" text-anchor="middle">LLMs and reviewed MCP tools</text>
+  <text class="node-text" x="950" y="337" text-anchor="middle">profile-scoped credentials only</text>
+  <path class="arrow" d="M700 309 H750 V180 H786"/>
+  <path class="arrow" d="M700 326 H730 V180 H916"/>
+  <path class="arrow" d="M700 343 H744 V180 H1046"/>
+  <path class="arrow dashed" d="M842 218 V264 H908 V285"/>
+  <path class="arrow dashed" d="M972 218 V264 H992 V285"/>
+
+  <rect class="zone" x="38" y="446" width="692" height="184" rx="16"/>
+  <text class="zone-label" x="62" y="477">CANONICAL DATA AND PROJECTION</text>
+  <rect class="node data" x="62" y="506" width="130" height="80" rx="12"/>
+  <text class="node-title" x="127" y="537" text-anchor="middle">PostgreSQL</text>
+  <text class="node-text" x="127" y="559" text-anchor="middle">authority</text>
+  <rect class="node data" x="220" y="506" width="130" height="80" rx="12"/>
+  <text class="node-title" x="285" y="537" text-anchor="middle">Outbox</text>
+  <text class="node-text" x="285" y="559" text-anchor="middle">leased connector</text>
+  <rect class="node data" x="378" y="506" width="130" height="80" rx="12"/>
+  <text class="node-title" x="443" y="537" text-anchor="middle">Notion</text>
+  <text class="node-text" x="443" y="559" text-anchor="middle">replaceable projection</text>
+  <rect class="node data" x="536" y="506" width="130" height="80" rx="12"/>
+  <text class="node-title" x="601" y="537" text-anchor="middle">PostgREST</text>
+  <text class="node-text" x="601" y="559" text-anchor="middle">scoped access</text>
+  <path class="data-arrow" d="M192 546 H220"/>
+  <path class="data-arrow" d="M350 546 H378"/>
+  <path class="data-arrow dashed" d="M192 576 H516 V546 H536"/>
+  <path class="data-arrow dashed" d="M188 370 V470 H145 V506"/>
+  <text class="small" x="270" y="611">Canonical IDs, revisions, and hashes stay in PostgreSQL.</text>
+  <text class="small" x="270" y="627">Recovery: logical PostgreSQL backups only.</text>
+
+  <rect class="zone" x="762" y="446" width="400" height="184" rx="16"/>
+  <text class="zone-label" x="786" y="477">EDGE AND OBSERVABILITY</text>
+  <rect class="node ops" x="786" y="506" width="154" height="80" rx="12"/>
+  <text class="node-title" x="863" y="537" text-anchor="middle">Cloudflare</text>
+  <text class="node-text" x="863" y="555" text-anchor="middle">Tunnel · per-route</text>
+  <text class="node-text" x="863" y="574" text-anchor="middle">Access policy</text>
+  <rect class="node ops" x="964" y="506" width="174" height="80" rx="12"/>
+  <text class="node-title" x="1051" y="537" text-anchor="middle">Observability</text>
+  <text class="node-text" x="1051" y="559" text-anchor="middle">OTel · Victoria* · Grafana</text>
+  <path class="arrow dashed" d="M314 177 H786"/>
+  <path class="arrow dashed" d="M632 330 H700 V546 H964"/>
+  <text class="caption" x="962" y="653" text-anchor="middle">Declared routes get separate Access policy.</text>
+  <text class="caption" x="962" y="674" text-anchor="middle">Internal APIs stay private.</text>
+</svg>

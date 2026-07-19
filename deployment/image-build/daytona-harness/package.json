@@ -1,0 +1,17 @@
+{
+  "name": "mte-daytona-harness-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.209",
+    "@earendil-works/pi-coding-agent": "0.80.7",
+    "@openai/codex": "0.144.4",
+    "@upstash/context7-pi": "0.1.1"
+  }
+}

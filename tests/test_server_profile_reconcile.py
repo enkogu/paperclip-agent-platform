@@ -82,6 +82,21 @@ class ProfileReconcileTests(unittest.TestCase):
         )
         self.assertTrue(all(len(row["bundleSha256"]) == 64 for row in specs))
 
+    def test_failed_payload_exposes_only_safe_symbolic_reason_code(self):
+        symbolic = self.module.failed_payload(
+            "ProfileReconcileEvidence",
+            RuntimeError("paperclip_profile_catalog_ref_drift"),
+        )
+        unsafe = self.module.failed_payload(
+            "ProfileReconcileEvidence",
+            RuntimeError("request failed with token secret-value"),
+        )
+        self.assertEqual(
+            symbolic["errorCode"], "paperclip_profile_catalog_ref_drift"
+        )
+        self.assertEqual(unsafe["errorCode"], "unclassified_failure")
+        self.assertNotIn("secret-value", json.dumps(unsafe))
+
     def test_bundle_identity_ignores_unrelated_values_but_tracks_notion_rotation(self):
         baseline = self.module.desired(self.rows, self.values, self.policy)
         unrelated = dict(self.values)
@@ -174,9 +189,14 @@ class ProfileReconcileTests(unittest.TestCase):
 
     def test_profile_and_kestra_producers_build_identical_catalog_document(self):
         kestra = load_kestra_module()
+        source_catalog = yaml.safe_load(
+            (ROOT / "config/profiles/catalog.yaml").read_text()
+        )
         catalog = {
             "apiVersion": "micro-task-engine/v1alpha1",
             "kind": "PaperclipProfileCatalog",
+            "extensions": source_catalog["extensions"],
+            "skillPackages": source_catalog["skillPackages"],
             "profiles": self.rows,
         }
         runtime_catalog = rendered_catalog(catalog)

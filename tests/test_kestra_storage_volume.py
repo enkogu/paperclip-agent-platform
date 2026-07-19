@@ -18,6 +18,7 @@ def test_kestra_storage_is_owned_before_runtime_starts():
 
     assert init["image"] == "${MTE_KESTRA_KESTRA_IMAGE:?required}"
     assert str(init["user"]) == "0:0"
+    assert init["network_mode"] == "none"
     assert init["entrypoint"] == ["/bin/sh", "-ec"]
     assert init["restart"] == "no"
     assert init["volumes"] == ["kestra-storage:/app/storage"]

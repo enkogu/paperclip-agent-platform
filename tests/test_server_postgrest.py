@@ -43,7 +43,6 @@ def values(module, *, generated: bool = False) -> dict[str, str]:
             "POSTGREST_READER_ROLE": "mte_reader",
             "POSTGREST_WRITER_ROLE": "mte_writer",
             "POSTGREST_PAPERCLIP_ROLE": "mte_paperclip",
-            "POSTGREST_ACTIVEPIECES_ROLE": "mte_activepieces",
             "POSTGREST_JWT_SECRET": "s" * 64,
             "POSTGREST_API_AUDIENCE": "mte-api",
             "POSTGREST_HEALTH_URL": "http://127.0.0.1:18095/ready",
@@ -66,100 +65,43 @@ class PostgrestContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.module = load_module()
 
-    def test_dokploy_app_name_resolves_exact_compose_identity(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            registry = Path(temporary) / "dokploy-mte-ids.json"
-            registry.write_text(json.dumps({"postgres": "compose-123"}))
-            response = mock.MagicMock()
-            response.__enter__.return_value = response
-            response.read.return_value = json.dumps(
-                {
-                    "composeId": "compose-123",
-                    "appName": "mte-postgres-ekpcdn",
-                    "composeType": "docker-compose",
-                    "sourceType": "raw",
-                }
-            ).encode()
-            with (
-                mock.patch.object(self.module, "DOKPLOY_IDS", registry),
-                mock.patch.object(
-                    self.module,
-                    "dotenv",
-                    return_value={
-                        "DOKPLOY_BASE_URL": "http://127.0.0.1:3000/api",
-                        "DOKPLOY_API_TOKEN": "unit-api-token",
-                    },
-                ),
-                mock.patch.object(
-                    self.module.urllib.request,
-                    "urlopen",
-                    return_value=response,
-                ) as opened,
-            ):
-                observed = self.module.dokploy_app_name("postgres")
-
-        self.assertEqual(observed, "mte-postgres-ekpcdn")
-        request = opened.call_args.args[0]
-        self.assertEqual(
-            request.full_url,
-            "http://127.0.0.1:3000/api/compose.one?composeId=compose-123",
-        )
-
-    def test_unique_container_uses_exact_observed_project_and_service(self):
+    def test_unique_container_uses_exact_direct_compose_project_and_service(self):
         calls: list[list[str]] = []
 
         def fake_run(argv, **_kwargs):
             calls.append(argv)
             return SimpleNamespace(stdout="container-one\n")
 
-        with (
-            mock.patch.object(
-                self.module,
-                "dokploy_app_name",
-                return_value="mte-postgres-ekpcdn",
-            ),
-            mock.patch.object(self.module, "run", side_effect=fake_run),
-        ):
+        with mock.patch.object(self.module, "run", side_effect=fake_run):
             observed = self.module.unique_container("postgres", "postgres")
 
         self.assertEqual(observed, "container-one")
-        self.assertIn("label=com.docker.compose.project=mte-postgres-ekpcdn", calls[0])
+        self.assertIn("label=com.docker.compose.project=mte-platform", calls[0])
         self.assertIn("label=com.docker.compose.service=postgres", calls[0])
         self.assertIn("status=running", calls[0])
 
-    def test_unique_container_missing_and_duplicate_fail_closed(self):
-        with mock.patch.object(
-            self.module,
-            "dokploy_app_name",
-            return_value="mte-postgres-ekpcdn",
+    def test_unique_container_rejects_noncanonical_direct_compose_identity(self):
+        with self.assertRaisesRegex(
+            self.module.PostgrestError,
+            "direct_compose_identity_invalid:postgres:postgres-copy",
         ):
-            for output in ("", "container-one\ncontainer-two\n"):
-                with (
-                    self.subTest(output=output),
-                    mock.patch.object(
-                        self.module,
-                        "run",
-                        return_value=SimpleNamespace(stdout=output),
-                    ),
-                    self.assertRaisesRegex(
-                        self.module.PostgrestError,
-                        "container_not_unique:postgres:postgres",
-                    ),
-                ):
-                    self.module.unique_container("postgres", "postgres")
+            self.module.unique_container("postgres", "postgres-copy")
 
-    def test_dokploy_component_registry_missing_fails_closed(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            registry = Path(temporary) / "dokploy-mte-ids.json"
-            registry.write_text("{}")
+    def test_unique_container_missing_and_duplicate_fail_closed(self):
+        for output in ("", "container-one\ncontainer-two\n"):
             with (
-                mock.patch.object(self.module, "DOKPLOY_IDS", registry),
+                self.subTest(output=output),
+                mock.patch.object(
+                    self.module,
+                    "run",
+                    return_value=SimpleNamespace(stdout=output),
+                ),
                 self.assertRaisesRegex(
                     self.module.PostgrestError,
-                    "dokploy_component_identity_missing:postgres",
+                    "container_not_unique:postgres:postgres",
                 ),
             ):
-                self.module.dokploy_app_name("postgres")
+                self.module.unique_container("postgres", "postgres")
 
     def test_release_is_exact_pinned_mit_contract(self):
         contract = {
@@ -198,16 +140,11 @@ class PostgrestContractTests(unittest.TestCase):
             self.assertEqual(release["license"], "MIT")
             self.assertRegex(release["image"], r"@sha256:[0-9a-f]{64}$")
 
-    def test_default_and_legacy_profiles_select_projection_provider(self):
+    def test_default_profile_selects_projection_provider(self):
         current = values(self.module)
         self.module.require_values(current)
         self.assertEqual(
             self.module.projection_provider(self.module.DEFAULT_PROFILE), "notion"
-        )
-        current["DATA_CONTENT_PROFILE"] = self.module.LEGACY_PROFILE
-        self.module.require_values(current)
-        self.assertEqual(
-            self.module.projection_provider(self.module.LEGACY_PROFILE), "nocodb"
         )
         current["DATA_CONTENT_PROFILE"] = "unsupported"
         with self.assertRaisesRegex(
@@ -242,13 +179,13 @@ class PostgrestContractTests(unittest.TestCase):
     def test_role_refs_are_exact_and_all_database_roles_are_distinct(self):
         current = values(self.module)
         self.module.require_values(current)
-        current["POSTGREST_ACTIVEPIECES_ROLE"] = current["POSTGREST_PAPERCLIP_ROLE"]
+        current["POSTGREST_PAPERCLIP_ROLE"] = current["POSTGREST_READER_ROLE"]
         with self.assertRaisesRegex(
             self.module.PostgrestError, "postgrest_database_roles_not_distinct"
         ):
             self.module.require_values(current)
 
-    def test_scoped_tokens_have_distinct_roles_audience_and_identity(self):
+    def test_scoped_token_has_exact_role_audience_and_identity(self):
         current = values(self.module)
         paperclip = self.module.jwt(
             current,
@@ -256,21 +193,9 @@ class PostgrestContractTests(unittest.TestCase):
             lifetime=31_536_000,
             token_id="mte-paperclip",
         )
-        activepieces = self.module.jwt(
-            current,
-            current["POSTGREST_ACTIVEPIECES_ROLE"],
-            lifetime=31_536_000,
-            token_id="mte-activepieces",
-        )
-        self.assertNotEqual(paperclip, activepieces)
         paperclip_claims = self.module.token_claims(current, paperclip)
-        activepieces_claims = self.module.token_claims(current, activepieces)
         self.assertEqual(paperclip_claims["role"], current["POSTGREST_PAPERCLIP_ROLE"])
-        self.assertEqual(
-            activepieces_claims["role"], current["POSTGREST_ACTIVEPIECES_ROLE"]
-        )
         self.assertEqual(paperclip_claims["aud"], current["POSTGREST_API_AUDIENCE"])
-        self.assertEqual(activepieces_claims["aud"], current["POSTGREST_API_AUDIENCE"])
         self.assertTrue(
             self.module.scoped_token_valid(
                 current,
@@ -284,7 +209,7 @@ class PostgrestContractTests(unittest.TestCase):
                 current,
                 paperclip,
                 "mte-paperclip",
-                current["POSTGREST_ACTIVEPIECES_ROLE"],
+                current["POSTGREST_READER_ROLE"],
             )
         )
 
@@ -302,9 +227,9 @@ class PostgrestDatabaseTests(unittest.TestCase):
             if "SELECT 1 FROM pg_database" in sql:
                 return "1"
             if "bool_and(c.relrowsecurity" in sql:
-                return "t|5|5|5|5|5"
+                return "t|5|5|5|5"
             if "has_table_privilege" in sql:
-                return "t|t|t|t|f|t|f|t|t|t|t|t|t|t|t|t|f"
+                return "t|t|t|t|f|t|f|t|t|t|f"
             if "information_schema.tables" in sql:
                 return "2|6|2|0|2|1|1"
             return ""
@@ -317,10 +242,10 @@ class PostgrestDatabaseTests(unittest.TestCase):
             result = self.module.database()
 
         all_sql = "\n".join(sql for _, sql in calls)
-        self.assertEqual(result["roles"], 7)
-        self.assertTrue(result["authorization"]["rolesDistinct"])
+        self.assertEqual(result["roles"], 6)
+        self.assertTrue(result["authorization"]["paperclipRoleScoped"])
         self.assertIn(
-            'GRANT "mte_anon", "mte_reader", "mte_writer", "mte_paperclip", "mte_activepieces" TO "mte_authenticator"',
+            'GRANT "mte_anon", "mte_reader", "mte_writer", "mte_paperclip" TO "mte_authenticator"',
             all_sql,
         )
         for table in (
@@ -336,7 +261,7 @@ class PostgrestDatabaseTests(unittest.TestCase):
         self.assertIn("CREATE TABLE IF NOT EXISTS api.provider_sync_state", all_sql)
         self.assertIn("CREATE TABLE IF NOT EXISTS api.provider_outbox", all_sql)
         self.assertIn(
-            'GRANT USAGE ON SCHEMA api TO "mte_reader", "mte_writer", "mte_paperclip", "mte_activepieces"',
+            'GRANT USAGE ON SCHEMA api TO "mte_reader", "mte_writer", "mte_paperclip"',
             all_sql,
         )
         self.assertIn("mte_entities_projection_outbox", all_sql)
@@ -345,8 +270,6 @@ class PostgrestDatabaseTests(unittest.TestCase):
         self.assertNotIn("payload jsonb", all_sql)
         self.assertIn("CREATE POLICY mte_paperclip_canary_rows", all_sql)
         self.assertIn("external_object_id LIKE 'MTE-C027-%'", all_sql)
-        self.assertIn("CREATE POLICY mte_activepieces_canary_rows", all_sql)
-        self.assertIn("external_object_id LIKE 'mte-ap-postgrest-%'", all_sql)
         self.assertEqual(result["authorization"]["canonicalSystem"], "postgresql")
         self.assertFalse(
             result["authorization"]["projectionTablesContainCanonicalPayload"]
@@ -361,8 +284,8 @@ class PostgrestDatabaseTests(unittest.TestCase):
 
         responses = iter(
             (
-                "t|5|5|5|5|5",
-                "t|t|t|t|f|t|f|t|t|t|t|t|t|t|t|t|f",
+                "t|5|5|5|5",
+                "t|t|t|t|f|t|f|t|t|t|f",
                 "2|5|2|0|2|1|1",
             )
         )
@@ -416,21 +339,14 @@ class PostgrestProvisionTests(unittest.TestCase):
             self.assertEqual(first_stat.st_ino, second_stat.st_ino)
             self.assertEqual(first_stat.st_mtime_ns, second_stat.st_mtime_ns)
             paperclip = current["POSTGREST_PAPERCLIP_TOKEN"]
-            activepieces = current["POSTGREST_ACTIVEPIECES_TOKEN"]
-            self.assertNotEqual(paperclip, activepieces)
             self.assertEqual(
                 self.module.token_claims(current, paperclip)["role"],
                 current["POSTGREST_PAPERCLIP_ROLE"],
             )
-            self.assertEqual(
-                self.module.token_claims(current, activepieces)["role"],
-                current["POSTGREST_ACTIVEPIECES_ROLE"],
-            )
             serialized = json.dumps({"first": first, "second": second})
             self.assertNotIn(paperclip, serialized)
-            self.assertNotIn(activepieces, serialized)
 
-    def test_rls_canary_proves_cross_role_read_and_delete_denied(self):
+    def test_rls_canary_proves_paperclip_scope_and_cleanup(self):
         current = values(self.module, generated=True)
         rows: dict[int, dict[str, object]] = {}
         next_id = 1
@@ -440,6 +356,8 @@ class PostgrestProvisionTests(unittest.TestCase):
             token = kwargs.get("token")
             if method == "POST":
                 body = kwargs["body"]
+                if not str(body["title"]).startswith("MTE-C027-"):
+                    return 403, {"message": "row-level security"}
                 row_id = next_id
                 next_id += 1
                 rows[row_id] = {
@@ -460,14 +378,78 @@ class PostgrestProvisionTests(unittest.TestCase):
             raise AssertionError((method, url))
 
         with mock.patch.object(self.module, "request", side_effect=fake_request):
-            result = self.module.rls_role_isolation_canary(
+            result = self.module.paperclip_scope_canary(
                 current, "http://postgrest/prototype_items"
             )
-        self.assertTrue(result["paperclipRoleIsolated"])
-        self.assertTrue(result["activepiecesRoleIsolated"])
-        self.assertTrue(result["crossRoleReadDenied"])
-        self.assertTrue(result["crossRoleDeleteDenied"])
+        self.assertTrue(result["paperclipRoleScoped"])
+        self.assertTrue(result["outOfScopeWriteDenied"])
         self.assertEqual(rows, {})
+
+    def test_verify_evidence_includes_live_database_authorization(self):
+        current = values(self.module, generated=True)
+        captured: dict[str, object] = {}
+        request_results = iter(
+            (
+                (403, None),
+                (403, None),
+                (201, [{"id": 1}]),
+                (200, [{"id": 1, "title": mock.ANY}]),
+                (200, [{"id": 1, "title": mock.ANY}]),
+                (204, None),
+                (200, []),
+            )
+        )
+
+        def fake_request(_method, _url, **_kwargs):
+            return next(request_results)
+
+        database_authorization = {
+            "rlsEnabled": True,
+            "paperclipRoleScoped": True,
+            "anonymousDenied": True,
+            "canonicalTables": ["canonical_entities", "canonical_documents"],
+        }
+        role_isolation = {
+            "paperclipRoleScoped": True,
+            "outOfScopeWriteDenied": True,
+            "cleanupCompleted": True,
+        }
+        ownership = {
+            "canonicalSystem": "postgresql",
+            "projectionProvider": "notion",
+        }
+        with (
+            mock.patch.object(self.module, "dotenv", return_value=current),
+            mock.patch.object(self.module, "release_contract", return_value={}),
+            mock.patch.object(
+                self.module,
+                "verify_database_authorization",
+                return_value=database_authorization,
+            ) as database_check,
+            mock.patch.object(
+                self.module, "paperclip_scope_canary", return_value=role_isolation
+            ),
+            mock.patch.object(
+                self.module, "canonical_ssot_canary", return_value=ownership
+            ),
+            mock.patch.object(self.module, "jwt", return_value="unit-token"),
+            mock.patch.object(self.module, "request", side_effect=fake_request),
+            mock.patch.object(self.module, "run"),
+            mock.patch.object(self.module, "unique_container", return_value="container"),
+            mock.patch.object(self.module, "wait_ready"),
+            mock.patch.object(self.module, "sha256_path", return_value="a" * 64),
+            mock.patch.object(
+                self.module,
+                "atomic_json",
+                side_effect=lambda _path, payload: captured.update(payload),
+            ),
+        ):
+            result = self.module.verify()
+
+        database_check.assert_called_once_with(current)
+        self.assertTrue(result["authorization"]["rlsEnabled"])
+        self.assertEqual(result["authorization"], captured["authorization"])
+        self.assertTrue(result["authorization"]["paperclipRoleScoped"])
 
     def test_canonical_ssot_canary_proves_content_is_postgres_owned(self):
         current = values(self.module)

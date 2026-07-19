@@ -65,15 +65,14 @@ def profile_catalog_semantic_sha256(document: dict) -> str:
     return semantic_sha256(document)
 
 
-def canonical_paperclip_url() -> str | None:
+def canonical_paperclip_values() -> dict[str, str]:
     if not CANONICAL_ENV.is_file():
-        return None
-    values = dict(
+        return {}
+    return dict(
         line.split("=", 1)
         for line in CANONICAL_ENV.read_text().splitlines()
         if line and not line.startswith("#") and "=" in line
     )
-    return values.get("PAPERCLIP_API_BASE")
 
 
 def request(base: str, token: str, method: str, path: str, body=None):
@@ -154,14 +153,23 @@ def desired_agent(
     if mode != "native":
         raise ValueError("only native Paperclip harness profiles are supported")
     adapter_type = profile["runtimeContract"]["adapterType"]
-    workspace = workspace_root / profile["ref"]
     adapter_config = {
-        key: (str(workspace) if value == "${WORKSPACE}" else value)
+        key: (str(workspace_root) if value == "${WORKSPACE}" else value)
         for key, value in profile["nativeAdapterConfig"].items()
     }
     adapter_config["instructionsFilePath"] = str(
         instructions_root / profile["instructions"]
     )
+    runtime_config = copy.deepcopy(profile["paperclipRuntimeConfig"])
+    runtime_config["heartbeat"] = {
+        "enabled": False,
+        "wakeOnDemand": True,
+        "maxConcurrentRuns": (
+            max_concurrency
+            if max_concurrency is not None
+            else profile["limits"]["maxConcurrentRuns"]
+        ),
+    }
     return {
         "name": f"MTE {profile['ref']}",
         "role": profile["role"],
@@ -172,17 +180,7 @@ def desired_agent(
         ),
         "adapterType": adapter_type,
         "adapterConfig": adapter_config,
-        "runtimeConfig": {
-            "heartbeat": {
-                "enabled": False,
-                "wakeOnDemand": True,
-                "maxConcurrentRuns": (
-                    max_concurrency
-                    if max_concurrency is not None
-                    else profile["limits"]["maxConcurrentRuns"]
-                ),
-            }
-        },
+        "runtimeConfig": runtime_config,
         "budgetMonthlyCents": 0,
         "metadata": {
             "profileRef": profile["ref"],
@@ -236,7 +234,15 @@ def reconcile(args: argparse.Namespace) -> dict:
     required_refs = tuple(str(profile["ref"]) for profile in profiles)
     companies = request(args.url, args.token, "GET", "/api/companies")
     company = next(
-        (row for row in companies if row["name"] == "Micro Task Engine Prototype"),
+        (
+            row
+            for row in companies
+            if (
+                getattr(args, "company_id", "")
+                and str(row.get("id")) == args.company_id
+            )
+            or row.get("name") in {"MTE Platform", "Micro Task Engine Prototype"}
+        ),
         None,
     )
     if not company:
@@ -246,11 +252,8 @@ def reconcile(args: argparse.Namespace) -> dict:
             "POST",
             "/api/companies",
             {
-                "name": "Micro Task Engine Prototype",
-                "description": (
-                    "Disposable Paperclip runtime evaluation; Kestra remains "
-                    "workflow owner."
-                ),
+                "name": "MTE Platform",
+                "description": "Managed multi-agent platform",
                 "budgetMonthlyCents": 0,
             },
         )
@@ -319,12 +322,22 @@ def reconcile(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
+    canonical = canonical_paperclip_values()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--url",
-        default=os.environ.get("PAPERCLIP_URL") or canonical_paperclip_url(),
+        default=os.environ.get("PAPERCLIP_URL") or canonical.get("PAPERCLIP_API_BASE"),
     )
-    parser.add_argument("--token", default=os.environ.get("PAPERCLIP_TOKEN", ""))
+    parser.add_argument(
+        "--company-id",
+        default=os.environ.get("PAPERCLIP_COMPANY_ID")
+        or canonical.get("PAPERCLIP_COMPANY_ID", ""),
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("PAPERCLIP_TOKEN")
+        or canonical.get("PAPERCLIP_BOARD_API_KEY", ""),
+    )
     parser.add_argument("--mode", choices=("native",), default="native")
     parser.add_argument(
         "--workspace-root",

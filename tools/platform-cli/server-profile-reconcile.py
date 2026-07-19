@@ -73,6 +73,7 @@ GROUP_PREFIX = "mte-profile-"
 KESTRA_NAMESPACE = "mte.platform"
 KESTRA_CATALOG_KEY = "mte.profile.catalog"
 SHA_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+ERROR_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_:-]{0,127}$")
 SENSITIVE_KEY_PATTERN = re.compile(
     r"PASSWORD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|CREDENTIAL|AUTH|WEBHOOK",
     re.IGNORECASE,
@@ -1714,6 +1715,7 @@ def execute(*, mutate: bool, finalize: bool = False) -> dict[str, Any]:
 
 
 def failed_payload(kind: str, exc: BaseException) -> dict[str, Any]:
+    message = str(exc)
     payload = {
         "apiVersion": "micro-task-engine/v1alpha1",
         "kind": kind,
@@ -1726,6 +1728,7 @@ def failed_payload(kind: str, exc: BaseException) -> dict[str, Any]:
         "producerPath": str(Path(__file__)),
         "producerSha256": sha256_path(Path(__file__)),
         "errorType": type(exc).__name__,
+        "errorCode": message if ERROR_CODE_PATTERN.fullmatch(message) else "unclassified_failure",
         "secretValuesPrinted": False,
     }
     return payload

@@ -18,22 +18,152 @@ import secrets
 import stat
 import subprocess
 import tempfile
-from typing import Any
+from typing import Any, NamedTuple
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
 ENV_FILE = Path("/root/.config/mte-secrets/platform.env")
 ENV_LOCK = ENV_FILE.parent / ".platform-env.lock"
-BOT_NAME = "hermes-operator"
-OPERATOR_NAME = "mte-operator"
-TEAM_NAME = "mte-platform"
-CHANNEL_NAME = "operator"
-MATTERMOST_URL = "http://127.0.0.1:18065"
+
+CANONICAL_RUNTIME_KEYS = (
+    "HERMES_APPROVALS_CRON_MODE",
+    "HERMES_APPROVALS_DESTRUCTIVE_SLASH_CONFIRM",
+    "HERMES_APPROVALS_MCP_RELOAD_CONFIRM",
+    "HERMES_APPROVALS_MODE",
+    "HERMES_APPROVALS_TIMEOUT",
+    "HERMES_API_SERVER_ENABLED",
+    "HERMES_API_SERVER_HOST",
+    "HERMES_API_SERVER_KEY",
+    "HERMES_API_SERVER_MODEL_NAME",
+    "HERMES_API_SERVER_PORT",
+    "HERMES_DISPLAY_TOOL_PROGRESS",
+    "HERMES_EXEC_ASK",
+    "HERMES_GATEWAY_STREAMING_ENABLED",
+    "HERMES_GATEWAY_STREAMING_TRANSPORT",
+    "HERMES_KESTRA_URL",
+    "HERMES_LLM_API_MODE",
+    "HERMES_LLM_BASE_URL",
+    "HERMES_LLM_PROVIDER",
+    "HERMES_PAPERCLIP_URL",
+    "HERMES_TELEGRAM_EXCLUSIVE_BOT_MENTIONS",
+    "HERMES_TELEGRAM_GUEST_MODE",
+    "HERMES_TELEGRAM_NOTIFICATIONS",
+    "HERMES_TELEGRAM_REQUIRE_MENTION",
+    "HERMES_TERMINAL_BACKEND",
+    "HERMES_TERMINAL_CWD",
+    "HERMES_TERMINAL_HOME_MODE",
+    "HERMES_TERMINAL_LIFETIME_SECONDS",
+    "HERMES_TERMINAL_TIMEOUT",
+    "MATTERMOST_REPLY_MODE",
+    "MATTERMOST_REQUIRE_MENTION",
+    "MATTERMOST_URL",
+)
+
+
+class BootstrapSettings(NamedTuple):
+    mattermost_url: str
+    http_timeout_seconds: int
+    command_timeout_seconds: int
+    container_name_suffix: str
+    bot_name: str
+    operator_name: str
+    operator_email: str
+    team_name: str
+    channel_name: str
 
 
 class BootstrapError(RuntimeError):
     pass
+
+
+def required(values: dict[str, str], key: str) -> str:
+    value = values.get(key, "").strip()
+    if not value:
+        raise BootstrapError(f"canonical {key} is required")
+    if any(character in value for character in "\r\n\0"):
+        raise BootstrapError(f"canonical {key} is malformed")
+    return value
+
+
+def required_int(
+    values: dict[str, str], key: str, *, minimum: int, maximum: int
+) -> int:
+    raw = required(values, key)
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise BootstrapError(f"canonical {key} must be an integer") from error
+    if not minimum <= value <= maximum:
+        raise BootstrapError(
+            f"canonical {key} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def required_slug(values: dict[str, str], key: str) -> str:
+    value = required(values, key)
+    if not re.fullmatch(r"[a-z][a-z0-9._-]{0,62}", value):
+        raise BootstrapError(f"canonical {key} is not a valid Mattermost slug")
+    return value
+
+
+def required_email(values: dict[str, str], key: str) -> str:
+    value = required(values, key)
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+", value):
+        raise BootstrapError(f"canonical {key} is not a valid email address")
+    return value
+
+
+def required_base_url(values: dict[str, str], key: str) -> str:
+    value = required(values, key).rstrip("/")
+    parsed = urllib.parse.urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise BootstrapError(f"canonical {key} must be a credential-free HTTP(S) URL")
+    return value
+
+
+def bootstrap_settings(values: dict[str, str]) -> BootstrapSettings:
+    """Validate every bootstrap-owned setting before any external mutation."""
+    for key in CANONICAL_RUNTIME_KEYS:
+        required(values, key)
+    for key in (
+        "HERMES_PAPERCLIP_URL",
+        "HERMES_KESTRA_URL",
+        "HERMES_LLM_BASE_URL",
+    ):
+        required_base_url(values, key)
+    return BootstrapSettings(
+        mattermost_url=required_base_url(values, "MATTERMOST_URL"),
+        http_timeout_seconds=required_int(
+            values,
+            "MATTERMOST_BOOTSTRAP_HTTP_TIMEOUT_SECONDS",
+            minimum=1,
+            maximum=300,
+        ),
+        command_timeout_seconds=required_int(
+            values,
+            "MATTERMOST_BOOTSTRAP_COMMAND_TIMEOUT_SECONDS",
+            minimum=1,
+            maximum=900,
+        ),
+        container_name_suffix=required_slug(
+            values, "MATTERMOST_CONTAINER_NAME_SUFFIX"
+        ),
+        bot_name=required_slug(values, "MATTERMOST_HERMES_BOT_USERNAME"),
+        operator_name=required_slug(values, "MATTERMOST_OPERATOR_USERNAME"),
+        operator_email=required_email(values, "MATTERMOST_OPERATOR_EMAIL"),
+        team_name=required_slug(values, "MATTERMOST_PLATFORM_TEAM_NAME"),
+        channel_name=required_slug(values, "MATTERMOST_OPERATOR_CHANNEL_NAME"),
+    )
 
 
 @contextmanager
@@ -55,17 +185,33 @@ def platform_env_lock():
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def command(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, text=True, capture_output=True, check=False)
+def command(
+    argv: list[str], *, check: bool = True, timeout: int
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise BootstrapError("Mattermost bootstrap command timed out") from error
     if check and result.returncode:
         raise BootstrapError("Mattermost bootstrap command failed")
     return result
 
 
-def mattermost_container() -> str:
-    result = command(["docker", "ps", "--format", "{{.Names}}"])
+def mattermost_container(settings: BootstrapSettings) -> str:
+    result = command(
+        ["docker", "ps", "--format", "{{.Names}}"],
+        timeout=settings.command_timeout_seconds,
+    )
     matches = [
-        line for line in result.stdout.splitlines() if line.endswith("mattermost-1")
+        line
+        for line in result.stdout.splitlines()
+        if line.endswith(settings.container_name_suffix)
     ]
     if len(matches) != 1:
         raise BootstrapError("expected exactly one running Mattermost container")
@@ -73,7 +219,10 @@ def mattermost_container() -> str:
 
 
 def mmctl(
-    container: str, *args: str, check: bool = True
+    settings: BootstrapSettings,
+    container: str,
+    *args: str,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     return command(
         [
@@ -87,6 +236,7 @@ def mmctl(
             *args,
         ],
         check=check,
+        timeout=settings.command_timeout_seconds,
     )
 
 
@@ -133,6 +283,7 @@ def secret_from(value: Any) -> str | None:
 
 
 def api_request(
+    settings: BootstrapSettings,
     path: str,
     *,
     body: dict[str, Any] | None = None,
@@ -143,7 +294,7 @@ def api_request(
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     request = urllib.request.Request(
-        MATTERMOST_URL + path,
+        settings.mattermost_url + path,
         data=(
             json.dumps(body, separators=(",", ":")).encode()
             if body is not None
@@ -153,7 +304,9 @@ def api_request(
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(
+            request, timeout=settings.http_timeout_seconds
+        ) as response:
             raw = response.read(1_000_001)
             response_headers = dict(response.headers.items())
     except urllib.error.HTTPError as error:
@@ -179,8 +332,9 @@ def api_request(
         raise BootstrapError("Mattermost API returned non-JSON output") from error
 
 
-def admin_login(login_id: str, password: str) -> str:
+def admin_login(settings: BootstrapSettings, login_id: str, password: str) -> str:
     actor, headers = api_request(
+        settings,
         "/api/v4/users/login",
         body={"login_id": login_id, "password": password},
     )
@@ -249,23 +403,35 @@ def update_env(updates: dict[str, str]) -> None:
 
 
 def ensure_user(
-    container: str, admin_token: str, existing_password: str | None
+    settings: BootstrapSettings,
+    container: str,
+    admin_token: str,
+    existing_password: str | None,
 ) -> tuple[dict[str, Any], str]:
-    found = mmctl(container, "user", "search", OPERATOR_NAME, check=False)
+    found = mmctl(
+        settings,
+        container,
+        "user",
+        "search",
+        settings.operator_name,
+        check=False,
+    )
     if found.returncode == 0:
-        user = first_named(payload(found), OPERATOR_NAME)
+        user = first_named(payload(found), settings.operator_name)
         if user:
             if existing_password:
                 password = existing_password
             else:
                 password = secrets.token_urlsafe(36)
                 api_request(
+                    settings,
                     f"/api/v4/users/{user['id']}/password",
                     bearer=admin_token,
                     method="PUT",
                     body={"new_password": password},
                 )
             api_request(
+                settings,
                 f"/api/v4/users/{user['id']}/roles",
                 bearer=admin_token,
                 method="PUT",
@@ -274,22 +440,26 @@ def ensure_user(
             return user, password
     password = secrets.token_urlsafe(36)
     created, _ = api_request(
+        settings,
         "/api/v4/users",
         bearer=admin_token,
         body={
-            "email": "operator@mte.local",
-            "username": OPERATOR_NAME,
+            "email": settings.operator_email,
+            "username": settings.operator_name,
             "password": password,
             "email_verified": True,
         },
     )
     user = created if isinstance(created, dict) else None
     if not user:
-        found = mmctl(container, "user", "search", OPERATOR_NAME)
-        user = first_named(payload(found), OPERATOR_NAME)
+        found = mmctl(
+            settings, container, "user", "search", settings.operator_name
+        )
+        user = first_named(payload(found), settings.operator_name)
     if not user:
         raise BootstrapError("operator account could not be resolved after creation")
     api_request(
+        settings,
         f"/api/v4/users/{user['id']}/roles",
         bearer=admin_token,
         method="PUT",
@@ -299,28 +469,37 @@ def ensure_user(
 
 
 def ensure_bot(
-    container: str, admin_token: str, existing_token: str | None
+    settings: BootstrapSettings,
+    container: str,
+    admin_token: str,
+    existing_token: str | None,
 ) -> tuple[dict[str, Any], str]:
-    bot = first_named(payload(mmctl(container, "bot", "list")), BOT_NAME)
+    bot = first_named(
+        payload(mmctl(settings, container, "bot", "list")), settings.bot_name
+    )
     if not bot:
         created, _ = api_request(
+            settings,
             "/api/v4/bots",
             bearer=admin_token,
             body={
-                "username": BOT_NAME,
+                "username": settings.bot_name,
                 "display_name": "Hermes",
                 "description": "Native Hermes Agent",
             },
         )
         bot = created if isinstance(created, dict) else None
     if not bot or not (bot.get("user_id") or bot.get("id")):
-        bot = first_named(payload(mmctl(container, "bot", "list")), BOT_NAME)
+        bot = first_named(
+            payload(mmctl(settings, container, "bot", "list")), settings.bot_name
+        )
     if not bot:
         raise BootstrapError("Hermes bot could not be resolved after creation")
     if existing_token:
         return bot, existing_token
     bot_user_id = str(bot.get("user_id") or bot.get("id"))
     generated, _ = api_request(
+        settings,
         f"/api/v4/users/{bot_user_id}/tokens",
         bearer=admin_token,
         body={"description": "mte-hermes-native"},
@@ -334,54 +513,66 @@ def ensure_bot(
     return bot, token
 
 
-def ensure_team(container: str) -> dict[str, Any]:
-    team = first_named(payload(mmctl(container, "team", "list")), TEAM_NAME)
+def ensure_team(settings: BootstrapSettings, container: str) -> dict[str, Any]:
+    team = first_named(
+        payload(mmctl(settings, container, "team", "list")), settings.team_name
+    )
     if team:
         return team
     created = payload(
         mmctl(
+            settings,
             container,
             "team",
             "create",
             "--name",
-            TEAM_NAME,
+            settings.team_name,
             "--display-name",
             "MTE Platform",
             "--private",
         )
     )
-    team = first_named(created, TEAM_NAME)
+    team = first_named(created, settings.team_name)
     if not team:
-        team = first_named(payload(mmctl(container, "team", "list")), TEAM_NAME)
+        team = first_named(
+            payload(mmctl(settings, container, "team", "list")), settings.team_name
+        )
     if not team:
         raise BootstrapError("Mattermost team could not be resolved after creation")
     return team
 
 
-def ensure_channel(container: str) -> dict[str, Any]:
+def ensure_channel(settings: BootstrapSettings, container: str) -> dict[str, Any]:
     channel = first_named(
-        payload(mmctl(container, "channel", "list", TEAM_NAME)), CHANNEL_NAME
+        payload(
+            mmctl(settings, container, "channel", "list", settings.team_name)
+        ),
+        settings.channel_name,
     )
     if channel:
         return channel
     created = payload(
         mmctl(
+            settings,
             container,
             "channel",
             "create",
             "--team",
-            TEAM_NAME,
+            settings.team_name,
             "--name",
-            CHANNEL_NAME,
+            settings.channel_name,
             "--display-name",
             "Hermes",
             "--private",
         )
     )
-    channel = first_named(created, CHANNEL_NAME)
+    channel = first_named(created, settings.channel_name)
     if not channel:
         channel = first_named(
-            payload(mmctl(container, "channel", "list", TEAM_NAME)), CHANNEL_NAME
+            payload(
+                mmctl(settings, container, "channel", "list", settings.team_name)
+            ),
+            settings.channel_name,
         )
     if not channel:
         raise BootstrapError("Mattermost channel could not be resolved after creation")
@@ -391,8 +582,16 @@ def ensure_channel(container: str) -> dict[str, Any]:
 def main() -> int:
     if os.geteuid() != 0:
         raise BootstrapError("run as root")
-    container = mattermost_container()
+    _, old_values = read_env()
+    settings = bootstrap_settings(old_values)
+    admin_username = required(old_values, "MATTERMOST_ADMIN_USERNAME")
+    admin_password = required(old_values, "MATTERMOST_ADMIN_PASSWORD")
+
+    # Everything above this point is validation-only. No Mattermost or
+    # credential mutation is allowed until the full canonical contract passes.
+    container = mattermost_container(settings)
     bot_setting = mmctl(
+        settings,
         container,
         "config",
         "get",
@@ -401,6 +600,7 @@ def main() -> int:
     )
     if bot_setting.returncode == 0:
         mmctl(
+            settings,
             container,
             "config",
             "set",
@@ -408,80 +608,53 @@ def main() -> int:
             "true",
         )
     mmctl(
+        settings,
         container,
         "config",
         "set",
         "ServiceSettings.EnableUserAccessTokens",
         "true",
     )
-    _, old_values = read_env()
-    admin_username = old_values.get("MATTERMOST_ADMIN_USERNAME") or "mte-admin"
-    admin_password = old_values.get("MATTERMOST_ADMIN_PASSWORD", "")
-    if not admin_password:
-        raise BootstrapError(
-            "Mattermost admin credential is required before Hermes bootstrap"
-        )
-    admin_token = admin_login(admin_username, admin_password)
+    admin_token = admin_login(settings, admin_username, admin_password)
     operator, operator_password = ensure_user(
-        container, admin_token, old_values.get("MATTERMOST_OPERATOR_PASSWORD")
+        settings,
+        container,
+        admin_token,
+        old_values.get("MATTERMOST_OPERATOR_PASSWORD"),
     )
-    session_token = admin_login(OPERATOR_NAME, operator_password)
+    session_token = admin_login(settings, settings.operator_name, operator_password)
     bot, bot_token = ensure_bot(
-        container, session_token, old_values.get("MATTERMOST_TOKEN")
+        settings, container, session_token, old_values.get("MATTERMOST_TOKEN")
     )
-    team = ensure_team(container)
-    channel = ensure_channel(container)
+    team = ensure_team(settings, container)
+    channel = ensure_channel(settings, container)
 
-    for username in (OPERATOR_NAME, BOT_NAME):
-        mmctl(container, "team", "users", "add", TEAM_NAME, username)
+    for username in (settings.operator_name, settings.bot_name):
         mmctl(
+            settings,
+            container,
+            "team",
+            "users",
+            "add",
+            settings.team_name,
+            username,
+        )
+        mmctl(
+            settings,
             container,
             "channel",
             "users",
             "add",
-            f"{TEAM_NAME}:{CHANNEL_NAME}",
+            f"{settings.team_name}:{settings.channel_name}",
             username,
         )
 
     updates = {
-        "HERMES_APPROVALS_CRON_MODE": "deny",
-        "HERMES_APPROVALS_DESTRUCTIVE_SLASH_CONFIRM": "true",
-        "HERMES_APPROVALS_MCP_RELOAD_CONFIRM": "true",
-        "HERMES_APPROVALS_MODE": "manual",
-        "HERMES_APPROVALS_TIMEOUT": "600",
-        "HERMES_API_SERVER_ENABLED": "true",
-        "HERMES_API_SERVER_HOST": "127.0.0.1",
-        "HERMES_API_SERVER_MODEL_NAME": "mte-hermes",
-        "HERMES_API_SERVER_PORT": "8642",
-        "HERMES_EXEC_ASK": "1",
-        "HERMES_DISPLAY_TOOL_PROGRESS": "new",
-        "HERMES_GATEWAY_STREAMING_ENABLED": "true",
-        "HERMES_GATEWAY_STREAMING_TRANSPORT": "edit",
-        "HERMES_PAPERCLIP_URL": "http://127.0.0.1:3100/api",
-        "HERMES_KESTRA_URL": "http://127.0.0.1:18081",
-        "HERMES_LLM_BASE_URL": "http://127.0.0.1:20128/v1",
-        "HERMES_LLM_API_MODE": "chat_completions",
-        "HERMES_LLM_PROVIDER": "custom",
-        "HERMES_TELEGRAM_EXCLUSIVE_BOT_MENTIONS": "true",
-        "HERMES_TELEGRAM_GUEST_MODE": "false",
-        "HERMES_TELEGRAM_NOTIFICATIONS": "important",
-        "HERMES_TELEGRAM_REQUIRE_MENTION": "true",
-        "HERMES_TERMINAL_BACKEND": "local",
-        "HERMES_TERMINAL_CWD": "/opt/mte-platform",
-        "HERMES_TERMINAL_HOME_MODE": "real",
-        "HERMES_TERMINAL_LIFETIME_SECONDS": "1800",
-        "HERMES_TERMINAL_TIMEOUT": "600",
-        "MATTERMOST_URL": MATTERMOST_URL,
         "MATTERMOST_ALLOWED_USERS": str(operator["id"]),
         "MATTERMOST_HOME_CHANNEL": str(channel["id"]),
-        "MATTERMOST_REQUIRE_MENTION": "true",
-        "MATTERMOST_REPLY_MODE": "thread",
+        "MATTERMOST_OPERATOR_PASSWORD": operator_password,
+        "MATTERMOST_TOKEN": bot_token,
     }
-    updates["MATTERMOST_TOKEN"] = bot_token
-    updates["MATTERMOST_OPERATOR_PASSWORD"] = operator_password
-    updates["HERMES_API_SERVER_KEY"] = old_values.get(
-        "HERMES_API_SERVER_KEY"
-    ) or secrets.token_urlsafe(48)
     update_env(updates)
 
     print(

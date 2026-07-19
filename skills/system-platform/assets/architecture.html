@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>System Platform Skill — архитектура</title>
+  <script>
+    (() => {
+      const saved = localStorage.getItem('mte-diagram-theme');
+      const dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+      if (dark) document.documentElement.classList.add('dark');
+    })();
+  </script>
+  <style>
+    :root {
+      --bg: #f4f2ec;
+      --surface: #fffefb;
+      --surface-2: #ebe8df;
+      --surface-3: #e1ddd2;
+      --ink: #171713;
+      --muted: #6d6b63;
+      --line: #c9c4b8;
+      --line-strong: #8b887f;
+      --control: #d87856;
+      --control-soft: #f5ddd4;
+      --runtime: #477a73;
+      --runtime-soft: #dceae7;
+      --data: #8e6db0;
+      --data-soft: #ebe2f3;
+      --integration: #b78a2e;
+      --integration-soft: #f4e9ca;
+      --ops: #557aa8;
+      --ops-soft: #dfe9f4;
+      --success: #2e7d5b;
+      --warning: #aa6c18;
+      --shadow: 0 18px 60px rgba(57, 49, 36, .12);
+      --edge-task: #d87856;
+      --edge-data: #8e6db0;
+      --edge-tools: #b78a2e;
+      --edge-ops: #557aa8;
+      --edge-default: #8b887f;
+    }
+    html.dark {
+      --bg: #111210;
+      --surface: #1b1c19;
+      --surface-2: #252621;
+      --surface-3: #30312b;
+      --ink: #f0eee7;
+      --muted: #aaa79d;
+      --line: #45463f;
+      --line-strong: #777970;
+      --control: #ed8c68;
+      --control-soft: #3d2922;
+      --runtime: #68a89f;
+      --runtime-soft: #203532;
+      --data: #b193ce;
+      --data-soft: #30263a;
+      --integration: #d2a848;
+      --integration-soft: #3b321d;
+      --ops: #7da4d2;
+      --ops-soft: #253346;
+      --success: #67b992;
+      --warning: #e3ad52;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .34);
+      --edge-task: #ed8c68;
+      --edge-data: #b193ce;
+      --edge-tools: #d2a848;
+      --edge-ops: #7da4d2;
+      --edge-default: #777970;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, color-mix(in srgb, var(--control) 10%, transparent), transparent 34rem),
+        radial-gradient(circle at 90% 12%, color-mix(in srgb, var(--runtime) 11%, transparent), transparent 34rem),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .shell { width: min(1900px, 100%); margin: 0 auto; padding: 24px; }
+    header { display: flex; gap: 20px; align-items: flex-start; justify-content: space-between; margin-bottom: 18px; }
+    .eyebrow { font: 700 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .15em; color: var(--control); text-transform: uppercase; }
+    h1 { margin: 6px 0 5px; max-width: 980px; font-size: clamp(24px, 3vw, 44px); letter-spacing: -.045em; line-height: 1.02; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+    .header-actions { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    button {
+      border: 1px solid var(--line); color: var(--ink); background: var(--surface); border-radius: 999px;
+      min-height: 38px; padding: 8px 13px; cursor: pointer; font: 650 12px/1 inherit;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+    }
+    button:hover { transform: translateY(-1px); border-color: var(--line-strong); }
+    button:focus-visible { outline: 3px solid color-mix(in srgb, var(--control) 35%, transparent); outline-offset: 2px; }
+    .architecture-pill { border: 1px solid color-mix(in srgb, var(--warning) 44%, var(--line)); background: color-mix(in srgb, var(--warning) 10%, var(--surface)); color: var(--warning); border-radius: 999px; padding: 9px 13px; font: 700 11px/1.1 ui-monospace, monospace; }
+    .flowbar { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+    .flowbar button.active { color: var(--surface); border-color: var(--ink); background: var(--ink); }
+    .diagram-card { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 22px; background: color-mix(in srgb, var(--surface) 94%, transparent); box-shadow: var(--shadow); }
+    .canvas { overflow: auto; overscroll-behavior: contain; }
+    svg { display: block; width: max(100%, 1480px); height: auto; min-height: 760px; }
+    .zone { fill: var(--surface); stroke: var(--line); stroke-width: 1.3; }
+    .zone.control { fill: color-mix(in srgb, var(--control-soft) 44%, var(--surface)); }
+    .zone.runtime { fill: color-mix(in srgb, var(--runtime-soft) 44%, var(--surface)); }
+    .zone.integrations { fill: color-mix(in srgb, var(--integration-soft) 35%, var(--surface)); }
+    .zone.data { fill: color-mix(in srgb, var(--data-soft) 35%, var(--surface)); }
+    .zone.ops { fill: color-mix(in srgb, var(--ops-soft) 35%, var(--surface)); }
+    .zone-title { fill: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+    .zone-sub { fill: var(--muted); font-size: 10px; }
+    .node { cursor: pointer; outline: none; }
+    .node rect.main { fill: var(--surface); stroke: var(--line); stroke-width: 1.35; transition: stroke .15s ease, transform .15s ease, filter .15s ease; }
+    .node:hover rect.main, .node:focus rect.main { stroke: var(--line-strong); filter: drop-shadow(0 7px 9px rgba(0,0,0,.12)); }
+    .node.core rect.main { stroke: var(--control); stroke-width: 2; }
+    .node.runtime-node rect.main { stroke: var(--runtime); }
+    .node.data-node rect.main { stroke: var(--data); }
+    .node.tool-node rect.main { stroke: var(--integration); }
+    .node.ops-node rect.main { stroke: var(--ops); }
+    .node.external rect.main { stroke-dasharray: 5 4; }
+    .node-title { fill: var(--ink); font-size: 14px; font-weight: 750; letter-spacing: -.01em; pointer-events: none; }
+    .node-sub { fill: var(--muted); font-size: 10.5px; pointer-events: none; }
+    .node-badge { font-size: 8.8px; font-weight: 850; letter-spacing: .06em; pointer-events: none; }
+    .badge-control { fill: var(--control-soft); stroke: var(--control); }
+    .badge-runtime { fill: var(--runtime-soft); stroke: var(--runtime); }
+    .badge-data { fill: var(--data-soft); stroke: var(--data); }
+    .badge-tools { fill: var(--integration-soft); stroke: var(--integration); }
+    .badge-ops { fill: var(--ops-soft); stroke: var(--ops); }
+    .badge-text-control { fill: var(--control); }
+    .badge-text-runtime { fill: var(--runtime); }
+    .badge-text-data { fill: var(--data); }
+    .badge-text-tools { fill: var(--integration); }
+    .badge-text-ops { fill: var(--ops); }
+    .edge { fill: none; stroke: var(--edge-default); stroke-width: 1.65; marker-end: url(#arrow-default); opacity: .52; transition: opacity .2s ease, stroke-width .2s ease; }
+    .edge.task { stroke: var(--edge-task); marker-end: url(#arrow-task); }
+    .edge.data-flow { stroke: var(--edge-data); marker-end: url(#arrow-data); }
+    .edge.tools { stroke: var(--edge-tools); marker-end: url(#arrow-tools); }
+    .edge.ops-flow { stroke: var(--edge-ops); marker-end: url(#arrow-ops); }
+    .edge.return { stroke-dasharray: 5 4; }
+    .edge.readonly { stroke-dasharray: 2 5; }
+    .edge-label rect { fill: var(--surface); stroke: var(--line); }
+    .edge-label text { fill: var(--muted); font-size: 9px; font-weight: 700; }
+    svg.filtered .edge, svg.filtered .node { opacity: .11; }
+    svg.filtered .zone { opacity: .48; }
+    svg.filtered .edge.active, svg.filtered .node.active { opacity: 1; }
+    svg.filtered .edge.active { stroke-width: 3; }
+    svg.filtered .zone.active { opacity: 1; }
+    .detail {
+      position: absolute; z-index: 5; right: 18px; top: 18px; width: min(390px, calc(100% - 36px));
+      border: 1px solid var(--line); border-radius: 16px; padding: 17px 18px 16px;
+      background: color-mix(in srgb, var(--surface) 96%, transparent); box-shadow: var(--shadow);
+      transform: translateY(-8px); opacity: 0; pointer-events: none; transition: .18s ease;
+    }
+    .detail.open { transform: none; opacity: 1; pointer-events: auto; }
+    .detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+    .detail h2 { font-size: 18px; margin: 0 0 4px; letter-spacing: -.025em; }
+    .detail .kind { color: var(--muted); font: 700 10px/1.3 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .1em; }
+    .detail p { color: var(--muted); font-size: 13px; line-height: 1.52; margin: 13px 0 0; }
+    .detail ul { margin: 12px 0 0; padding-left: 18px; color: var(--ink); font-size: 12px; line-height: 1.6; }
+    .detail .close { min-width: 32px; min-height: 32px; padding: 0; font-size: 18px; }
+    .legend { display: flex; gap: 18px; flex-wrap: wrap; padding: 13px 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 21px; height: 3px; border-radius: 3px; background: var(--edge-default); }
+    .swatch.task { background: var(--edge-task); }
+    .swatch.data { background: var(--edge-data); }
+    .swatch.tools { background: var(--edge-tools); }
+    .swatch.ops { background: var(--edge-ops); }
+    .dash { width: 22px; height: 0; border-top: 2px dashed var(--line-strong); }
+    .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; }
+    .note { border: 1px solid var(--line); border-radius: 14px; padding: 14px 15px; background: color-mix(in srgb, var(--surface) 72%, transparent); }
+    .note strong { display: block; font-size: 12px; margin-bottom: 5px; }
+    .note p { margin: 0; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+    @media (max-width: 900px) {
+      .shell { padding: 14px; }
+      header { display: block; }
+      .header-actions { margin-top: 14px; justify-content: flex-start; }
+      .notes { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <div class="eyebrow">Paperclip Agent Platform · architecture</div>
+        <h1>Как связана агентская платформа</h1>
+        <p class="subtitle">Интерактивный обзор: выберите сценарий или нажмите на компонент. Карта показывает границы владения; готовность конкретной ревизии подтверждает только сгенерированное acceptance evidence.</p>
+      </div>
+      <div class="header-actions">
+        <span class="architecture-pill">ARCHITECTURE · EVIDENCE PER REVISION</span>
+        <button id="themeToggle" type="button" aria-label="Переключить цветовую тему">Тема</button>
+      </div>
+    </header>
+
+    <nav class="flowbar" aria-label="Сценарии архитектуры">
+      <button class="active" data-flow="all" type="button">Вся платформа</button>
+      <button data-flow="task" type="button">Запуск задачи</button>
+      <button data-flow="data" type="button">Данные и документы</button>
+      <button data-flow="tools" type="button">Инструменты и OAuth</button>
+      <button data-flow="ops" type="button">Эксплуатация и мониторинг</button>
+    </nav>
+
+    <section class="diagram-card" aria-label="Архитектурная диаграмма">
+      <div class="canvas">
+        <svg id="architecture" viewBox="0 0 1600 910" role="img" aria-labelledby="diagramTitle diagramDesc">
+          <title id="diagramTitle">Архитектура Paperclip Agent Platform</title>
+          <desc id="diagramDesc">Потоки от расписаний и Telegram через Kestra, Hermes, Paperclip, Daytona и Codex, Claude Code или Pi к инструментам, данным, GitHub и наблюдаемости.</desc>
+          <defs>
+            <marker id="arrow-default" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="var(--edge-default)"/></marker>
+            <marker id="arrow-task" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="var(--edge-task)"/></marker>
+            <marker id="arrow-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="var(--edge-data)"/></marker>
+            <marker id="arrow-tools" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="var(--edge-tools)"/></marker>
+            <marker id="arrow-ops" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 Z" fill="var(--edge-ops)"/></marker>
+          </defs>
+
+          <!-- Zones -->
+          <rect class="zone" data-zone="task" x="20" y="55" width="220" height="530" rx="18"/>
+          <text class="zone-title" x="42" y="84">Точки входа</text><text class="zone-sub" x="42" y="102">люди, сообщения, расписания</text>
+          <rect class="zone control" data-zone="task" x="260" y="55" width="390" height="530" rx="18"/>
+          <text class="zone-title" x="282" y="84">Control plane</text><text class="zone-sub" x="282" y="102">оркестрация, пул агентов, статусы</text>
+          <rect class="zone runtime" data-zone="task tools" x="670" y="55" width="390" height="530" rx="18"/>
+          <text class="zone-title" x="692" y="84">Execution plane</text><text class="zone-sub" x="692" y="102">изолированные workspaces и native harness</text>
+          <rect class="zone integrations" data-zone="task tools" x="1080" y="55" width="500" height="530" rx="18"/>
+          <text class="zone-title" x="1102" y="84">Инструменты и внешние системы</text><text class="zone-sub" x="1102" y="102">MCP, OAuth, research, GitHub, коммуникации</text>
+          <rect class="zone data" data-zone="data" x="20" y="605" width="1040" height="280" rx="18"/>
+          <text class="zone-title" x="42" y="635">Data &amp; knowledge plane</text><text class="zone-sub" x="42" y="653">канонические данные отдельно от заменяемых представлений</text>
+          <rect class="zone ops" data-zone="ops" x="1080" y="605" width="500" height="280" rx="18"/>
+          <text class="zone-title" x="1102" y="635">Platform operations</text><text class="zone-sub" x="1102" y="653">деплой, конфигурация, edge и наблюдаемость</text>
+
+          <!-- Edges: task -->
+          <path class="edge task" data-flow="task" d="M210 180 H310"/>
+          <path class="edge task" data-flow="task" d="M210 300 H310"/>
+          <path class="edge task" data-flow="task" d="M210 420 H310"/>
+          <path class="edge task" data-flow="task" d="M500 180 V254"/>
+          <path class="edge task" data-flow="task" d="M500 350 V396"/>
+          <path class="edge task" data-flow="task" d="M570 300 H700 V180 H730"/>
+          <path class="edge task" data-flow="task" d="M570 444 H700 V180 H730"/>
+          <path class="edge task" data-flow="task" d="M840 225 V277"/>
+          <path class="edge task" data-flow="task" d="M840 375 V425"/>
+          <path class="edge task return" data-flow="task" d="M730 487 H625 V482"/>
+          <path class="edge task" data-flow="task" d="M950 487 H1130"/>
+          <path class="edge task" data-flow="task" d="M950 465 H1015 V360 H1130"/>
+          <path class="edge task return" data-flow="task" d="M1240 405 V488"/>
+          <path class="edge task" data-flow="task" d="M1350 360 H1460 V212 H1410"/>
+
+          <!-- Edges: data -->
+          <path class="edge data-flow" data-flow="data" d="M500 530 V685"/>
+          <path class="edge data-flow" data-flow="data" d="M840 530 V665 H340 V685"/>
+          <path class="edge data-flow" data-flow="data" d="M460 730 H520"/>
+          <path class="edge data-flow" data-flow="data" d="M720 730 H780"/>
+          <path class="edge data-flow" data-flow="data" d="M915 775 V820 H690"/>
+          <path class="edge data-flow readonly" data-flow="data" d="M1130 180 H1030 V830 H960"/>
+          <path class="edge data-flow" data-flow="data" d="M1130 300 H1020 V700 H720"/>
+
+          <!-- Edges: tools -->
+          <path class="edge tools" data-flow="tools" d="M950 330 H1130"/>
+          <path class="edge tools" data-flow="tools" d="M1240 225 V255"/>
+          <path class="edge tools" data-flow="tools" d="M1350 300 H1390"/>
+          <path class="edge tools" data-flow="tools" d="M1240 345 V375"/>
+          <path class="edge tools" data-flow="tools" d="M1350 420 H1390"/>
+
+          <!-- Edges: ops -->
+          <path class="edge ops-flow" data-flow="ops" d="M1210 710 H1260"/>
+          <path class="edge ops-flow" data-flow="ops" d="M1380 710 H1430"/>
+          <path class="edge ops-flow" data-flow="ops" d="M1150 755 V800 H1220"/>
+          <path class="edge ops-flow" data-flow="ops" d="M1340 755 V800 H1460"/>
+          <path class="edge ops-flow return" data-flow="ops" d="M1460 755 V540 H1350"/>
+          <path class="edge ops-flow" data-flow="ops" d="M1550 800 H1570 V180 H1410"/>
+
+          <!-- Entry nodes -->
+          <g class="node" data-node="operator" data-flows="task ops" tabindex="0" role="button" transform="translate(50 135)">
+            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Оператор</text><text class="node-sub" x="18" y="54">Web UI · Cloudflare Access</text><text class="node-sub" x="18" y="70">human identity</text>
+          </g>
+          <g class="node" data-node="telegram" data-flows="task" tabindex="0" role="button" transform="translate(50 255)">
+            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Telegram</text><text class="node-sub" x="18" y="54">сообщение пользователю</text><text class="node-sub" x="18" y="70">webhook + allowlist</text>
+          </g>
+          <g class="node" data-node="schedules" data-flows="task" tabindex="0" role="button" transform="translate(50 375)">
+            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Schedules / events</text><text class="node-sub" x="18" y="54">основная точка входа</text><text class="node-sub" x="18" y="70">cron · webhook · API</text>
+          </g>
+
+          <!-- Control nodes -->
+          <g class="node core" data-node="hermes" data-flows="task ops tools" tabindex="0" role="button" transform="translate(310 135)">
+            <rect class="main" width="190" height="90" rx="14"/><text class="node-title" x="18" y="34">Hermes</text><text class="node-sub" x="18" y="54">native operator gateway</text><text class="node-sub" x="18" y="70">messages · diagnosis · repair</text>
+          </g>
+          <g class="node core" data-node="kestra" data-flows="task data ops" tabindex="0" role="button" transform="translate(310 255)">
+            <rect class="main" width="260" height="95" rx="14"/><text class="node-title" x="18" y="34">Kestra</text><text class="node-sub" x="18" y="54">schedules · workflow DAG · retries</text><text class="node-sub" x="18" y="70">approval stages</text>
+          </g>
+          <g class="node core" data-node="paperclip" data-flows="task data ops" tabindex="0" role="button" transform="translate(310 396)">
+            <rect class="main" width="315" height="134" rx="14"/><text class="node-title" x="18" y="32">Paperclip</text><text class="node-sub" x="18" y="53">агентские задачи · heartbeats · сообщения</text><text class="node-sub" x="18" y="70">профили · secret scopes · workspace binding</text><rect class="badge-control" x="18" y="86" width="158" height="18" rx="9"/><text class="node-badge badge-text-control" x="97" y="98.5" text-anchor="middle">IMMUTABLE DIGEST IMAGE</text><text class="node-sub" x="18" y="120">не business workflow engine</text>
+          </g>
+
+          <!-- Runtime nodes -->
+          <g class="node runtime-node" data-node="daytona" data-flows="task ops" tabindex="0" role="button" transform="translate(730 135)">
+            <rect class="main" width="220" height="90" rx="14"/><text class="node-title" x="18" y="34">Daytona</text><text class="node-sub" x="18" y="54">isolated sandbox/workspace</text><text class="node-sub" x="18" y="70">profile-selected environment</text>
+          </g>
+          <g class="node runtime-node" data-node="harnesses" data-flows="task data tools" tabindex="0" role="button" transform="translate(730 277)">
+            <rect class="main" width="220" height="98" rx="14"/><text class="node-title" x="18" y="31">Native harness</text><text class="node-sub" x="18" y="51">instructions · skills · MCP · plugins</text><rect class="badge-runtime" x="18" y="65" width="54" height="18" rx="9"/><text class="node-badge badge-text-runtime" x="45" y="77.5" text-anchor="middle">CODEX</text><rect class="badge-runtime" x="78" y="65" width="62" height="18" rx="9"/><text class="node-badge badge-text-runtime" x="109" y="77.5" text-anchor="middle">CLAUDE</text><rect class="badge-runtime" x="146" y="65" width="56" height="18" rx="9"/><text class="node-badge badge-text-runtime" x="174" y="77.5" text-anchor="middle">PI / E2E</text>
+          </g>
+          <g class="node runtime-node" data-node="router" data-flows="task" tabindex="0" role="button" transform="translate(730 425)">
+            <rect class="main" width="220" height="105" rx="14"/><text class="node-title" x="18" y="31">9router</text><text class="node-sub" x="18" y="51">profile-scoped LLM gateway</text><text class="node-sub" x="18" y="67">route → MiniMax</text><rect class="badge-runtime" x="18" y="79" width="134" height="17" rx="8"/><text class="node-badge badge-text-runtime" x="85" y="91" text-anchor="middle">NO DIRECT PROVIDER KEY</text>
+          </g>
+
+          <!-- Integration nodes -->
+          <g class="node tool-node" data-node="toolhive" data-flows="tools data" tabindex="0" role="button" transform="translate(1130 135)">
+            <rect class="main" width="220" height="90" rx="14"/><text class="node-title" x="18" y="34">ToolHive</text><text class="node-sub" x="18" y="54">MCP aggregation + policy</text><rect class="badge-tools" x="18" y="66" width="152" height="16" rx="8"/><text class="node-badge badge-text-tools" x="94" y="77.5" text-anchor="middle">PROFILE-PRIVATE BUNDLES</text>
+          </g>
+          <g class="node tool-node" data-node="extensions" data-flows="tools data" tabindex="0" role="button" transform="translate(1130 255)">
+            <rect class="main" width="220" height="90" rx="14"/><text class="node-title" x="18" y="34">Connector extensions</text><text class="node-sub" x="18" y="54">optional, not shipped</text><text class="node-sub" x="18" y="70">scoped credentials</text>
+          </g>
+          <g class="node tool-node" data-node="firecrawl" data-flows="tools" tabindex="0" role="button" transform="translate(1130 375)">
+            <rect class="main" width="220" height="90" rx="14"/><text class="node-title" x="18" y="34">Firecrawl</text><text class="node-sub" x="18" y="54">crawl · scrape · extraction</text><text class="node-sub" x="18" y="70">через SearXNG search</text>
+          </g>
+          <g class="node external" data-node="minimax" data-flows="task" tabindex="0" role="button" transform="translate(1130 488)">
+            <rect class="main" width="220" height="70" rx="14"/><text class="node-title" x="18" y="30">MiniMax / LLM providers</text><text class="node-sub" x="18" y="50">outbound route through 9router</text>
+          </g>
+          <g class="node external" data-node="saas" data-flows="tools" tabindex="0" role="button" transform="translate(1390 255)">
+            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">SaaS APIs</text><text class="node-sub" x="18" y="54">Gmail и сотни</text><text class="node-sub" x="18" y="70">других сервисов</text>
+          </g>
+          <g class="node external" data-node="searxng" data-flows="tools" tabindex="0" role="button" transform="translate(1390 375)">
+            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">SearXNG</text><text class="node-sub" x="18" y="54">private metasearch</text><text class="node-sub" x="18" y="70">research input</text>
+          </g>
+          <g class="node external" data-node="github" data-flows="task" tabindex="0" role="button" transform="translate(1390 135)">
+            <rect class="main" width="160" height="77" rx="14"/><text class="node-title" x="18" y="32">GitHub</text><text class="node-sub" x="18" y="52">repo · branch · PR · checks</text>
+          </g>
+          <g class="node tool-node" data-node="mattermost" data-flows="task ops" tabindex="0" role="button" transform="translate(1390 488)">
+            <rect class="main" width="160" height="70" rx="14"/><text class="node-title" x="18" y="29">Mattermost</text><text class="node-sub" x="18" y="49">events · approvals · alerts</text>
+          </g>
+
+          <!-- Data nodes -->
+          <g class="node data-node" data-node="postgrest" data-flows="data" tabindex="0" role="button" transform="translate(280 685)">
+            <rect class="main" width="180" height="90" rx="14"/><text class="node-title" x="18" y="34">PostgREST</text><text class="node-sub" x="18" y="54">scoped internal API</text><text class="node-sub" x="18" y="70">separate RLS roles</text>
+          </g>
+          <g class="node data-node core" data-node="postgres" data-flows="data" tabindex="0" role="button" transform="translate(520 680)">
+            <rect class="main" width="200" height="100" rx="14"/><text class="node-title" x="18" y="32">PostgreSQL</text><text class="node-sub" x="18" y="53">entities · documents · revisions</text><text class="node-sub" x="18" y="69">outbox · provider sync state</text><rect class="badge-data" x="18" y="78" width="69" height="16" rx="8"/><text class="node-badge badge-text-data" x="52.5" y="89.5" text-anchor="middle">ONLY SSOT</text>
+          </g>
+          <g class="node data-node" data-node="connector" data-flows="data" tabindex="0" role="button" transform="translate(780 680)">
+            <rect class="main" width="180" height="95" rx="14"/><text class="node-title" x="18" y="31">Connector / outbox</text><text class="node-sub" x="18" y="51">lease · retry · idempotency</text><rect class="badge-data" x="18" y="65" width="122" height="17" rx="8"/><text class="node-badge badge-text-data" x="79" y="77" text-anchor="middle">REPLACEABLE ADAPTER</text>
+          </g>
+          <g class="node data-node external" data-node="notion" data-flows="data" tabindex="0" role="button" transform="translate(690 800)">
+            <rect class="main" width="270" height="62" rx="14"/><text class="node-title" x="18" y="27">Notion</text><text class="node-sub" x="18" y="45">replaceable tables + documents projection</text><rect class="badge-data" x="177" y="19" width="75" height="17" rx="8"/><text class="node-badge badge-text-data" x="214.5" y="31" text-anchor="middle">NOT SSOT</text>
+          </g>
+          <g class="node data-node external" data-node="future-connectors" data-flows="data" tabindex="0" role="button" transform="translate(280 810)">
+            <rect class="main" width="350" height="52" rx="14"/><text class="node-title" x="18" y="24">Другие проекции</text><text class="node-sub" x="18" y="40">separate connector packages</text>
+          </g>
+
+          <!-- Ops nodes -->
+          <g class="node ops-node" data-node="config" data-flows="ops" tabindex="0" role="button" transform="translate(1100 675)">
+            <rect class="main" width="110" height="80" rx="14"/><text class="node-title" x="14" y="29">platform.env</text><text class="node-sub" x="14" y="47">config/ SSOT</text><text class="node-sub" x="14" y="63">server runtime</text>
+          </g>
+          <g class="node ops-node" data-node="compose" data-flows="ops" tabindex="0" role="button" transform="translate(1260 675)">
+            <rect class="main" width="120" height="80" rx="14"/><text class="node-title" x="16" y="30">Compose</text><text class="node-sub" x="16" y="49">incremental</text><text class="node-sub" x="16" y="65">Docker runtime</text>
+          </g>
+          <g class="node ops-node" data-node="cloudflare" data-flows="ops task" tabindex="0" role="button" transform="translate(1430 675)">
+            <rect class="main" width="120" height="80" rx="14"/><text class="node-title" x="14" y="29">Cloudflare</text><text class="node-sub" x="14" y="47">DNS · Tunnel</text><text class="node-sub" x="14" y="63">per-route Access</text>
+          </g>
+          <g class="node ops-node" data-node="observability" data-flows="ops" tabindex="0" role="button" transform="translate(1220 800)">
+            <rect class="main" width="330" height="62" rx="14"/><text class="node-title" x="16" y="27">OTel → Victoria* → Grafana / Alertmanager</text><text class="node-sub" x="16" y="45">metrics · logs · traces · alerts → Mattermost</text>
+          </g>
+        </svg>
+      </div>
+
+      <aside class="detail" id="detail" aria-live="polite">
+        <div class="detail-head"><div><div class="kind" id="detailKind">Компонент</div><h2 id="detailTitle">Компонент</h2></div><button class="close" id="detailClose" type="button" aria-label="Закрыть">×</button></div>
+        <p id="detailText"></p><ul id="detailList"></ul>
+      </aside>
+      <div class="legend">
+        <span><i class="swatch task"></i> управление задачей</span><span><i class="swatch data"></i> данные</span><span><i class="swatch tools"></i> инструменты / OAuth</span><span><i class="swatch ops"></i> эксплуатация</span><span><i class="dash"></i> внешний или read-only контур</span>
+      </div>
+    </section>
+
+    <section class="notes" aria-label="Ключевые архитектурные решения">
+      <article class="note"><strong>Нет overfit под coding</strong><p>Paperclip и Kestra управляют общими задачами и workflow. Codex, Claude Code и Pi — только три runtime-профиля; через тот же control plane можно запускать research, content и operational jobs.</p></article>
+      <article class="note"><strong>Данные переживут любой UI</strong><p>Канонические записи и документы живут в PostgreSQL. Notion получает проекции через outbox-коннектор и может быть заменён без миграции source-of-truth.</p></article>
+      <article class="note"><strong>Секреты не идут напрямую агентам</strong><p>Профили получают scoped runtime keys. Notion write identity и credentials будущих connector packages остаются вне harness; ToolHive ограничивает доступный MCP toolset.</p></article>
+    </section>
+  </main>
+
+  <script>
+    const details = {
+      operator: ['Точка входа', 'Человек открывает UI через Cloudflare Access.', ['Paperclip, Kestra, Grafana и Mattermost', 'Прямые origin-порты не публикуются']],
+      telegram: ['Точка входа', 'Telegram сообщения попадают в Hermes только через явно объявленный webhook и allowlist.', ['Telegram → Hermes → scoped Paperclip task bridge', 'Точное path, signature, replay и payload controls принадлежат integration owner', 'Публикация webhook не следует из одной декларации']],
+      schedules: ['Точка входа', 'Kestra хранит внешнее workflow state и создаёт нативные Paperclip Issues для задач.', ['Декларативные workflow YAML', 'Schedules, branching, retries и approval stages', 'Issue → Daytona → GitHub требует source-bound E2E evidence']],
+      hermes: ['Операторский gateway', 'Hermes остаётся официальным upstream gateway/runtime для сообщений, диагностики и ремонта, без platform-specific proxy или command API.', ['Маршрут к LLM только через 9router', 'Scoped Paperclip task bridge', 'Доступ к хосту является явным решением профиля']],
+      kestra: ['Workflow orchestration', 'Kestra владеет schedules, branching, retries, approvals и внешним workflow state; Paperclip владеет агентской задачей.', ['Native Paperclip Issue API', 'Terminal gates и cleanup принадлежат workflow', 'Не заменяет agent control plane']],
+      paperclip: ['Agent control plane', 'Paperclip владеет Issues, assignment, heartbeats, messages и run status. Его MTE runtime задаётся только immutable digest-pinned image.', ['Profiles, environments и secret scopes рендерятся из декларативного каталога', 'Не является business workflow engine', 'Mutable tags и ручная подмена runtime image запрещены']],
+      daytona: ['Execution environment', 'Daytona создаёт изолированный workspace и environment, выбранные профилем Paperclip.', ['Outer isolation boundary для native harness', 'Codex, Claude Code и Pi выполняются внутри workspace', 'Профиль задаёт limits и workspace contract']],
+      harnesses: ['Native harnesses', 'Codex, Claude Code и Pi получают profile-scoped routes, instructions, skills и разрешённые MCP integrations.', ['Нет platform-owned LLM loop', 'Каждый harness получает отдельный 9router key reference', 'GitHub work product и cleanup подтверждаются E2E evidence']],
+      router: ['LLM gateway', '9router — единственный LLM route shipped harness profiles; root-only MiniMax credential остаётся за gateway.', ['Отдельный runtime key на профиль', 'MiniMax provider route', 'Harness не хранит provider credential']],
+      toolhive: ['Tool plane', 'ToolHive управляет MCP workloads и profile-private aggregates, а agent-plane gateway применяет binding и bearer policy.', ['Profile vMCP и allow-list', 'Нельзя использовать endpoint или bearer другого профиля', 'Docker control plane не публикуется']],
+      extensions: ['Connector extensions', 'Опциональные пакеты могут добавлять OAuth/API integrations без изменения core.', ['Core не поставляет OAuth hub', 'Consent остаётся обязательным', 'Секреты не передаются harness']],
+      firecrawl: ['Research tool', 'Firecrawl — backend research-инструмента, а не сборка из исходников.', ['Scrape / crawl / extract', 'SearXNG доступен как private metasearch', 'Доступ агентам задаётся profile tool bundle']],
+      minimax: ['External LLM', 'MiniMax — upstream provider profile routes в этой платформенной конфигурации.', ['Доступ только через 9router', 'Harness не хранит provider credential']],
+      saas: ['External systems', 'Gmail — лишь пример. Этот контур рассчитан на OAuth/API-интеграции через опциональные connector packages.', ['Connector-owned credentials', 'Curated actions вместо передачи raw token агенту']],
+      searxng: ['Search service', 'Self-hosted metasearch для research-задач.', ['Internal endpoint для Firecrawl/agents', 'Human UI защищён Cloudflare Access']],
+      github: ['Code collaboration', 'Репозитории, ветки, draft PR и checks для coding workflow.', ['Scoped token', 'Branch/commit/PR evidence', 'Kestra проверяет terminal checks']],
+      mattermost: ['Communications', 'Mattermost принимает события, approvals и Alertmanager notifications; Hermes может связывать ответ с Paperclip task/run.', ['Alert delivery', 'Operator communication', 'Scoped integration credentials']],
+      postgrest: ['Scoped data API', 'Единый внутренний API к каноническим данным PostgreSQL.', ['Paperclip role; отдельные роли для extensions', 'RLS isolation', 'Нет публичного hostname']],
+      postgres: ['Canonical data plane', 'Единственный источник истины для сущностей, документов, ревизий и состояния синхронизации.', ['UI и внешние провайдеры заменяемы', 'Transactional outbox', 'Provider sync state', 'Persistence и negative-access tests']],
+      connector: ['Projection connector', 'Читает payload-free outbox, арендует события и синхронизирует выбранный provider идемпотентно.', ['Retry / lease / SKIP LOCKED', 'Read-back и content hash', 'Provider credential из secret store']],
+      notion: ['Replaceable projection', 'Notion остаётся human-facing проекцией, а PostgreSQL — SSOT. Leased connector читает canonical payload, выполняет write и проверяет remote ID, revision и hash.', ['Отдельная tables projection', 'Отдельная documents projection', 'Write выполняет connector identity', 'Projection не является recoverable canonical copy']],
+      'future-connectors': ['Extension point', 'Вместо Notion можно подключить другой tables/docs provider без переноса SSOT.', ['Отдельный connector package', 'Отдельный license review', 'Тот же outbox/read-back contract']],
+      config: ['Configuration SSOT', 'Оператор меняет только config/platform.env; root-only server env является runtime-материализацией.', ['Generated projections', 'Source hash', 'Permissions 0700/0600', 'Секреты не попадают в evidence']],
+      compose: ['Deployment runtime', 'Простой install.sh вызывает единый Docker Compose project на одном сервере.', ['Смысловые этапы вызываются отдельно', 'Повторный up идемпотентен', 'Docker Engine не публикуется']],
+      cloudflare: ['Edge security', 'Cloudflare создаёт DNS, outbound Tunnel и Access applications только для объявленных human и service routes.', ['Отдельные Access app, policy и service credential для каждого route', 'Internal и loopback APIs не получают public origin', 'WAF, rate limits и webhook route policies не создаются этим модулем']],
+      observability: ['Observability', 'OTel собирает correlated telemetry; Victoria хранит metrics/logs/traces; Grafana отображает, Alertmanager уведомляет.', ['task_id, run_id, profile_ref и source hash', 'Internal backends', 'Acceptance ищет correlated metric, log, trace и alert delivery']]
+    };
+
+    const svg = document.getElementById('architecture');
+    const flowButtons = [...document.querySelectorAll('[data-flow]')].filter(el => el.tagName === 'BUTTON');
+    function selectFlow(flow) {
+      flowButtons.forEach(button => button.classList.toggle('active', button.dataset.flow === flow));
+      const filtered = flow !== 'all';
+      svg.classList.toggle('filtered', filtered);
+      svg.querySelectorAll('.edge').forEach(edge => edge.classList.toggle('active', !filtered || edge.dataset.flow === flow));
+      svg.querySelectorAll('.node').forEach(node => {
+        const flows = (node.dataset.flows || '').split(' ');
+        node.classList.toggle('active', !filtered || flows.includes(flow));
+      });
+      svg.querySelectorAll('.zone').forEach(zone => {
+        const zones = (zone.dataset.zone || '').split(' ');
+        zone.classList.toggle('active', !filtered || zones.includes(flow));
+      });
+    }
+    flowButtons.forEach(button => button.addEventListener('click', () => selectFlow(button.dataset.flow)));
+
+    const detail = document.getElementById('detail');
+    function showDetail(id) {
+      const data = details[id]; if (!data) return;
+      document.getElementById('detailKind').textContent = data[0];
+      document.getElementById('detailTitle').textContent = document.querySelector(`[data-node="${id}"] .node-title`)?.textContent || id;
+      document.getElementById('detailText').textContent = data[1];
+      document.getElementById('detailList').innerHTML = data[2].map(item => `<li>${item}</li>`).join('');
+      detail.classList.add('open');
+    }
+    document.querySelectorAll('[data-node]').forEach(node => {
+      node.addEventListener('click', () => showDetail(node.dataset.node));
+      node.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showDetail(node.dataset.node); } });
+    });
+    document.getElementById('detailClose').addEventListener('click', () => detail.classList.remove('open'));
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') detail.classList.remove('open'); });
+
+    document.getElementById('themeToggle').addEventListener('click', () => {
+      const dark = document.documentElement.classList.toggle('dark');
+      localStorage.setItem('mte-diagram-theme', dark ? 'dark' : 'light');
+    });
+  </script>
+</body>
+</html>

@@ -12,6 +12,7 @@ import argparse
 import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -41,47 +42,33 @@ CONFIG = ROOT / "config/platform.json"
 BOOTSTRAP = ROOT / "evidence/paperclip-bootstrap.json"
 PLATFORM_ENV = Path("/root/.config/mte-secrets/platform.env")
 EVIDENCE_ROOT = ROOT / "evidence"
-DAYTONA_STEP_SOURCE = ROOT / "steps/60-daytona.sh"
+DAYTONA_STEP_SOURCE = ROOT / "steps/daytona.sh"
 API_VERSION = "micro-task-engine/v1alpha1"
 DEFAULT_PROFILE_CATALOG = load_profile_catalog(default_catalog_path())
-DAYTONA_PROFILE_REFS = DEFAULT_PROFILE_CATALOG.refs
-DAYTONA_IMAGE_CONTRACT_KEYS = (
-    "DAYTONA_TARGET",
-    "MTE_DAYTONA_SANDBOX_BASE_IMAGE",
-    "MTE_CODEX_VERSION",
-    "MTE_CLAUDE_CODE_VERSION",
-    "MTE_PI_VERSION",
-    "MTE_CODEX_NPM_INTEGRITY",
-    "MTE_CLAUDE_CODE_NPM_INTEGRITY",
-    "MTE_PI_NPM_INTEGRITY",
-    "MTE_TOOLHIVE_VERSION",
-    "MTE_TOOLHIVE_ARCHIVE_SHA256",
-    "MTE_GITHUB_CLI_VERSION",
-    "MTE_GITHUB_CLI_ARCHIVE_SHA256",
-    "MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL",
-    "HERMES_LLM_MODEL",
-    "MTE_PI_CODING_AGENT_DIR",
-    "MTE_DAYTONA_CODING_SNAPSHOT",
-    "MTE_DAYTONA_GENERAL_SNAPSHOT",
-    "MTE_DAYTONA_CODING_CPU",
-    "MTE_DAYTONA_CODING_MEMORY_GIB",
-    "MTE_DAYTONA_GENERAL_CPU",
-    "MTE_DAYTONA_GENERAL_MEMORY_GIB",
-    "MTE_DAYTONA_DISK_GIB",
+DAYTONA_PROFILE_REFS = (
+    "coding-daytona-codex",
+    "coding-daytona-claude",
+    "coding-daytona-pi",
 )
-DAYTONA_LIFECYCLE_STATES = (
-    ("created", "started"),
-    ("file-roundtrip", "started"),
-    ("stopped", "stopped"),
-    ("restarted", "started"),
-    ("stopped-before-archive", "stopped"),
-    ("archive-requested", "archiving"),
-    ("archived", "archived"),
-    ("restored-from-archive", "restored"),
-    ("refreshed", "started"),
-    ("final-stop", "stopped"),
-    ("cleanup", "deleted"),
-)
+DAYTONA_HARNESS_CONTRACTS = {
+    "coding-daytona-codex": {
+        "harnessKind": "codex",
+        "runtimeSecretEnv": "OPENAI_API_KEY",
+        "protocol": "openai-responses",
+    },
+    "coding-daytona-claude": {
+        "harnessKind": "claude",
+        "runtimeSecretEnv": "ANTHROPIC_API_KEY",
+        "protocol": "anthropic-messages",
+    },
+    "coding-daytona-pi": {
+        "harnessKind": "pi",
+        "runtimeSecretEnv": "OPENAI_API_KEY",
+        "protocol": "openai-chat-completions",
+    },
+}
+DAYTONA_ROUTER_PROVIDER = "9router"
+MINIMAX_MODEL_FRAGMENT = "mte-minimax/"
 EXPECTED_ENVIRONMENT_PROBE_WARNINGS = {
     ref: frozenset(profile["runtimeContract"]["probe"]["acceptedWarnings"])
     for ref, profile in DEFAULT_PROFILE_CATALOG.by_ref.items()
@@ -94,7 +81,23 @@ ENVIRONMENT_PROBE_ATTEMPTS = 3
 ENVIRONMENT_PROBE_RETRY_SECONDS = 2
 FULL_SHA256 = re.compile(r"[a-f0-9]{64}")
 FULL_IMAGE_DIGEST = re.compile(r"sha256:[a-f0-9]{64}")
+FULL_IMAGE_REFERENCE = re.compile(r"[^\s@]+@sha256:[a-f0-9]{64}")
 EXACT_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Z][A-Z0-9_]*):\?required\}")
+DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+HARNESS_VERSION_PATTERNS = {
+    "codex": re.compile(r"(?:codex(?:-cli)?\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)"),
+    "claude": re.compile(
+        r"(?:claude\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)(?: \(Claude Code\))?"
+    ),
+    "pi": re.compile(r"(?:pi\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)"),
+}
+
+
+def normalized_harness_version(name: str, output: object) -> str | None:
+    """Return the sole exact CLI semantic version, or fail closed."""
+    pattern = HARNESS_VERSION_PATTERNS.get(name)
+    match = pattern.fullmatch(str(output or "").strip()) if pattern else None
+    return match.group(1) if match else None
 
 
 class ControlError(RuntimeError):
@@ -125,6 +128,134 @@ def dotenv(path: Path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key] = value
     return values
+
+
+def validated_operator_api_base(
+    value: Any,
+    *,
+    setting: str,
+    expected_path: str,
+) -> str:
+    """Return one explicit operator API base or fail before network access."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ControlError(
+            "missing_canonical_config",
+            f"{setting} must be a non-empty canonical URL",
+        )
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ControlError(
+            "invalid_canonical_config", f"{setting} is not a valid URL"
+        ) from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise ControlError(
+            "invalid_canonical_config",
+            f"{setting} must use http or https",
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ControlError(
+            "invalid_canonical_config",
+            f"{setting} must not contain credentials",
+        )
+    hostname = parsed.hostname or ""
+    if not hostname or port is None or not 1 <= port <= 65535:
+        raise ControlError(
+            "invalid_canonical_config",
+            f"{setting} must contain an explicit host and port",
+        )
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        labels = hostname.rstrip(".").split(".")
+        if (
+            len(hostname) > 253
+            or hostname.endswith(".")
+            or not labels
+            or any(not DNS_LABEL.fullmatch(label) for label in labels)
+        ):
+            raise ControlError(
+                "invalid_canonical_config",
+                f"{setting} contains an invalid host",
+            )
+    if parsed.path != expected_path or parsed.query or parsed.fragment:
+        path_label = expected_path or "an origin-only URL"
+        raise ControlError(
+            "invalid_canonical_config",
+            f"{setting} must use {path_label} without query or fragment",
+        )
+    return value
+
+
+def canonical_paperclip_api_base(experimental: dict[str, Any]) -> str:
+    values = dotenv(PLATFORM_ENV)
+    rendered = experimental.get("apiBase")
+    canonical = values.get("PAPERCLIP_API_BASE")
+    if not isinstance(rendered, str) or not rendered:
+        raise ControlError(
+            "missing_canonical_config",
+            "spec.paperclipExperimental.apiBase is required",
+        )
+    if canonical is None or not canonical:
+        raise ControlError(
+            "missing_canonical_config",
+            "PAPERCLIP_API_BASE is required in canonical platform.env",
+        )
+    if rendered != canonical:
+        raise ControlError(
+            "canonical_config_drift",
+            "Paperclip API base differs between rendered config and platform.env",
+        )
+    return validated_operator_api_base(
+        canonical,
+        setting="PAPERCLIP_API_BASE",
+        expected_path="",
+    )
+
+
+def canonical_daytona_api_base(
+    values: dict[str, str],
+    spec: dict[str, Any] | None = None,
+) -> str:
+    operator_base = validated_operator_api_base(
+        values.get("MTE_DAYTONA_API_URL"),
+        setting="MTE_DAYTONA_API_URL",
+        expected_path="/api",
+    )
+    if spec is None:
+        return operator_base
+    api_url_ref = spec.get("apiUrlRef")
+    if api_url_ref != "PAPERCLIP_DAYTONA_UPSTREAM_URL":
+        raise ControlError(
+            "invalid_canonical_config",
+            "Paperclip Daytona driver must use PAPERCLIP_DAYTONA_UPSTREAM_URL",
+        )
+    driver_base = values.get(api_url_ref)
+    if driver_base is None or not driver_base:
+        raise ControlError(
+            "missing_canonical_config",
+            f"{api_url_ref} is required in canonical platform.env",
+        )
+    driver_base = validated_operator_api_base(
+        driver_base,
+        setting=api_url_ref,
+        expected_path="/api",
+    )
+    internal_port = values.get("MTE_DAYTONA_API_INTERNAL_PORT", "")
+    expected_driver_base = f"http://mte-daytona-api:{internal_port}/api"
+    operator_host = urllib.parse.urlsplit(operator_base).hostname
+    if (
+        not internal_port.isdigit()
+        or driver_base != expected_driver_base
+        or operator_host != "127.0.0.1"
+        or driver_base == operator_base
+    ):
+        raise ControlError(
+            "canonical_config_drift",
+            "Daytona operator and Paperclip driver API routes are not strictly separated",
+        )
+    return driver_base
 
 
 def settings() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -159,16 +290,113 @@ def catalog_value(value: Any, values: dict[str, str]) -> str:
     return ""
 
 
+def required_daytona_profile_refs(
+    profile_catalog: Any, values: dict[str, str]
+) -> tuple[str, ...]:
+    """Validate the three first-class harnesses use MiniMax through 9Router.
+
+    The profile catalog is the declaration; this guard makes it impossible for
+    R1 reconciliation or evidence validation to quietly omit one native
+    harness or fall back to a direct provider, subscription, or OAuth flow.
+    """
+    if tuple(getattr(profile_catalog, "refs", ())) != DAYTONA_PROFILE_REFS:
+        raise ControlError(
+            "daytona_harness_contract_invalid",
+            "the Paperclip catalog must declare exactly Codex, Claude, and Pi",
+        )
+    if not values.get("MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL"):
+        raise ControlError(
+            "daytona_harness_contract_invalid",
+            "the 9Router OpenAI-compatible gateway is not configured",
+        )
+
+    for profile_ref in DAYTONA_PROFILE_REFS:
+        try:
+            profile = profile_catalog.require(profile_ref)
+        except Exception as exc:
+            raise ControlError(
+                "daytona_harness_contract_invalid",
+                f"{profile_ref} is missing from the catalog",
+            ) from exc
+        runtime = profile.get("runtimeContract")
+        routing = profile.get("llmRouting")
+        adapter = profile.get("nativeAdapterConfig")
+        auth_policy = profile.get("authPolicy")
+        expected_runtime = DAYTONA_HARNESS_CONTRACTS[profile_ref]
+        if not all(
+            isinstance(value, dict)
+            for value in (runtime, routing, adapter, auth_policy)
+        ):
+            raise ControlError(
+                "daytona_harness_contract_invalid",
+                f"{profile_ref} has an incomplete runtime contract",
+            )
+        model = catalog_value(adapter.get("model"), values)
+        expected_key_ref = (
+            "NINEROUTER_PROFILE_" + profile_ref.upper().replace("-", "_") + "_API_KEY"
+        )
+        if (
+            any(runtime.get(key) != value for key, value in expected_runtime.items())
+            or routing.get("provider") != DAYTONA_ROUTER_PROVIDER
+            or routing.get("apiKeyRef") != expected_key_ref
+            or MINIMAX_MODEL_FRAGMENT not in model
+            or auth_policy.get("oauthInImage") is not False
+            or auth_policy.get("persistentSecretsInImage") is not False
+            or auth_policy.get("runtimeSecretRefsOnly") is not True
+        ):
+            raise ControlError(
+                "daytona_harness_contract_invalid",
+                f"{profile_ref} must use MiniMax through 9Router without OAuth",
+            )
+        if profile_ref == "coding-daytona-codex":
+            extra_args = "\n".join(str(item) for item in adapter.get("extraArgs", []))
+            rendered_router_base = values[
+                "MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL"
+            ]
+            source_router_ref = "MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL"
+            if (
+                'model_provider="mte9router"' not in extra_args
+                or (
+                    source_router_ref not in extra_args
+                    and f'base_url="{rendered_router_base}"' not in extra_args
+                )
+            ):
+                raise ControlError(
+                    "daytona_harness_contract_invalid",
+                    "Codex must use its 9Router MiniMax provider configuration",
+                )
+        if (
+            profile_ref == "coding-daytona-pi"
+            and catalog_value(adapter.get("provider"), values) != "mte9router"
+        ):
+            raise ControlError(
+                "daytona_harness_contract_invalid",
+                "Pi must use its 9Router MiniMax provider configuration",
+            )
+    return DAYTONA_PROFILE_REFS
+
+
+def required_daytona_profiles(values: dict[str, str]) -> tuple[dict[str, Any], ...]:
+    """Resolve all validated R1 harness profiles in deterministic order."""
+    return tuple(
+        DEFAULT_PROFILE_CATALOG.require(profile_ref)
+        for profile_ref in required_daytona_profile_refs(
+            DEFAULT_PROFILE_CATALOG, values
+        )
+    )
+
+
 def expected_harness_versions(values: dict[str, str]) -> dict[str, str]:
     result = {
         str(profile["runtimeContract"]["packageKey"]): catalog_value(
             profile["runtimePackages"][profile["runtimeContract"]["packageKey"]],
             values,
         )
-        for profile in DEFAULT_PROFILE_CATALOG.profiles
+        for profile in required_daytona_profiles(values)
     }
     result["toolhive"] = values.get("MTE_TOOLHIVE_VERSION", "")
     result["githubCli"] = values.get("MTE_GITHUB_CLI_VERSION", "")
+    result["context7Pi"] = values.get("MTE_CONTEXT7_PI_VERSION", "")
     if any(not value for value in result.values()):
         raise ControlError(
             "missing_canonical_config", "profile harness version is missing"
@@ -176,18 +404,233 @@ def expected_harness_versions(values: dict[str, str]) -> dict[str, str]:
     return result
 
 
-def expected_package_integrity(values: dict[str, str]) -> dict[str, str]:
+def expected_snapshot_harness_versions(values: dict[str, str]) -> dict[str, str]:
+    """Return only the harness versions recorded by the snapshot producer."""
     result = {
-        "codex": values.get("MTE_CODEX_NPM_INTEGRITY", ""),
-        "claudeCode": values.get("MTE_CLAUDE_CODE_NPM_INTEGRITY", ""),
-        "pi": values.get("MTE_PI_NPM_INTEGRITY", ""),
-        "githubCliSha256": values.get("MTE_GITHUB_CLI_ARCHIVE_SHA256", ""),
+        "codex": values.get("MTE_CODEX_VERSION", ""),
+        "claudeCode": values.get("MTE_CLAUDE_CODE_VERSION", ""),
+        "pi": values.get("MTE_PI_VERSION", ""),
     }
     if any(not value for value in result.values()):
         raise ControlError(
-            "missing_canonical_config", "sandbox package integrity is missing"
+            "missing_canonical_config", "snapshot harness version is missing"
         )
     return result
+
+
+def expected_profile_skill() -> dict[str, Any]:
+    package = DEFAULT_PROFILE_CATALOG.require_skill_package(
+        "verification-before-completion"
+    )
+    return {
+        "ref": "verification-before-completion",
+        "contractId": package["contractId"],
+        "manifestSha256": package["manifestSha256"],
+        "metadataSha256": package["metadataSha256"],
+        "nativeDestinations": package["nativeDestinations"],
+        "installedProfiles": list(DAYTONA_PROFILE_REFS),
+    }
+
+
+def validated_tool_delivery_contract(
+    profile: dict[str, Any], values: dict[str, str]
+) -> dict[str, Any]:
+    """Validate capability invariants while keeping the catalog as the SSOT."""
+    profile_ref = str(profile.get("ref", ""))
+    harness = str((profile.get("runtimeContract") or {}).get("harnessKind", ""))
+    delivery = profile.get("toolDelivery")
+    if not isinstance(delivery, dict) or set(delivery) != {
+        "context7",
+        "profileTools",
+    }:
+        raise ControlError(
+            "coding_profile_tool_delivery_drift",
+            f"{profile_ref} tool-delivery declaration is invalid",
+        )
+    context7 = delivery.get("context7")
+    profile_tools = delivery.get("profileTools")
+    if not isinstance(context7, dict) or not isinstance(profile_tools, dict):
+        raise ControlError(
+            "coding_profile_tool_delivery_drift",
+            f"{profile_ref} tool-delivery declaration is invalid",
+        )
+    if (
+        context7.get("tools") != ["resolve-library-id", "query-docs"]
+        or "headers" in context7
+        or profile_tools.get("endpointRef")
+        != (profile.get("toolAccess") or {}).get("endpointRef")
+    ):
+        raise ControlError(
+            "coding_profile_tool_delivery_drift",
+            f"{profile_ref} tool-delivery references drifted",
+        )
+
+    allow = set((profile.get("mcpPolicy") or {}).get("allow") or [])
+    deny = set((profile.get("mcpPolicy") or {}).get("deny") or [])
+    if harness in {"codex", "claude"}:
+        context7_endpoint = catalog_value(context7.get("endpoint"), values)
+        required_context_keys = {
+            "mode",
+            "serverName",
+            "endpoint",
+            "authentication",
+            "tools",
+        }
+        required_profile_keys = {
+            "mode",
+            "serverName",
+            "endpointRef",
+            "bearerTokenEnv",
+            "status",
+        }
+        if harness == "codex":
+            required_context_keys.add("runtimeConfigSource")
+            required_profile_keys.add("runtimeConfigSource")
+        else:
+            required_context_keys.add("configPath")
+            required_profile_keys.add("configPath")
+        if (
+            set(context7) != required_context_keys
+            or set(profile_tools) != required_profile_keys
+            or context7.get("mode") != "native_remote_mcp"
+            or context7.get("serverName") != "context7"
+            or context7.get("authentication") != "optional_bearer_env"
+            or context7_endpoint != values.get("MTE_CONTEXT7_MCP_URL")
+            or not context7_endpoint.startswith("https://")
+            or profile_tools.get("mode") != "native_remote_mcp"
+            or profile_tools.get("serverName") != "mte-profile-tools"
+            or profile_tools.get("bearerTokenEnv") != "MTE_TOOLHIVE_BEARER_TOKEN"
+            or profile_tools.get("status") != "available"
+            or not {"context7", "toolhive"}.issubset(allow)
+            or "CONTEXT7_API_KEY"
+            not in set((profile.get("runtimeContract") or {}).get("envAllowlist") or [])
+        ):
+            raise ControlError(
+                "coding_profile_tool_delivery_drift",
+                f"{profile_ref} native MCP delivery drifted",
+            )
+        if harness == "codex":
+            extra_args = "\n".join(
+                str(item)
+                for item in (profile.get("nativeAdapterConfig") or {}).get(
+                    "extraArgs", []
+                )
+            )
+            if (
+                context7.get("runtimeConfigSource") != "nativeAdapterConfig.extraArgs"
+                or profile_tools.get("runtimeConfigSource")
+                != "nativeAdapterConfig.extraArgs"
+                or "mcp_servers.context7.url=" not in extra_args
+                or "mcp_servers.mte-profile-tools.url=" not in extra_args
+                or "mcp_servers.mte-profile-tools.bearer_token_env_var="
+                not in extra_args
+            ):
+                raise ControlError(
+                    "coding_profile_tool_delivery_drift",
+                    f"{profile_ref} Codex runtime MCP overrides drifted",
+                )
+        elif context7.get("configPath") != profile_tools.get("configPath") or not str(
+            context7.get("configPath", "")
+        ).startswith("/etc/"):
+            raise ControlError(
+                "coding_profile_tool_delivery_drift",
+                f"{profile_ref} Claude managed MCP config drifted",
+            )
+    elif harness == "pi":
+        resolved_package = catalog_value(context7.get("package"), values)
+        resolved_version = catalog_value(context7.get("version"), values)
+        resolved_integrity = catalog_value(context7.get("npmIntegrity"), values)
+        extension_ref = str(profile_tools.get("extensionRef", ""))
+        try:
+            extension = DEFAULT_PROFILE_CATALOG.require_extension(extension_ref)
+        except Exception as exc:
+            raise ControlError(
+                "coding_profile_tool_delivery_drift",
+                f"{profile_ref} Pi ToolHive extension reference is invalid",
+            ) from exc
+        extension_package = extension.get("package") or {}
+        extension_config = extension.get("config") or {}
+        extension_integrity_ref = str(extension_package.get("integrityRef", ""))
+        extension_integrity = values.get(extension_integrity_ref, "")
+        tool_routing = profile.get("toolRouting") or {}
+        if (
+            set(context7)
+            != {
+                "mode",
+                "package",
+                "version",
+                "npmIntegrity",
+                "configPath",
+                "authentication",
+                "tools",
+            }
+            or set(profile_tools)
+            != {
+                "mode",
+                "status",
+                "failClosed",
+                "extensionRef",
+                "endpointRef",
+                "bearerTokenEnv",
+                "sandboxReachabilityProbeOnly",
+            }
+            or context7.get("mode") != "official_pi_extension"
+            or resolved_package != values.get("MTE_CONTEXT7_PI_PACKAGE")
+            or resolved_version != values.get("MTE_CONTEXT7_PI_VERSION")
+            or resolved_integrity != values.get("MTE_CONTEXT7_PI_NPM_INTEGRITY")
+            or not str(resolved_integrity).startswith("sha512-")
+            or context7.get("authentication") != "optional_bearer_env"
+            or profile_tools.get("mode") != "reviewed_pi_extension"
+            or profile_tools.get("status") != "available"
+            or profile_tools.get("failClosed") is not True
+            or profile_tools.get("bearerTokenEnv") != "MTE_TOOLHIVE_BEARER_TOKEN"
+            or profile_tools.get("sandboxReachabilityProbeOnly") is not False
+            or extension.get("kind") != "extension"
+            or extension.get("enabledProfiles") != [profile_ref]
+            or extension_package
+            != {
+                "kind": "local",
+                "ref": "deployment/agent-runtime/pi/mte-toolhive.js",
+                "integrityRef": "MTE_PI_TOOLHIVE_EXTENSION_SHA256",
+            }
+            or extension_config
+            != {
+                "mode": "pi_extension",
+                "projectionRootRef": "MTE_PI_CODING_AGENT_DIR",
+                "projectionRelativePath": "extensions/mte-toolhive.js",
+                "endpointRef": "MTE_AGENT_GATEWAY_TOOLHIVE_PI_URL",
+                "credentialRef": "MTE_TOOLHIVE_BEARER_TOKEN",
+                "bindingRef": "MTE_TOOLHIVE_BINDING_REF",
+                "bundleRef": "MTE_TOOLHIVE_BUNDLE_ID",
+                "workloadRef": "MTE_TOOLHIVE_WORKLOAD_ID",
+                "tools": ["toolhive_list_tools", "toolhive_call"],
+            }
+            or extension.get("credentialRefs") != ["MTE_TOOLHIVE_BEARER_TOKEN"]
+            or not FULL_SHA256.fullmatch(extension_integrity)
+            or tool_routing.get("harnessDeliveryStatus") != "available"
+            or tool_routing.get("failClosed") is not True
+            or "blocker" in tool_routing
+            or "toolhive-pi-extension" not in allow
+            or "toolhive-mcp" in deny
+        ):
+            raise ControlError(
+                "coding_profile_tool_delivery_drift",
+                f"{profile_ref} Pi extension/fail-closed delivery drifted",
+            )
+    else:
+        raise ControlError(
+            "coding_profile_tool_delivery_drift",
+            f"{profile_ref} has an unsupported tool-delivery harness",
+        )
+
+    def resolve(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: resolve(nested) for key, nested in value.items()}
+        if isinstance(value, list):
+            return [resolve(nested) for nested in value]
+        return catalog_value(value, values) if isinstance(value, str) else value
+
+    return resolve(delivery)
 
 
 def normalized_driver_config(value: dict[str, Any]) -> dict[str, Any]:
@@ -236,20 +679,17 @@ def adapter_environment_probe_config(
 def accepted_environment_probe(
     profile_ref: str, payload: Any
 ) -> tuple[bool, list[str]]:
-    """Accept a native probe or one precisely allowlisted upstream warning.
+    """Accept an evidenced native probe or one allowlisted upstream warning.
 
     Paperclip aggregates any adapter warning into a top-level ``warn`` status.
-    We remain fail-closed: a warning result is accepted only when its complete
-    warning-code set exactly matches the profile allowlist, no error exists,
-    and the native harness hello check passed.
+    A top-level ``pass`` alone is not evidence that the correct harness ran.
+    We remain fail-closed: every accepted result must include the profile's
+    native harness hello check; warning results must additionally match the
+    profile allowlist exactly and contain no error.
     """
     if not isinstance(payload, dict):
         return False, []
     status = payload.get("status")
-    if status == "pass":
-        return True, []
-    if status != "warn":
-        return False, []
     checks = payload.get("checks")
     if not isinstance(checks, list) or not checks:
         return False, []
@@ -267,6 +707,10 @@ def accepted_environment_probe(
         row.get("code") == hello_code and row.get("level") == "info"
         for row in normalized
     )
+    if status == "pass":
+        return hello_passed and not warning_codes, warning_codes
+    if status != "warn":
+        return False, []
     return set(warning_codes) == set(allowed) and bool(
         allowed
     ) and hello_passed, warning_codes
@@ -295,9 +739,7 @@ def environment_probe_observation(
         ]
     return {
         "attempt": attempt,
-        "status": str(payload.get("status", ""))
-        if isinstance(payload, dict)
-        else "",
+        "status": str(payload.get("status", "")) if isinstance(payload, dict) else "",
         "accepted": accepted,
         "warningCodes": warning_codes,
         "requestError": request_error,
@@ -314,13 +756,20 @@ def validate_profile_env_contract(
     env: Any,
     required_keys: set[str],
     provider_managed_env: dict[str, dict[str, str]] | None = None,
+    optional_keys: set[str] | None = None,
 ) -> None:
     """Validate the catalog-owned env allowlist and provider-managed homes."""
     if provider_managed_env is None:
         profile = DEFAULT_PROFILE_CATALOG.require(profile_ref)
         provider_managed_env = profile["runtimeContract"]["providerManagedEnv"]
-    expected_keys = set(required_keys) | set(provider_managed_env)
-    if not isinstance(env, dict) or set(env) != expected_keys:
+    optional_keys = set(optional_keys or ())
+    allowed_keys = set(required_keys) | set(provider_managed_env)
+    required_present_keys = allowed_keys - optional_keys
+    if (
+        not isinstance(env, dict)
+        or not required_present_keys.issubset(env)
+        or not set(env).issubset(allowed_keys)
+    ):
         raise ControlError(
             "coding_profile_env_drift",
             f"{profile_ref} env keys do not match the profile",
@@ -351,82 +800,75 @@ def validate_daytona_runtime_evidence(
 ) -> None:
     """Fail closed before binding nested Daytona evidence into C072/C074/C075."""
     if expected_kind == "PaperclipDaytonaControlPlaneEvidence":
-        gateway = payload.get("agentGateway")
-        profiles = gateway.get("profiles") if isinstance(gateway, dict) else None
-        runner_id = (
-            str(gateway.get("runnerContainerId", ""))
-            if isinstance(gateway, dict)
-            else ""
-        )
-        gateway_id = (
-            str(gateway.get("gatewayContainerId", ""))
-            if isinstance(gateway, dict)
-            else ""
-        )
-        expected_networks = ["mte-agent-plane", "mte-daytona-net", "mte-tool-runtime"]
-        expected_profiles = tuple(
-            {
-                "profileRef": str(profile["ref"]),
-                "upstreamRef": str(profile["topology"]["toolhiveUpstreamRef"]),
-                "host": "toolhive",
-                "port": int(values[profile["topology"]["toolhiveProxyPortRef"]]),
-                "gatewayPort": int(
-                    values[profile["topology"]["toolhiveGatewayPortRef"]]
-                ),
-                "httpStatus": 200,
-                "initialize": True,
-            }
-            for profile in DEFAULT_PROFILE_CATALOG.profiles
-        )
+        expected_services = [
+            "agent-gateway",
+            "api",
+            "db",
+            "dex",
+            "minio",
+            "proxy",
+            "redis",
+            "registry",
+            "runner",
+            "ssh-gateway",
+        ]
         if (
-            payload.get("action") != "verify"
-            or payload.get("secretValuesPrinted") is not False
-            or not isinstance(gateway, dict)
-            or set(gateway)
+            set(payload)
             != {
+                "apiVersion",
+                "kind",
                 "status",
-                "profileCount",
-                "runnerContainerId",
-                "gatewayContainerId",
-                "gatewayNetworkMode",
-                "runnerNetworks",
-                "expectedRunnerNetworks",
-                "privateToolRuntimeNetwork",
-                "noPublishedPorts",
-                "profiles",
+                "generatedAt",
+                "producerSha256",
+                "canonicalSourceSha256",
+                "composeServices",
+                "runtimeEvidence",
+                "secretValuesPrinted",
             }
-            or gateway.get("status") != "passed"
-            or gateway.get("profileCount") != len(expected_profiles)
-            or not FULL_SHA256.fullmatch(runner_id)
-            or not FULL_SHA256.fullmatch(gateway_id)
-            or gateway.get("gatewayNetworkMode") != "container:" + runner_id
-            or gateway.get("noPublishedPorts") is not True
-            or gateway.get("privateToolRuntimeNetwork") != "mte-tool-runtime"
-            or gateway.get("runnerNetworks") != expected_networks
-            or gateway.get("expectedRunnerNetworks") != expected_networks
-            or not isinstance(profiles, list)
-            or len(profiles) != len(expected_profiles)
+            or payload.get("composeServices") != expected_services
+            or payload.get("runtimeEvidence")
+            != {
+                "images": str(EVIDENCE_ROOT / "daytona-images.json"),
+                "lifecycle": str(EVIDENCE_ROOT / "daytona-lifecycle.json"),
+            }
+            or payload.get("secretValuesPrinted") is not False
         ):
             raise ControlError(
                 "runtime_evidence_failed", "Daytona control-plane proof is incomplete"
             )
-        for row, expected in zip(profiles, expected_profiles, strict=True):
-            if not isinstance(row, dict) or row != expected:
-                raise ControlError(
-                    "runtime_evidence_failed",
-                    f"{expected['profileRef']} control-plane gateway proof drifted",
-                )
         return
 
     if expected_kind == "DaytonaHarnessSnapshots":
+        expected_keys = {
+            "apiVersion",
+            "kind",
+            "status",
+            "generatedAt",
+            "producerSha256",
+            "canonicalSourceSha256",
+            "controlPlane",
+            "sandboxVersion",
+            "snapshotContractHash",
+            "generation",
+            "sandboxImage",
+            "source",
+            "snapshots",
+            "deferredCleanup",
+            "pointerSwitch",
+            "resources",
+            "harnessVersions",
+            "credentialsBakedIntoImage",
+        }
         snapshots = payload.get("snapshots")
         expected_snapshots = (
             (
+                "coding",
                 values["MTE_DAYTONA_CODING_SNAPSHOT"],
                 int(values["MTE_DAYTONA_CODING_CPU"]),
                 int(values["MTE_DAYTONA_CODING_MEMORY_GIB"]),
             ),
             (
+                "general",
                 values["MTE_DAYTONA_GENERAL_SNAPSHOT"],
                 int(values["MTE_DAYTONA_GENERAL_CPU"]),
                 int(values["MTE_DAYTONA_GENERAL_MEMORY_GIB"]),
@@ -437,38 +879,90 @@ def validate_daytona_runtime_evidence(
                 "runtime_evidence_failed", "Daytona snapshot proof is incomplete"
             )
         ids: set[str] = set()
-        for row, (name, cpu, memory) in zip(snapshots, expected_snapshots, strict=True):
+        for row, (role, name, cpu, memory) in zip(
+            snapshots, expected_snapshots, strict=True
+        ):
             if (
                 not isinstance(row, dict)
+                or set(row)
+                != {
+                    "role",
+                    "id",
+                    "name",
+                    "state",
+                    "ref",
+                    "cpu",
+                    "memoryGiB",
+                    "diskGiB",
+                }
+                or row.get("role") != role
                 or not row.get("id")
                 or row.get("name") != name
                 or row.get("state") != "active"
+                or not isinstance(row.get("ref"), str)
+                or row.get("ref") != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
                 or row.get("cpu") != cpu
                 or row.get("memoryGiB") != memory
                 or row.get("diskGiB") != int(values["MTE_DAYTONA_DISK_GIB"])
-                or not FULL_IMAGE_DIGEST.fullmatch(str(row.get("digest", "")))
             ):
                 raise ControlError(
                     "runtime_evidence_failed", f"snapshot {name} proof drifted"
                 )
             ids.add(str(row["id"]))
-        expected_contract = {
-            key: values.get(key, "") for key in sorted(DAYTONA_IMAGE_CONTRACT_KEYS)
-        }
         if (
-            len(ids) != 2
-            or payload.get("harnessVersions") != expected_harness_versions(values)
-            or payload.get("packageIntegrity") != expected_package_integrity(values)
-            or payload.get("imageContract") != expected_contract
-            or payload.get("imageContractHash")
-            != canonical_json_sha256(expected_contract)
-            or payload.get("credentialsBakedIntoImage") is not False
-            or (payload.get("canonicalBinding") or {}).get("imageContractUnchanged")
-            is not True
-            or (payload.get("canonicalBinding") or {}).get(
-                "fullCanonicalHashAfterReadinessMerge"
+            set(payload) != expected_keys
+            or len(ids) != 2
+            or payload.get("harnessVersions")
+            != expected_snapshot_harness_versions(values)
+            or payload.get("resources")
+            != {
+                "coding": {
+                    "cpu": int(values["MTE_DAYTONA_CODING_CPU"]),
+                    "memory": int(values["MTE_DAYTONA_CODING_MEMORY_GIB"]),
+                    "disk": int(values["MTE_DAYTONA_DISK_GIB"]),
+                },
+                "general": {
+                    "cpu": int(values["MTE_DAYTONA_GENERAL_CPU"]),
+                    "memory": int(values["MTE_DAYTONA_GENERAL_MEMORY_GIB"]),
+                    "disk": int(values["MTE_DAYTONA_DISK_GIB"]),
+                },
+            }
+            or not FULL_IMAGE_REFERENCE.fullmatch(str(payload.get("sandboxImage", "")))
+            or payload.get("sandboxImage")
+            != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+            or payload.get("source")
+            != {
+                "url": values.get("MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL"),
+                "revision": values.get("MTE_DAYTONA_SANDBOX_IMAGE_REVISION"),
+            }
+            or payload.get("snapshotContractHash")
+            != canonical_json_sha256(
+                {
+                    "sandboxImage": payload.get("sandboxImage"),
+                    "sandboxImageRevision": values.get(
+                        "MTE_DAYTONA_SANDBOX_IMAGE_REVISION"
+                    ),
+                    "resources": payload.get("resources"),
+                    "harnessVersions": payload.get("harnessVersions"),
+                }
             )
-            != file_sha256(PLATFORM_ENV)
+            or payload.get("generation")
+            != str(payload.get("snapshotContractHash") or "")[:12]
+            or payload.get("controlPlane")
+            != {
+                "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+                "sourceCommit": values.get("MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"),
+            }
+            or payload.get("sandboxVersion")
+            != values.get("MTE_DAYTONA_SANDBOX_VERSION")
+            or payload.get("pointerSwitch")
+            != {
+                "coding": values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+                "general": values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+                "completed": True,
+            }
+            or not isinstance(payload.get("deferredCleanup"), list)
+            or payload.get("credentialsBakedIntoImage") is not False
         ):
             raise ControlError(
                 "runtime_evidence_failed", "Daytona image contract proof drifted"
@@ -477,88 +971,104 @@ def validate_daytona_runtime_evidence(
 
     if expected_kind == "DaytonaSandboxLifecycleEvidence":
         states = payload.get("states")
+        harnesses = payload.get("harnesses")
+        credential_files = payload.get("credentialFileProbe")
+        credential_env = payload.get("credentialEnvProbe")
         expected_resources = {
             "cpu": int(values["MTE_DAYTONA_CODING_CPU"]),
             "memory": int(values["MTE_DAYTONA_CODING_MEMORY_GIB"]),
             "disk": int(values["MTE_DAYTONA_DISK_GIB"]),
         }
-        version_output = payload.get("harnessVersionOutput")
-        joined_versions = (
-            "\n".join(str(row) for row in version_output)
-            if isinstance(version_output, list)
-            else ""
-        )
-        credential_probe = payload.get("credentialFileProbe")
-        workspace_probe = payload.get("workspaceDirectoryProbe")
-        pi_config_probe = payload.get("piProbeConfig")
-        github_probe = payload.get("github")
-        expected_workspace_paths = [
-            str(profile["nativeAdapterConfig"]["cwd"])
-            for profile in DEFAULT_PROFILE_CATALOG.profiles
+        expected_keys = {
+            "apiVersion",
+            "kind",
+            "status",
+            "generatedAt",
+            "producerSha256",
+            "canonicalSourceSha256",
+            "provider",
+            "target",
+            "snapshot",
+            "sandboxId",
+            "workspace",
+            "harnesses",
+            "credentialFileProbe",
+            "credentialEnvProbe",
+            "resources",
+            "credentialsBakedIntoImage",
+            "states",
+            "cleanupDeleted",
+            "delete",
+        }
+        expected_checked_paths = [
+            "/home/daytona/.codex/auth.json",
+            "/home/daytona/.claude/.credentials.json",
+            "/home/daytona/.pi/agent/auth.json",
+            "/home/daytona/.config/gh/hosts.yml",
         ]
+        expected_checked_names = [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GH_TOKEN",
+            "CONTEXT7_API_KEY",
+            "MTE_TOOLHIVE_BEARER_TOKEN",
+        ]
+        expected_versions = (
+            ("codex", values["MTE_CODEX_VERSION"]),
+            ("claude", values["MTE_CLAUDE_CODE_VERSION"]),
+            ("pi", values["MTE_PI_VERSION"]),
+        )
+        valid_harnesses = isinstance(harnesses, list) and len(harnesses) == 3
+        if valid_harnesses:
+            for row, (name, version) in zip(harnesses, expected_versions, strict=True):
+                if (
+                    not isinstance(row, dict)
+                    or set(row) != {"name", "commandPath", "realpath", "versionOutput"}
+                    or row.get("name") != name
+                    or row.get("commandPath") != f"/usr/local/bin/{name}"
+                    or not str(row.get("realpath", "")).startswith(
+                        "/opt/mte-harness/node_modules/"
+                    )
+                    or normalized_harness_version(name, row.get("versionOutput"))
+                    != version
+                ):
+                    valid_harnesses = False
+                    break
         if (
-            not isinstance(states, list)
-            or [(row.get("phase"), row.get("state")) for row in states]
-            != list(DAYTONA_LIFECYCLE_STATES)
+            set(payload) != expected_keys
             or payload.get("provider") != "daytona"
             or payload.get("target") != values["DAYTONA_TARGET"]
             or payload.get("snapshot") != values["MTE_DAYTONA_CODING_SNAPSHOT"]
-            or payload.get("credentialsBakedIntoImage") is not False
-            or (payload.get("fileRoundTrip") or {}).get("verified") is not True
-            or not FULL_SHA256.fullmatch(
-                str((payload.get("fileRoundTrip") or {}).get("markerSha256", ""))
+            or not payload.get("sandboxId")
+            or payload.get("workspace") != "/home/daytona/paperclip-workspace"
+            or not valid_harnesses
+            or not isinstance(states, list)
+            or [(row.get("phase"), row.get("state")) for row in states]
+            != [("create", "started"), ("execute", "passed"), ("delete", "deleted")]
+            or any(
+                not isinstance(row.get("at"), str) or not row["at"] for row in states
             )
-            or (payload.get("fileRoundTrip") or {}).get("markerSha256")
-            != payload.get("markerSha256")
-            or payload.get("persistence")
-            != {"verified": True, "afterRestart": True, "afterArchiveRestore": True}
             or payload.get("resources")
             != {
                 "expected": expected_resources,
                 "actual": expected_resources,
                 "equal": True,
             }
-            or payload.get("agentGateway")
+            or credential_files
             != {
-                "expectedHost": values["MTE_AGENT_GATEWAY_HOST"],
-                "observedDefaultGateway": values["MTE_AGENT_GATEWAY_HOST"],
-                "matchesCanonical": True,
+                "checkedPaths": expected_checked_paths,
+                "foundPaths": [],
+                "credentialFree": True,
             }
-            or not all(
-                version in joined_versions
-                for version in expected_harness_versions(values).values()
-            )
-            or github_probe
+            or credential_env
             != {
-                "cliVersion": values["MTE_GITHUB_CLI_VERSION"],
-                "authentication": "GH_TOKEN-runtime-env",
-                "gitCredentialHelper": "gh auth git-credential",
-                "gitIdentity": {
-                    "name": "Paperclip Agent",
-                    "email": "paperclip-agent@users.noreply.github.com",
-                },
-                "tokenInRemoteUrl": False,
-                "credentialFilePersisted": False,
+                "checkedNames": expected_checked_names,
+                "foundNames": [],
+                "credentialFree": True,
             }
+            or payload.get("credentialsBakedIntoImage") is not False
             or payload.get("cleanupDeleted") is not True
             or payload.get("delete") != {"requested": True, "getAfterDeleteStatus": 404}
-            or not isinstance(credential_probe, dict)
-            or credential_probe.get("credentialFree") is not True
-            or credential_probe.get("foundPaths") != []
-            or not isinstance(credential_probe.get("checkedPaths"), list)
-            or not credential_probe["checkedPaths"]
-            or workspace_probe
-            != {
-                "checkedPaths": expected_workspace_paths,
-                "missingPaths": [],
-                "allPresent": True,
-            }
-            or not isinstance(pi_config_probe, dict)
-            or pi_config_probe.get("path")
-            != values["MTE_PI_CODING_AGENT_DIR"] + "/models.json"
-            or pi_config_probe.get("apiKeyReference") != "$OPENAI_API_KEY"
-            or pi_config_probe.get("secretEmbedded") is not False
-            or not FULL_SHA256.fullmatch(str(pi_config_probe.get("sha256", "")))
         ):
             raise ControlError(
                 "runtime_evidence_failed", "Daytona lifecycle proof drifted"
@@ -606,14 +1116,9 @@ def evidence_reference(
     ):
         raise ControlError("runtime_evidence_failed", f"{path.name} is not ready")
     if values is not None:
-        if (
-            not DAYTONA_STEP_SOURCE.is_file()
-            or payload.get("producerSha256") != file_sha256(DAYTONA_STEP_SOURCE)
-            or (
-                expected_kind == "PaperclipDaytonaControlPlaneEvidence"
-                and payload.get("producerPath") != str(DAYTONA_STEP_SOURCE)
-            )
-        ):
+        if not DAYTONA_STEP_SOURCE.is_file() or payload.get(
+            "producerSha256"
+        ) != file_sha256(DAYTONA_STEP_SOURCE):
             raise ControlError(
                 "runtime_evidence_failed", f"{path.name} producer binding drifted"
             )
@@ -634,12 +1139,22 @@ def json_request(
     *,
     timeout: int = 30,
 ) -> Any:
+    board_key = dotenv(PLATFORM_ENV).get("PAPERCLIP_BOARD_API_KEY", "").strip()
+    if not board_key:
+        raise ControlError(
+            "missing_canonical_config",
+            "PAPERCLIP_BOARD_API_KEY is required for administrative Paperclip API calls",
+        )
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(
         base.rstrip("/") + path,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {board_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -675,8 +1190,9 @@ def daytona_json_request(
     allow_not_found: bool = False,
 ) -> Any:
     data = json.dumps(body).encode() if body is not None else None
+    base = canonical_daytona_api_base(values)
     request = urllib.request.Request(
-        values["MTE_DAYTONA_API_URL"].rstrip("/") + path,
+        base + path,
         data=data,
         method=method,
         headers={
@@ -721,7 +1237,15 @@ def destroy_daytona_probe_sandbox(values: dict[str, str], sandbox_id: str) -> No
     deadline = time.monotonic() + 180
     while True:
         try:
-            daytona_json_request(values, "DELETE", f"/sandbox/{encoded}")
+            # Paperclip marks probe leases ephemeral and may delete one before
+            # the controller reaches cleanup. Deletion is idempotent: 404 is
+            # proof that the sandbox is already absent, not a cleanup failure.
+            daytona_json_request(
+                values,
+                "DELETE",
+                f"/sandbox/{encoded}",
+                allow_not_found=True,
+            )
             break
         except ControlError as exc:
             if exc.status not in {409, 423} or time.monotonic() >= deadline:
@@ -757,7 +1281,7 @@ def rows(value: Any, *keys: str) -> list[dict[str, Any]]:
 
 def paperclip_context() -> tuple[str, str]:
     _, experimental = settings()
-    base = str(experimental.get("apiBase", "http://127.0.0.1:3100")).rstrip("/")
+    base = canonical_paperclip_api_base(experimental)
     bootstrap = load_json(BOOTSTRAP)
     company_id = str(bootstrap.get("companyId", "")).strip()
     if not company_id:
@@ -862,6 +1386,39 @@ def environment_capabilities(base: str, company_id: str) -> Any:
         raise
 
 
+def reconcile_workspace_feature_flags(base: str, *, mutate: bool) -> dict[str, bool]:
+    """Keep the official Paperclip workspace features enabled declaratively.
+
+    Paperclip validates workspace fields even while the instance flag is off,
+    then intentionally drops those fields in the issue service.  Reconciling
+    environments without this setting therefore gives a misleadingly healthy
+    control plane whose tasks still run against the shared project workspace.
+    """
+
+    path = "/api/instance/settings/experimental"
+    observed = json_request(base, "GET", path)
+    if not isinstance(observed, dict):
+        raise ControlError(
+            "instance_settings_invalid",
+            "Paperclip experimental instance settings are not an object",
+        )
+    desired = {
+        "enableEnvironments": True,
+        "enableIsolatedWorkspaces": True,
+    }
+    drift = any(observed.get(key) is not value for key, value in desired.items())
+    if mutate and drift:
+        observed = json_request(base, "PATCH", path, desired)
+    if not isinstance(observed, dict) or any(
+        observed.get(key) is not value for key, value in desired.items()
+    ):
+        raise ControlError(
+            "workspace_features_disabled",
+            "Paperclip environments and isolated workspaces must be enabled",
+        )
+    return {key: bool(observed[key]) for key in desired}
+
+
 def environment_list(base: str, company_id: str) -> list[dict[str, Any]]:
     value = json_request(
         base,
@@ -939,6 +1496,7 @@ def reconcile_local_environment(*, mutate: bool) -> dict[str, Any]:
         )
 
     base, company_id = paperclip_context()
+    feature_flags = reconcile_workspace_feature_flags(base, mutate=mutate)
     capabilities = environment_capabilities(base, company_id)
     if mutate:
         ensure_local_repository(workspace_root)
@@ -1045,6 +1603,7 @@ def reconcile_local_environment(*, mutate: bool) -> dict[str, Any]:
         "projectId": str(project["id"]),
         "workspaceMode": observed_policy.get("defaultMode"),
         "workspaceStrategy": observed_strategy.get("type"),
+        "featureFlags": feature_flags,
         "capabilitiesAvailable": bool(capabilities),
     }
 
@@ -1166,7 +1725,12 @@ def validate_company_secret_scopes(
     expected_ids = [daytona_secret_id]
     for row in profile_bindings:
         expected_ids.extend((row["runtimeSecretId"], row["toolhiveSecretId"]))
-    if len(expected_ids) != 7 or len(set(expected_ids)) != 7:
+    expected_count = 1 + 2 * len(profile_bindings)
+    if (
+        not profile_bindings
+        or len(expected_ids) != expected_count
+        or len(set(expected_ids)) != expected_count
+    ):
         raise ControlError(
             "secret_scope_mismatch",
             "Daytona and harness company secret IDs must be distinct",
@@ -1366,36 +1930,40 @@ def plugin_match(
 
 
 def installed_plugin_package_proof(package_name: str) -> dict[str, Any]:
-    if not re.fullmatch(r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+", package_name):
+    if package_name != "@paperclipai/plugin-daytona":
         raise ControlError("invalid_config", "unsafe Daytona plugin package name")
     script = r"""
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const root = '/home/node/.paperclip/plugins/node_modules';
-const packageName = process.argv[1];
-const packageRoot = path.resolve(root, packageName);
-if (!packageRoot.startsWith(root + path.sep)) process.exit(3);
-const manifestBytes = fs.readFileSync(path.join(packageRoot, 'package.json'));
+let current = path.dirname(require.resolve('@paperclipai/plugin-daytona'));
+while (current !== path.dirname(current) && !fs.existsSync(path.join(current, 'package.json'))) {
+  current = path.dirname(current);
+}
+const manifestPath = path.join(current, 'package.json');
+const manifestBytes = fs.readFileSync(manifestPath);
 const manifest = JSON.parse(manifestBytes.toString('utf8'));
+if (manifest.name !== '@paperclipai/plugin-daytona') process.exit(4);
 const files = [];
-function walk(current) {
-  for (const entry of fs.readdirSync(current, {withFileTypes: true})) {
-    const absolute = path.join(current, entry.name);
+function walk(directory) {
+  for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
+    const absolute = path.join(directory, entry.name);
     if (entry.isDirectory()) walk(absolute);
-    else if (entry.isFile()) files.push(path.relative(packageRoot, absolute));
+    else if (entry.isFile()) files.push(path.relative(current, absolute));
+    else throw new Error(`unsupported Daytona plugin file type: ${absolute}`);
   }
 }
-walk(packageRoot);
+walk(current);
 files.sort();
 const digest = crypto.createHash('sha256');
 for (const relative of files) {
   digest.update(relative); digest.update('\0');
-  digest.update(fs.readFileSync(path.join(packageRoot, relative))); digest.update('\0');
+  digest.update(fs.readFileSync(path.join(current, relative))); digest.update('\0');
 }
 process.stdout.write(JSON.stringify({
   name: manifest.name,
   version: manifest.version,
+  packagePath: current,
   manifestSha256: crypto.createHash('sha256').update(manifestBytes).digest('hex'),
   contentSha256: digest.digest('hex'),
   fileCount: files.length,
@@ -1403,7 +1971,7 @@ process.stdout.write(JSON.stringify({
 """
     try:
         completed = subprocess.run(
-            ["docker", "exec", "mte-paperclip", "node", "-e", script, package_name],
+            ["docker", "exec", "mte-paperclip", "node", "-e", script],
             check=True,
             text=True,
             capture_output=True,
@@ -1411,17 +1979,21 @@ process.stdout.write(JSON.stringify({
         value = json.loads(completed.stdout)
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
         raise ControlError(
-            "plugin_package_unverifiable", "cannot hash installed Daytona plugin"
+            "plugin_package_unverifiable",
+            "cannot discover Daytona plugin from immutable Paperclip image",
         ) from exc
     if (
         not isinstance(value, dict)
         or value.get("name") != package_name
+        or not re.fullmatch(r"\d+\.\d+\.\d+", str(value.get("version", "")))
+        or not str(value.get("packagePath", "")).startswith("/app/")
         or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("manifestSha256", "")))
         or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("contentSha256", "")))
         or int(value.get("fileCount", 0)) < 1
     ):
         raise ControlError(
-            "plugin_package_unverifiable", "installed Daytona plugin proof is invalid"
+            "plugin_package_unverifiable",
+            "image-bundled Daytona plugin proof is invalid",
         )
     return value
 
@@ -1430,24 +2002,18 @@ def ensure_daytona_plugin(
     base: str,
     package_name: str,
     manifest_version: str,
-    package_version: str,
+    package_proof: dict[str, Any],
 ) -> dict[str, Any]:
+    locked_local_path = str(package_proof["packagePath"])
+    installed_package_version = str(package_proof["version"])
     plugin = plugin_match(plugin_rows(base), package_name)
     observed_version = str((plugin or {}).get("version", ""))
     state = str((plugin or {}).get("status", "")).lower()
-    installed_package_version = ""
-    if plugin:
-        try:
-            installed_package_version = str(
-                installed_plugin_package_proof(package_name).get("version", "")
-            )
-        except ControlError as exc:
-            if exc.code != "plugin_package_unverifiable":
-                raise
     package_current = (
         bool(plugin)
         and observed_version == manifest_version
-        and (installed_package_version == package_version)
+        and installed_package_version == manifest_version
+        and str(plugin.get("packagePath", "")) == locked_local_path
     )
     if plugin and package_current and state in {"error", "failed", "disabled"}:
         plugin_key = str(plugin.get("pluginKey", ""))
@@ -1480,24 +2046,14 @@ def ensure_daytona_plugin(
             base,
             "POST",
             "/api/plugins/install",
-            {
-                "packageName": package_name,
-                "version": package_version,
-                "isLocalPath": False,
-            },
+            {"packageName": locked_local_path, "isLocalPath": True},
             timeout=180,
         )
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         plugin = plugin_match(plugin_rows(base), package_name)
         state = str((plugin or {}).get("status", "")).lower()
-        if plugin and state not in {
-            "installing",
-            "pending",
-            "error",
-            "failed",
-            "disabled",
-        }:
+        if plugin and state not in {"installing", "pending", "error", "failed", "disabled"}:
             return plugin
         if state in {"error", "failed"}:
             break
@@ -1548,19 +2104,24 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
     )
 
     values = dotenv(PLATFORM_ENV)
-    package_name = values.get(
-        "MTE_DAYTONA_PLUGIN_PACKAGE",
-        str(spec.get("pluginPackage", "@paperclipai/plugin-daytona")),
-    )
-    manifest_version = values.get(
-        "MTE_DAYTONA_PLUGIN_MANIFEST_VERSION",
-        str(spec.get("pluginVersion", "0.1.0")),
-    )
-    package_version = values.get("MTE_DAYTONA_PLUGIN_NPM_VERSION", "")
-    if not package_version:
+    daytona_api_base = canonical_daytona_api_base(values, spec)
+    package_name = "@paperclipai/plugin-daytona"
+    manifest_version = str(spec.get("pluginVersion", ""))
+    if not re.fullmatch(r"\d+\.\d+\.\d+", manifest_version):
+        raise ControlError(
+            "invalid_config", "Daytona plugin manifest version is invalid"
+        )
+    paperclip_image = values.get("MTE_PAPERCLIP_IMAGE", "")
+    if not FULL_IMAGE_REFERENCE.fullmatch(paperclip_image):
         raise ControlError(
             "missing_canonical_config",
-            "MTE_DAYTONA_PLUGIN_NPM_VERSION is required",
+            "MTE_PAPERCLIP_IMAGE must be digest-pinned",
+        )
+    package_proof = installed_plugin_package_proof(package_name)
+    if package_proof.get("version") != manifest_version:
+        raise ControlError(
+            "plugin_version_drift",
+            "immutable image Daytona plugin version differs from platform manifest",
         )
     plugin = plugin_match(plugin_rows(base), package_name)
     if mutate:
@@ -1568,16 +2129,15 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
             base,
             package_name,
             manifest_version,
-            package_version,
+            package_proof,
         )
     if not plugin:
         raise ControlError(
             "plugin_missing", "Paperclip Daytona plugin is not installed"
         )
-    package_proof = installed_plugin_package_proof(package_name)
     if (
         str(plugin.get("version", "")) != manifest_version
-        or package_proof.get("version") != package_version
+        or str(plugin.get("packagePath", "")) != package_proof.get("packagePath")
     ):
         raise ControlError(
             "plugin_version_drift", "Daytona plugin package or manifest version drifted"
@@ -1623,22 +2183,23 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
         "MTE_DAYTONA_ENVIRONMENT_NAME",
         str(spec.get("environmentName", "MTE Daytona Coding")),
     )
-    image = values.get("MTE_DAYTONA_CODING_IMAGE") or values.get(
-        "MTE_DAYTONA_SANDBOX_BASE_IMAGE", ""
-    )
-    if not image:
+    sandbox_image = values.get("MTE_DAYTONA_SANDBOX_IMAGE", "")
+    if not FULL_IMAGE_REFERENCE.fullmatch(sandbox_image):
         raise ControlError(
             "missing_canonical_config",
-            "canonical Daytona coding image is not configured",
+            "canonical Daytona harness image is not digest-pinned",
         )
-    memory_gib = int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB", ""))
-    disk_gib = int(values.get("MTE_DAYTONA_DISK_GIB", ""))
     timeout_ms = int(values.get("MTE_DAYTONA_TIMEOUT_MS", ""))
     reuse_lease = values.get("MTE_DAYTONA_REUSE_LEASE", "").lower() == "true"
     snapshot_name = values.get("MTE_DAYTONA_CODING_SNAPSHOT", "")
     snapshot_ready = values.get(
         "MTE_DAYTONA_CODING_SNAPSHOT_READY", ""
     ).lower() == "true" and bool(snapshot_name)
+    if not snapshot_ready:
+        raise ControlError(
+            "snapshot_not_ready",
+            "canonical Daytona coding snapshot is not ready",
+        )
     environment = find_named(environment_list(base, company_id), environment_name)
     driver_config: dict[str, Any] = {
         "provider": "daytona",
@@ -1649,11 +2210,9 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
         "timeoutMs": timeout_ms,
         "reuseLease": reuse_lease,
     }
-    if snapshot_ready:
-        driver_config["snapshot"] = snapshot_name
-    else:
-        driver_config.update({"image": image, "memory": memory_gib, "disk": disk_gib})
-    for config_key, ref_key in (("apiUrl", "apiUrlRef"), ("target", "targetRef")):
+    driver_config["snapshot"] = snapshot_name
+    driver_config["apiUrl"] = daytona_api_base
+    for config_key, ref_key in (("target", "targetRef"),):
         ref = str(spec.get(ref_key, ""))
         if ref and values.get(ref):
             driver_config[config_key] = values[ref]
@@ -1706,7 +2265,7 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
         )
 
     profile_catalog = DEFAULT_PROFILE_CATALOG
-    required_profiles = profile_catalog.refs
+    required_profiles = required_daytona_profile_refs(profile_catalog, values)
     managed_agents = [
         agent
         for agent in agent_list(base, company_id)
@@ -1743,6 +2302,7 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
         runtime = profile["runtimeContract"]
         access = profile["toolAccess"]
         topology = profile["topology"]
+        tool_delivery = validated_tool_delivery_contract(profile, values)
         wrong_profile = profile_catalog.require(str(topology["wrongProfileRef"]))
         package_key = str(runtime["packageKey"])
         harness_version = catalog_value(profile["runtimePackages"][package_key], values)
@@ -1784,6 +2344,12 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
                 "coding_profile_drift", f"{profile_ref} has a non-Daytona workspace cwd"
             )
         env = adapter_config.get("env")
+        optional_env_keys = {
+            str(credential_ref)
+            for extension in profile_catalog.extensions_for(profile_ref)
+            if (extension.get("config") or {}).get("credentialRequired") is False
+            for credential_ref in extension.get("credentialRefs", [])
+        }
         validate_profile_env_contract(
             profile_ref=profile_ref,
             company_id=company_id,
@@ -1791,6 +2357,7 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
             env=env,
             required_keys=set(runtime["envAllowlist"]),
             provider_managed_env=runtime["providerManagedEnv"],
+            optional_keys=optional_env_keys,
         )
         runtime_ref = env.get(runtime["runtimeSecretEnv"])
         gh_ref = env.get("GH_TOKEN")
@@ -1862,6 +2429,7 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
                 "toolhiveSecretBinding": "paperclip_company_secret_ref",
                 "toolhiveSecretId": str(toolhive_ref["secretId"]),
                 "toolhiveUrlRef": toolhive_url_ref,
+                "toolDelivery": tool_delivery,
                 "status": "ready",
             }
         )
@@ -1886,9 +2454,7 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
         # Daytona's native Snapshot API builds the pinned image. Finishing an
         # empty Paperclip interactive setup session would capture a sandbox
         # without the required harness CLIs, so that route is not used here.
-        template_state = (
-            "active-snapshot" if snapshot_ready else "pending-snapshot-build"
-        )
+        template_state = "active-snapshot"
 
     probe_results: list[dict[str, Any]] = []
     runtime_evidence: dict[str, dict[str, str]] = {}
@@ -1953,9 +2519,7 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
                 after_sandbox_ids = daytona_environment_sandbox_ids(
                     values, environment_id
                 )
-                created_sandbox_ids = sorted(
-                    after_sandbox_ids - before_sandbox_ids
-                )
+                created_sandbox_ids = sorted(after_sandbox_ids - before_sandbox_ids)
                 profile_created_sandbox_ids.update(created_sandbox_ids)
                 # Paperclip marks ad-hoc test leases ephemeral, but a provider
                 # with reuseLease=true stops rather than destroys them. Delete
@@ -1993,12 +2557,8 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
                     + "observed codes: "
                     + (",".join(observed_codes) or "none"),
                 )
-            probe_cleanup["createdSandboxCount"] += len(
-                profile_created_sandbox_ids
-            )
-            probe_cleanup["deletedSandboxCount"] += len(
-                profile_created_sandbox_ids
-            )
+            probe_cleanup["createdSandboxCount"] += len(profile_created_sandbox_ids)
+            probe_cleanup["deletedSandboxCount"] += len(profile_created_sandbox_ids)
             probe_results.append(
                 {
                     "profileRef": str(agent["profileRef"]),
@@ -2067,8 +2627,8 @@ def reconcile_daytona(*, mutate: bool, probe: bool) -> dict[str, Any]:
         "profileRefs": list(required_profiles),
         "agents": reconciled_agents,
         "provider": "daytona",
-        "image": image,
-        "snapshot": snapshot_name if snapshot_ready else None,
+        "sandboxImage": sandbox_image,
+        "snapshot": snapshot_name,
         "apiKeySecretId": str(daytona_secret["id"]),
         "apiKeyFingerprint": key_fingerprint or "stored",
         "driverConfig": {

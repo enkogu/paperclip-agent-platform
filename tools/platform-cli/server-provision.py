@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import http.cookiejar
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -60,15 +61,6 @@ SENSITIVE_ENV_KEY_RE = re.compile(
 
 DEFAULT_USER_SECRET_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
-        "key": "mte.activepieces.user_mcp_token",
-        "name": "Activepieces personal MCP token",
-        "description": "Per-user scoped MCP credential; provider OAuth remains encrypted in Activepieces.",
-        "usageGuidance": "Authorize the user's Activepieces connections, then store only the scoped MCP token here.",
-        "sourceComponent": "activepieces",
-        "sourceKey": "ACTIVEPIECES_USER_MCP_TOKEN",
-        "toolSelectors": ["activepieces", "gmail", "email", "calendar", "oauth"],
-    },
-    {
         "key": "mte.github.personal_access_token",
         "name": "GitHub personal access token",
         "description": "Per-user GitHub token used only by profiles whose tool policy allows GitHub.",
@@ -80,22 +72,59 @@ DEFAULT_USER_SECRET_DEFINITIONS: tuple[dict[str, Any], ...] = (
 )
 
 INTEGRATION_PREFIXES = {
-    "baserow": ("BASEROW_",),
-    "wikijs": ("WIKIJS_",),
     "mattermost": ("MATTERMOST_",),
-    "activepieces": ("ACTIVEPIECES_",),
     "9router": ("NINEROUTER_",),
     "paperclip": ("PAPERCLIP_",),
+}
+
+# These Paperclip keys are idempotency markers owned by the secret reconcilers.
+# They must never enter the component snapshot: saving that older snapshot at
+# the end of a provision pass would otherwise undo a rotation performed during
+# the same pass.
+PAPERCLIP_RECONCILER_STATE_PREFIXES = (
+    "PAPERCLIP_SECRET_",
+    "PAPERCLIP_USER_SECRET_",
+)
+PAPERCLIP_UNATTENDED_OWNER_BOOTSTRAP_KEY = (
+    "MTE_ALLOW_UNATTENDED_PAPERCLIP_OWNER_BOOTSTRAP"
+)
+PAPERCLIP_OWNER_INVITE_ID_KEY = "PAPERCLIP_OWNER_INVITE_ID"
+PAPERCLIP_OWNER_BOOTSTRAP_REQUEST_TYPE_KEY = (
+    "PAPERCLIP_OWNER_BOOTSTRAP_REQUEST_TYPE"
+)
+PAPERCLIP_OWNER_BOOTSTRAP_STATE_KEYS = frozenset(
+    {
+        PAPERCLIP_OWNER_INVITE_ID_KEY,
+        PAPERCLIP_OWNER_BOOTSTRAP_REQUEST_TYPE_KEY,
+    }
+)
+
+# Host-side provisioning endpoints are assembled exclusively from the rendered
+# platform config and canonical platform.env. The ports below are references,
+# not defaults: server-config owns their values in the single runtime SSOT.
+SERVICE_ENDPOINT_REFS: dict[str, tuple[str, str]] = {
+    "postgrest": ("POSTGREST_HEALTH_URL", "POSTGREST_ORIGIN_PORT"),
+    "mattermost": ("MATTERMOST_HEALTH_URL", "MATTERMOST_ORIGIN_PORT"),
+    "kestra": ("KESTRA_HEALTH_URL", "KESTRA_ORIGIN_PORT"),
+    "9router": ("NINEROUTER_HEALTH_URL", "NINEROUTER_ORIGIN_PORT"),
+    "paperclip": ("PAPERCLIP_HEALTH_URL", "PAPERCLIP_ORIGIN_PORT"),
 }
 
 TERMINAL_READY = {"ready", "configured", "not_applicable", "unsupported"}
 REQUIRED_COMPONENTS = {
     "mattermost",
-    "activepieces",
     "kestra",
     "9router",
     "paperclip",
 }
+
+E2E_GITHUB_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+E2E_GITHUB_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+PAPERCLIP_E2E_WORKSPACE_NAME = "MTE GitHub E2E primary"
+PAPERCLIP_E2E_WORKSPACE_PURPOSE = "github-e2e-primary"
+PAPERCLIP_E2E_WORKSPACE_MANAGER = "mte-server-provision"
+PAPERCLIP_DAYTONA_ENVIRONMENT_PURPOSE = "coding-daytona"
+PAPERCLIP_DAYTONA_ENVIRONMENT_MANAGER = "mte-platform"
 
 
 class ApiError(RuntimeError):
@@ -175,12 +204,8 @@ def canonical_mutation_plan(values: dict[str, str]) -> frozenset[str]:
         for key in values
         if key.startswith(
             (
-                "BASEROW_",
                 "POSTGREST_",
-                "NOCODB_",
-                "WIKIJS_",
                 "MATTERMOST_",
-                "ACTIVEPIECES_",
                 "NINEROUTER_",
                 "PAPERCLIP_",
             )
@@ -195,15 +220,6 @@ def canonical_mutation_plan(values: dict[str, str]) -> frozenset[str]:
     }
     planned.update(
         {
-            "BASEROW_PAPERCLIP_TOKEN",
-            "BASEROW_PAPERCLIP_TOKEN_ID",
-            "BASEROW_ACTIVEPIECES_TOKEN",
-            "BASEROW_ACTIVEPIECES_TOKEN_ID",
-            "BASEROW_WORKSPACE_ID",
-            "BASEROW_DATABASE_ID",
-            "BASEROW_TABLE_ID",
-            "WIKIJS_API_TOKEN",
-            "WIKIJS_API_TOKEN_ID",
             "MATTERMOST_ADMIN_USERNAME",
             "MATTERMOST_ADMIN_EMAIL",
             "MATTERMOST_ADMIN_PASSWORD",
@@ -211,10 +227,6 @@ def canonical_mutation_plan(values: dict[str, str]) -> frozenset[str]:
             "MATTERMOST_BOT_USER_ID",
             "MATTERMOST_TEAM_ID",
             "MATTERMOST_ALERT_WEBHOOK_URL",
-            "ACTIVEPIECES_ADMIN_EMAIL",
-            "ACTIVEPIECES_ADMIN_PASSWORD",
-            "ACTIVEPIECES_PLATFORM_ID",
-            "ACTIVEPIECES_PROJECT_ID",
             "NINEROUTER_AGENT_API_KEY",
             "NINEROUTER_AGENT_API_KEY_ID",
             "NINEROUTER_OPENAI_BASE_URL",
@@ -227,11 +239,15 @@ def canonical_mutation_plan(values: dict[str, str]) -> frozenset[str]:
             "HERMES_LLM_BASE_URL",
             "HERMES_LLM_MODEL",
             "PAPERCLIP_COMPANY_ID",
+            "PAPERCLIP_BOARD_API_KEY",
+            "PAPERCLIP_BOARD_EMAIL",
+            "PAPERCLIP_BOARD_PASSWORD",
             "PAPERCLIP_PROJECT_ID",
             "PAPERCLIP_SERVICE_AGENT_ID",
             "PAPERCLIP_AGENT_API_KEY",
             "PAPERCLIP_AGENT_API_KEY_ID",
             "PAPERCLIP_AGENT_KEY_STATE",
+            *PAPERCLIP_OWNER_BOOTSTRAP_STATE_KEYS,
             "HERMES_PAPERCLIP_API_KEY",
         }
     )
@@ -259,11 +275,11 @@ def canonical_mutation_plan(values: dict[str, str]) -> frozenset[str]:
         planned.add(f"NINEROUTER_MINIMAX_CANARY_{canary}_FINGERPRINT")
     paperclip_source_keys = dict(
         [
-            ("BASEROW_PAPERCLIP_TOKEN", "mte.baserow.paperclip"),
             ("POSTGREST_PAPERCLIP_TOKEN", "mte.postgrest.paperclip"),
             ("MATTERMOST_BOT_TOKEN", "mte.mattermost.bot"),
             ("HERMES_API_SERVER_KEY", "mte.hermes.api-server"),
             ("KESTRA_ADMIN_PASSWORD", "mte.kestra.shared-password"),
+            ("CONTEXT7_API_KEY", "mte.context7.api-key"),
         ]
     )
     if values.get("DATA_CONTENT_PROFILE", "") == "postgres-notion":
@@ -503,30 +519,52 @@ class Context:
         row = self.components.get(component, {})
         exposure = row.get("exposure", {})
         if exposure.get("origin"):
-            return str(exposure["origin"]).rstrip("/")
-        health = str(row.get("health", {}).get("url", ""))
-        suffixes = {
-            "baserow": "/api/_health/",
-            "wikijs": "/healthz",
-            "activepieces": "/api/v1/health",
-            "9router": "/api/health",
-            "paperclip": "/api/health",
-        }
-        suffix = suffixes.get(component, "")
-        if suffix and health.endswith(suffix):
-            return health[: -len(suffix)]
-        defaults = {
-            "baserow": "http://127.0.0.1:18085",
-            "wikijs": "http://127.0.0.1:18086",
-            "postgrest": "http://127.0.0.1:18093",
-            "nocodb": "http://127.0.0.1:18096",
-            "mattermost": "http://127.0.0.1:18065",
-            "activepieces": "http://127.0.0.1:18090",
-            "kestra": "http://127.0.0.1:18082",
-            "9router": "http://127.0.0.1:20128",
-            "paperclip": "http://127.0.0.1:3100",
-        }
-        return defaults[component]
+            return self._validated_origin(str(exposure["origin"]), component)
+
+        try:
+            health_ref, default_port_ref = SERVICE_ENDPOINT_REFS[component]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"service_endpoint_contract_missing:{component}"
+            ) from exc
+
+        health = str(row.get("health", {}).get("url", "")).strip()
+        if not health or health.startswith("${"):
+            health = self.platform_env.get(health_ref, "").strip()
+        port_ref = str(exposure.get("originPortRef") or default_port_ref)
+        port = self.platform_env.get(port_ref, "").strip()
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise RuntimeError(f"service_origin_port_invalid:{component}:{port_ref}")
+
+        parsed = urllib.parse.urlsplit(health)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError(f"service_health_url_invalid:{component}:{health_ref}")
+        host = parsed.hostname
+        if ":" in host:
+            host = f"[{host}]"
+        return f"{parsed.scheme}://{host}:{int(port)}"
+
+    @staticmethod
+    def _validated_origin(value: str, component: str) -> str:
+        parsed = urllib.parse.urlsplit(value.rstrip("/"))
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise RuntimeError(f"service_origin_invalid:{component}")
+        return value.rstrip("/")
 
     def integration(self, name: str) -> tuple[Path, dict[str, str]]:
         path = INTEGRATIONS / f"{name}.env"
@@ -535,6 +573,10 @@ class Context:
             key: value
             for key, value in self.platform_env.items()
             if any(key.startswith(prefix) for prefix in prefixes)
+            and not (
+                name == "paperclip"
+                and key.startswith(PAPERCLIP_RECONCILER_STATE_PREFIXES)
+            )
         }
 
     def persist_canonical(self, values: dict[str, str]) -> None:
@@ -767,127 +809,6 @@ def ensure_mattermost_alert_webhook(
     return {"MATTERMOST_ALERT_WEBHOOK_URL": f"{ctx.url('mattermost')}/hooks/{hook_id}"}
 
 
-def activepieces_app_container() -> str:
-    """Return the Activepieces API container, never a worker container."""
-    completed = subprocess.run(
-        ["docker", "ps", "--format", "{{.Names}}|{{.Image}}"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError("docker_ps_failed")
-    for line in completed.stdout.splitlines():
-        name, _, image = line.partition("|")
-        if "activepieces" not in image.lower():
-            continue
-        try:
-            environment = command_json(
-                ["docker", "inspect", "--format", "{{json .Config.Env}}", name]
-            )
-        except (RuntimeError, json.JSONDecodeError):
-            continue
-        if not isinstance(environment, list):
-            continue
-        if "AP_CONTAINER_TYPE=APP" in environment:
-            return name
-    raise RuntimeError("activepieces_app_container_not_found")
-
-
-def reconcile_activepieces_owner(
-    saved: dict[str, str], *, require_single_identity: bool = True
-) -> dict[str, Any]:
-    """Reconcile the sole local CE owner without exposing credential material.
-
-    Activepieces Community Edition does not expose a platform service-account
-    or admin password-rotation endpoint.  A stale bootstrap credential would
-    otherwise make an idempotent self-hosted reinstall unrecoverable.  This
-    narrowly scoped recovery is allowed only when exactly one local identity
-    exists, and is followed by a normal API sign-in in ``activepieces``.
-    """
-    container = activepieces_app_container()
-    script = r"""
-const crypto = require('crypto');
-const fs = require('fs');
-const bcrypt = require('bcrypt');
-const { Client } = require('pg');
-
-async function main() {
-  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-  const client = new Client({
-    host: process.env.AP_POSTGRES_HOST,
-    port: Number(process.env.AP_POSTGRES_PORT || 5432),
-    user: process.env.AP_POSTGRES_USERNAME,
-    password: process.env.AP_POSTGRES_PASSWORD,
-    database: process.env.AP_POSTGRES_DATABASE,
-  });
-  await client.connect();
-  try {
-    await client.query('BEGIN');
-    const identities = await client.query(
-      'SELECT id, email FROM user_identity ORDER BY created ASC FOR UPDATE'
-    );
-    if (input.requireSingleIdentity && identities.rowCount !== 1) {
-      throw new Error('activepieces_owner_identity_count_not_one');
-    }
-    const matches = identities.rows.filter(
-      (row) => String(row.email).toLowerCase() === input.email.toLowerCase()
-    );
-    const identity = matches.length === 1 ? matches[0] :
-      (identities.rowCount === 1 ? identities.rows[0] : null);
-    if (!identity) throw new Error('activepieces_managed_owner_not_found');
-    const users = await client.query(
-      'SELECT id FROM "user" WHERE "identityId" = $1 FOR UPDATE',
-      [identity.id]
-    );
-    if (users.rowCount < 1) throw new Error('activepieces_owner_user_not_found');
-    const passwordHash = await bcrypt.hash(input.password, 10);
-    await client.query(
-      'UPDATE user_identity SET email = $1, password = $2, updated = NOW(), '
-      + '"tokenVersion" = $3, verified = TRUE WHERE id = $4',
-      [input.email, passwordHash, crypto.randomUUID(), identity.id]
-    );
-    await client.query('COMMIT');
-    process.stdout.write(JSON.stringify({status: 'reconciled', identities: 1, users: users.rowCount}));
-  } catch (error) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
-    throw error;
-  } finally {
-    await client.end();
-  }
-}
-main().catch((error) => {
-  process.stdout.write(JSON.stringify({status: 'error', reason: error.message}));
-  process.exitCode = 1;
-});
-"""
-    completed = subprocess.run(
-        ["docker", "exec", "-i", container, "node", "-e", script],
-        input=json.dumps(
-            {
-                "email": saved["ACTIVEPIECES_ADMIN_EMAIL"],
-                "password": saved["ACTIVEPIECES_ADMIN_PASSWORD"],
-                "requireSingleIdentity": require_single_identity,
-            }
-        ),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    try:
-        payload = json.loads(completed.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("activepieces_owner_reconcile_invalid_output") from exc
-    if completed.returncode != 0 or payload.get("status") != "reconciled":
-        reason = str(payload.get("reason") or "activepieces_owner_reconcile_failed")
-        if not re.fullmatch(r"[a-z0-9_]+", reason):
-            reason = "activepieces_owner_reconcile_failed"
-        raise RuntimeError(reason)
-    return payload
-
-
 def mattermost(ctx: Context) -> dict[str, Any]:
     component = "mattermost"
     path, saved = ctx.integration(component)
@@ -937,6 +858,10 @@ def mattermost(ctx: Context) -> dict[str, Any]:
         bots = list_value(mmctl(container, "bot", "list", "--all"), "bots")
         bot = next((row for row in bots if row.get("username") == "mte-agent"), None)
         if bot is None and ctx.mutate:
+            # Mattermost keeps bot-account creation disabled by default. This
+            # is the single prerequisite for the ordinary admin REST API;
+            # without it a valid system-admin session receives HTTP 403.
+            mmctl_config_set(container, "ServiceSettings.EnableBotAccountCreation", "true")
             admin_headers, actor = mattermost_admin_session(ctx, saved)
             bot = request_json(
                 "POST",
@@ -1066,128 +991,6 @@ def mattermost(ctx: Context) -> dict[str, Any]:
             if saved.get("MATTERMOST_BOT_TOKEN")
             and saved.get("MATTERMOST_ALERT_WEBHOOK_URL")
             else {},
-        )
-    except BaseException as exc:
-        return component_error(component, exc)
-
-
-def activepieces(ctx: Context) -> dict[str, Any]:
-    component = "activepieces"
-    path, saved = ctx.integration(component)
-    for canonical_key, deployment_key in (
-        ("ACTIVEPIECES_ADMIN_EMAIL", "AP_ADMIN_EMAIL"),
-        ("ACTIVEPIECES_ADMIN_PASSWORD", "AP_ADMIN_PASSWORD"),
-    ):
-        if not saved.get(canonical_key) and ctx.platform_env.get(deployment_key):
-            saved[canonical_key] = ctx.platform_env[deployment_key]
-    if ctx.mutate and saved:
-        ctx.save_integration(component, saved)
-    url = ctx.url(component)
-    try:
-        flags = request_json("GET", f"{url}/api/v1/flags")
-        user_created = bool(flags.get("USER_CREATED"))
-        have_credentials = bool(
-            saved.get("ACTIVEPIECES_ADMIN_EMAIL")
-            and saved.get("ACTIVEPIECES_ADMIN_PASSWORD")
-        )
-        if not have_credentials:
-            if user_created:
-                return result(
-                    component,
-                    "needs_authorization",
-                    reason="existing_owner_credentials_not_managed",
-                    limitations=[
-                        "Community Edition has no platform API keys or service accounts; those endpoints are Enterprise-only."
-                    ],
-                )
-            if not ctx.mutate:
-                return result(component, "pending_bootstrap", managed=[])
-            saved.update(
-                {
-                    "ACTIVEPIECES_ADMIN_EMAIL": ctx.operator_email(component),
-                    "ACTIVEPIECES_ADMIN_PASSWORD": password(),
-                }
-            )
-            ctx.save_integration(component, saved)
-        owner_recovery: dict[str, Any] | None = None
-        try:
-            auth = request_json(
-                "POST",
-                f"{url}/api/v1/authentication/sign-in",
-                body={
-                    "email": saved["ACTIVEPIECES_ADMIN_EMAIL"],
-                    "password": saved["ACTIVEPIECES_ADMIN_PASSWORD"],
-                },
-            )
-        except ApiError as exc:
-            if not user_created and ctx.mutate:
-                auth = request_json(
-                    "POST",
-                    f"{url}/api/v1/authentication/sign-up",
-                    body={
-                        "email": saved["ACTIVEPIECES_ADMIN_EMAIL"],
-                        "password": saved["ACTIVEPIECES_ADMIN_PASSWORD"],
-                        "firstName": "MTE",
-                        "lastName": "Operator",
-                        "trackEvents": False,
-                        "newsLetter": False,
-                    },
-                )
-            elif user_created and ctx.mutate and exc.status in {401, 403}:
-                owner_recovery = reconcile_activepieces_owner(saved)
-                auth = request_json(
-                    "POST",
-                    f"{url}/api/v1/authentication/sign-in",
-                    body={
-                        "email": saved["ACTIVEPIECES_ADMIN_EMAIL"],
-                        "password": saved["ACTIVEPIECES_ADMIN_PASSWORD"],
-                    },
-                )
-            else:
-                raise
-        if not auth.get("platformId") or not auth.get("projectId"):
-            onboarding_token = find_secret(auth)
-            if not onboarding_token:
-                raise RuntimeError("activepieces_onboarding_token_missing")
-            if not ctx.mutate:
-                return result(component, "pending_bootstrap", managed=["owner"])
-            auth = request_json(
-                "POST",
-                f"{url}/api/v1/platforms",
-                headers={"Authorization": f"Bearer {onboarding_token}"},
-                body={"name": "MTE Platform"},
-            )
-        if auth.get("platformId"):
-            saved["ACTIVEPIECES_PLATFORM_ID"] = str(auth["platformId"])
-        if auth.get("projectId"):
-            saved["ACTIVEPIECES_PROJECT_ID"] = str(auth["projectId"])
-        if ctx.mutate:
-            ctx.save_integration(component, saved)
-        ready = bool(
-            saved.get("ACTIVEPIECES_PLATFORM_ID")
-            and saved.get("ACTIVEPIECES_PROJECT_ID")
-        )
-        return result(
-            component,
-            "ready" if ready else "needs_authorization",
-            managed=["owner", "platform", "default_project"],
-            names={"platform": "MTE Platform"},
-            fingerprints={
-                "adminPassword": fingerprint(saved["ACTIVEPIECES_ADMIN_PASSWORD"])
-            }
-            if saved.get("ACTIVEPIECES_ADMIN_PASSWORD")
-            else {},
-            ownerRecovery={
-                "status": owner_recovery.get("status"),
-                "identities": owner_recovery.get("identities"),
-                "users": owner_recovery.get("users"),
-            }
-            if owner_recovery
-            else None,
-            limitations=[
-                "Community Edition has no platform API keys or service accounts; machine access should use webhook endpoints or a purpose-built piece.",
-                "OAuth app connections remain per-provider needs_authorization and are not fabricated by this script.",
-            ],
         )
     except BaseException as exc:
         return component_error(component, exc)
@@ -2118,13 +1921,7 @@ def paperclip_runtime_security(ctx: Context) -> dict[str, Any]:
         )
         if completed.returncode != 0:
             raise RuntimeError("paperclip_restart_failed")
-        port = snapshot.get("port")
-        health_url = (
-            f"http://127.0.0.1:{port}/api/health"
-            if isinstance(port, int)
-            else f"{ctx.url('paperclip')}/api/health"
-        )
-        wait_json_endpoint(health_url)
+        wait_json_endpoint(f"{ctx.url('paperclip')}/api/health")
         snapshot = paperclip_runtime_snapshot(key_override)
         effective_strict = (
             strict_override in {"1", "true", "yes", "on"}
@@ -2163,13 +1960,247 @@ def paperclip_headers(
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
+def paperclip_bootstrap_request(
+    opener: urllib.request.OpenerDirector,
+    method: str,
+    url: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Accept": "application/json", "Origin": url.split("/api/", 1)[0]}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with opener.open(request, timeout=30) as response:
+            payload = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        raise ApiError(
+            exc.code,
+            "paperclip_bootstrap_http_error",
+            operation=f"paperclip_bootstrap_{method.lower()}",
+            response_error_sha256=hashlib.sha256(raw).hexdigest(),
+            response_error_length=len(raw),
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("paperclip_bootstrap_response_invalid")
+    return payload
+
+
+def paperclip_public_url(ctx: Context) -> str:
+    return (
+        "https://"
+        + ctx.platform_env.get("PAPERCLIP_SUBDOMAIN", "paperclip")
+        + "."
+        + ctx.platform_env["PLATFORM_BASE_DOMAIN"]
+    )
+
+
+def paperclip_machine_invite_request_type(health: dict[str, Any]) -> str | None:
+    """Return an upstream-declared non-human invite type, if one exists.
+
+    Absence is intentionally not guessed.  A server that only exposes the
+    historical human request type must remain a human-approved bootstrap even
+    when an operator has opted into unattended setup.
+    """
+
+    candidates = health.get("supportedInviteRequestTypes")
+    if not isinstance(candidates, list):
+        return None
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip().lower() == "machine":
+            return "machine"
+    return None
+
+
+def paperclip_owner_authorization_handoff(
+    ctx: Context,
+    *,
+    invite_id: str = "",
+    reason: str,
+) -> dict[str, Any]:
+    """Give operators a resumable but non-secret-bearing browser handoff."""
+
+    return {
+        "status": "needs_authorization",
+        "reason": reason,
+        "browserHandoff": {
+            "url": paperclip_public_url(ctx).rstrip("/") + "/invite/[redacted]",
+            "inviteFingerprint": fingerprint(invite_id) if invite_id else None,
+            "redacted": True,
+            "resumeCommand": "./install.sh",
+        },
+    }
+
+
+def ensure_paperclip_board_identity(ctx: Context) -> dict[str, Any]:
+    """Reconcile a board key without ever passing a machine off as a human.
+
+    The public path creates at most the upstream bootstrap invite and then
+    stops.  It returns only a redacted handoff, so the invite bearer is neither
+    printed nor included in the provisioning evidence.  A repeated install
+    reuses the stored private invite identifier and resumes once a human has
+    accepted it.  The legacy fully unattended sequence is available solely
+    behind an explicit high-risk flag and only for an upstream-declared
+    ``machine`` invite request type.
+    """
+
+    _, saved = ctx.integration("paperclip")
+    if saved.get("PAPERCLIP_BOARD_API_KEY") or ctx.platform_env.get(
+        "PAPERCLIP_BOARD_API_KEY", ""
+    ):
+        return {"status": "ready"}
+    if not ctx.mutate:
+        return paperclip_owner_authorization_handoff(
+            ctx, reason="paperclip_board_identity_missing"
+        )
+
+    base = ctx.url("paperclip")
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    health = paperclip_bootstrap_request(opener, "GET", f"{base}/api/health")
+    if health.get("bootstrapStatus") == "bootstrap_pending":
+        invite_id = saved.get(PAPERCLIP_OWNER_INVITE_ID_KEY, "")
+        if not invite_id:
+            completed = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "--user",
+                    "node",
+                    PAPERCLIP_CONTAINER,
+                    "/tools/node_modules/.bin/paperclipai",
+                    "auth",
+                    "bootstrap-ceo",
+                    "-c",
+                    PAPERCLIP_CONFIG_PATH,
+                    "-d",
+                    "/data",
+                    "--base-url",
+                    paperclip_public_url(ctx),
+                    "--expires-hours",
+                    "24",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError("paperclip_bootstrap_invite_create_failed")
+            match = re.search(
+                r"/invite/(pcp_(?:invite|bootstrap)_[A-Za-z0-9_-]+)",
+                completed.stdout + "\n" + completed.stderr,
+            )
+            if not match:
+                raise RuntimeError("paperclip_bootstrap_invite_missing")
+            invite_id = match.group(1)
+            saved[PAPERCLIP_OWNER_INVITE_ID_KEY] = invite_id
+            ctx.save_integration("paperclip", saved)
+
+        request_type = paperclip_machine_invite_request_type(health)
+        if (
+            ctx.platform_env.get(PAPERCLIP_UNATTENDED_OWNER_BOOTSTRAP_KEY) != "true"
+        ):
+            return paperclip_owner_authorization_handoff(
+                ctx,
+                invite_id=invite_id,
+                reason="paperclip_first_owner_human_authorization_required",
+            )
+        if request_type is None:
+            return paperclip_owner_authorization_handoff(
+                ctx,
+                invite_id=invite_id,
+                reason="paperclip_unattended_owner_bootstrap_requires_upstream_machine_type",
+            )
+
+        email = (
+            saved.get("PAPERCLIP_BOARD_EMAIL")
+            or ctx.platform_env.get("PAPERCLIP_BOARD_EMAIL", "")
+            or f"platform-admin@{ctx.platform_env['PLATFORM_BASE_DOMAIN']}"
+        )
+        operator_password = (
+            saved.get("PAPERCLIP_BOARD_PASSWORD")
+            or ctx.platform_env.get("PAPERCLIP_BOARD_PASSWORD", "")
+            or password()
+        )
+        # Persist the explicitly machine-only resumable state before the
+        # upstream accept call. If a later board-key request fails, a replay
+        # can sign in as that same machine identity without inventing a human
+        # request type or issuing another owner invite.
+        saved.update(
+            {
+                "PAPERCLIP_BOARD_EMAIL": email,
+                "PAPERCLIP_BOARD_PASSWORD": operator_password,
+                PAPERCLIP_OWNER_BOOTSTRAP_REQUEST_TYPE_KEY: request_type,
+            }
+        )
+        ctx.save_integration("paperclip", saved)
+        paperclip_bootstrap_request(
+            opener,
+            "POST",
+            f"{base}/api/auth/sign-up/email",
+            {
+                "name": "MTE Platform Admin",
+                "email": email,
+                "password": operator_password,
+            },
+        )
+        accepted = paperclip_bootstrap_request(
+            opener,
+            "POST",
+            f"{base}/api/invites/{invite_id}/accept",
+            {"requestType": request_type},
+        )
+        if accepted.get("bootstrapAccepted") is not True:
+            raise RuntimeError("paperclip_bootstrap_accept_failed")
+    else:
+        if (
+            ctx.platform_env.get(PAPERCLIP_UNATTENDED_OWNER_BOOTSTRAP_KEY) != "true"
+            or saved.get(PAPERCLIP_OWNER_BOOTSTRAP_REQUEST_TYPE_KEY) != "machine"
+            or not saved.get("PAPERCLIP_BOARD_EMAIL")
+            or not saved.get("PAPERCLIP_BOARD_PASSWORD")
+        ):
+            return paperclip_owner_authorization_handoff(
+                ctx,
+                reason="paperclip_board_api_key_requires_owner_authorization",
+            )
+        email = saved["PAPERCLIP_BOARD_EMAIL"]
+        operator_password = saved["PAPERCLIP_BOARD_PASSWORD"]
+        paperclip_bootstrap_request(
+            opener,
+            "POST",
+            f"{base}/api/auth/sign-in/email",
+            {
+                "email": email,
+                "password": operator_password,
+            },
+        )
+
+    created = paperclip_bootstrap_request(
+        opener,
+        "POST",
+        f"{base}/api/board-api-keys",
+        {"name": "mte-platform-provisioner"},
+    )
+    board_key = str(created.get("token") or "")
+    if not board_key.startswith("pcp_board_"):
+        raise RuntimeError("paperclip_board_key_create_failed")
+    saved.update(
+        {
+            "PAPERCLIP_BOARD_EMAIL": email,
+            "PAPERCLIP_BOARD_PASSWORD": operator_password,
+            "PAPERCLIP_BOARD_API_KEY": board_key,
+        }
+    )
+    ctx.save_integration("paperclip", saved)
+    return {"status": "ready"}
+
+
 def paperclip_secret_specs(ctx: Context) -> list[dict[str, str]]:
     specs: list[dict[str, str]] = []
     candidates = {
-        "BASEROW_PAPERCLIP_TOKEN": (
-            "mte.baserow.paperclip",
-            "Baserow Paperclip scoped database token",
-        ),
         "POSTGREST_PAPERCLIP_TOKEN": (
             "mte.postgrest.paperclip",
             "PostgREST Paperclip scoped writer JWT",
@@ -2182,6 +2213,10 @@ def paperclip_secret_specs(ctx: Context) -> list[dict[str, str]]:
         "KESTRA_ADMIN_PASSWORD": (
             "mte.kestra.shared-password",
             "Kestra shared Basic Auth password",
+        ),
+        "CONTEXT7_API_KEY": (
+            "mte.context7.api-key",
+            "Optional Context7 API key for native harness tools",
         ),
     }
     if ctx.platform_env.get("DATA_CONTENT_PROFILE", "") == "postgres-notion":
@@ -2244,10 +2279,6 @@ def data_content_paperclip_bindings(ctx: Context) -> tuple[tuple[str, str], ...]
     """
 
     profile = ctx.platform_env.get("DATA_CONTENT_PROFILE", "")
-    if profile == "baserow-wikijs":
-        return (("BASEROW_PAPERCLIP_TOKEN", "BASEROW_API_TOKEN"),)
-    if profile == "postgres-postgrest-nocodb-nocodocs":
-        return (("POSTGREST_PAPERCLIP_TOKEN", "POSTGREST_API_TOKEN"),)
     if profile == "postgres-notion":
         return (("POSTGREST_PAPERCLIP_TOKEN", "POSTGREST_API_TOKEN"),)
     raise RuntimeError("data_content_profile_unsupported")
@@ -2267,7 +2298,7 @@ def reconcile_data_content_paperclip_env(
     """Replace data/content credentials with Paperclip-managed references."""
 
     desired = dict(existing)
-    for stale_key in ("BASEROW_API_TOKEN", "POSTGREST_API_TOKEN", "NOTION_TOKEN"):
+    for stale_key in ("POSTGREST_API_TOKEN", "NOTION_TOKEN"):
         desired.pop(stale_key, None)
     for source_key, env_key in data_content_paperclip_bindings(ctx):
         secret_id = secret_ids.get(source_key, "")
@@ -2323,7 +2354,7 @@ def ensure_paperclip_company_secret(
         and remote.get("id")
         and (ctx.mutate or stored_fingerprint == value_fingerprint)
     )
-    return {
+    evidence = {
         "sourceKey": spec["sourceKey"],
         "key": spec["key"],
         "id": str(remote.get("id")) if remote and remote.get("id") else "",
@@ -2334,8 +2365,13 @@ def ensure_paperclip_company_secret(
         "status": "ready"
         if ready
         else ("pending_bootstrap" if remote is None else "needs_rotation"),
-        "fingerprint": value_fingerprint,
     }
+    # Context7 is optional and its credential evidence is deliberately
+    # boolean/ref-only. The root-only source fingerprint remains an internal
+    # idempotent rotation marker, never part of result/evidence payloads.
+    if spec["sourceKey"] != "CONTEXT7_API_KEY":
+        evidence["fingerprint"] = value_fingerprint
+    return evidence
 
 
 def paperclip_profile_ref(
@@ -2354,6 +2390,91 @@ def paperclip_profile_ref(
 
 def paperclip_ref(secret_id: str) -> dict[str, Any]:
     return {"type": "secret_ref", "secretId": secret_id, "version": "latest"}
+
+
+def hermes_gateway_agent_payload(
+    ctx: Context,
+    *,
+    gateway_secret_id: str,
+) -> dict[str, Any]:
+    """Return the official Paperclip hermes_gateway agent declaration.
+
+    Hermes is a native host service, while Paperclip is isolated in the
+    ``mte-control`` Docker network.  Paperclip therefore calls the host through
+    that network's private gateway; Hermes calls Paperclip through its
+    loopback-published API.  The gateway credential is always a Paperclip
+    secret reference, never an inline value.
+    """
+
+    host = ctx.platform_env.get("HERMES_API_SERVER_HOST", "").strip()
+    port = ctx.platform_env.get("HERMES_API_SERVER_PORT", "").strip()
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise RuntimeError("hermes_gateway_host_invalid") from exc
+    if (
+        not gateway_secret_id
+        or not port.isdigit()
+        or not 1 <= int(port) <= 65535
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_link_local
+        or not (address.is_loopback or address.is_private)
+    ):
+        raise RuntimeError("hermes_gateway_contract_invalid")
+    adapter_config: dict[str, Any] = {
+        "apiBaseUrl": f"http://{host}:{int(port)}",
+        "apiKey": paperclip_ref(gateway_secret_id),
+        "paperclipApiUrl": ctx.url("paperclip"),
+        "sessionKeyStrategy": "issue",
+        "timeoutSec": 1800,
+    }
+    if not address.is_loopback:
+        # Upstream Paperclip requires this explicit opt-in for trusted private
+        # HTTP networks. The API remains authenticated by API_SERVER_KEY and
+        # is bound only to the private Docker bridge address.
+        adapter_config["dangerouslyAllowInsecureRemoteHttp"] = True
+    return {
+        "name": "MTE Hermes Gateway",
+        "title": "Platform Operator",
+        "role": "devops",
+        "capabilities": (
+            "Operate and repair the MTE platform; create, inspect, comment on, "
+            "and update Paperclip tasks through a project-scoped bridge key."
+        ),
+        "adapterType": "hermes_gateway",
+        "adapterConfig": adapter_config,
+        "runtimeConfig": {
+            "heartbeat": {
+                "enabled": False,
+                "wakeOnDemand": True,
+                "maxConcurrentRuns": 1,
+            }
+        },
+        "budgetMonthlyCents": 0,
+        "metadata": {
+            "systemRef": "hermes-operator",
+            "managedBy": "mte-server-provision",
+        },
+    }
+
+
+def context7_binding_evidence(
+    ctx: Context, secret_id: str, adapter_type: str = ""
+) -> dict[str, Any]:
+    configured = bool(canonical_secret_value(ctx.platform_env, "CONTEXT7_API_KEY"))
+    native_config_binding = {
+        "codex_local": "codex_bearer_token_env_var",
+        "claude_local": "claude_managed_mcp_headers_ref",
+        "pi_local": "pi_extension_optional_env",
+    }.get(adapter_type, "company_secret_ref")
+    return {
+        "configured": configured,
+        "authMode": "paperclip_company_secret_ref" if configured else "anonymous",
+        "bindingRef": "CONTEXT7_API_KEY" if configured else None,
+        "secretId": secret_id or None,
+        "nativeConfigBinding": native_config_binding if configured else "none",
+    }
 
 
 def paperclip_user_ref(key: str) -> dict[str, Any]:
@@ -2389,6 +2510,33 @@ def unsafe_paperclip_env(env: Any) -> list[str]:
         ):
             findings.append(str(key))
     return findings
+
+
+def reconcile_codex_context7_args(
+    raw_args: Any, *, secret_ref_configured: bool
+) -> list[str]:
+    args = [str(value) for value in raw_args] if isinstance(raw_args, list) else []
+    binding_prefix = "mcp_servers.context7.bearer_token_env_var="
+    desired: list[str] = []
+    index = 0
+    while index < len(args):
+        if (
+            args[index] == "-c"
+            and index + 1 < len(args)
+            and args[index + 1].startswith(binding_prefix)
+        ):
+            index += 2
+            continue
+        if args[index].startswith(binding_prefix):
+            index += 1
+            continue
+        desired.append(args[index])
+        index += 1
+    if secret_ref_configured:
+        desired.extend(
+            ["-c", 'mcp_servers.context7.bearer_token_env_var="CONTEXT7_API_KEY"']
+        )
+    return desired
 
 
 def paperclip_agent_gateway_contract(
@@ -2497,6 +2645,7 @@ def paperclip_desired_adapter_config(
     router_secret_id: str,
     toolhive_secret_id: str,
     existing: dict[str, Any],
+    context7_secret_id: str = "",
 ) -> dict[str, Any]:
     desired = dict(existing)
     desired.update(dict(profile.get("nativeAdapterConfig") or {}))
@@ -2607,6 +2756,13 @@ def paperclip_desired_adapter_config(
             ("MTE_TOOLHIVE_CANARY_TOOL", gateway["toolhiveCanaryTool"]),
         ):
             env[key] = {"type": "plain", "value": value}
+    if context7_secret_id:
+        env["CONTEXT7_API_KEY"] = paperclip_ref(context7_secret_id)
+    if adapter_type == "codex_local" and ("extraArgs" in desired or context7_secret_id):
+        desired["extraArgs"] = reconcile_codex_context7_args(
+            desired.get("extraArgs"),
+            secret_ref_configured=bool(context7_secret_id),
+        )
     if "github" in set((profile.get("mcpPolicy") or {}).get("allow", [])):
         github_ref = paperclip_user_ref("mte.github.personal_access_token")
         # Official GitHub CLI consumes GH_TOKEN while GitHub API/MCP clients
@@ -2625,17 +2781,315 @@ def paperclip_adapter_binding_ready(
     *,
     router_secret_id: str,
     toolhive_secret_id: str,
+    context7_required: bool = False,
+    context7_secret_id: str = "",
 ) -> bool:
     """Return readiness from the post-mutation adapter representation."""
     return (
         bool(router_secret_id)
         and bool(toolhive_secret_id)
+        and (not context7_required or bool(context7_secret_id))
         and adapter_config == desired_adapter_config
     )
 
 
+def paperclip_e2e_workspace_contract(ctx: Context) -> dict[str, Any]:
+    """Return the supported Paperclip project workspace for the E2E target."""
+
+    e2e = ctx.config.get("spec", {}).get("e2e", {})
+    refs = {
+        "owner": str(e2e.get("githubOwnerRef") or ""),
+        "repository": str(e2e.get("githubRepositoryRef") or ""),
+        "baseBranch": str(e2e.get("baseBranchRef") or ""),
+    }
+    missing_refs = sorted(key for key, ref in refs.items() if not ref)
+    if missing_refs:
+        raise RuntimeError(
+            "paperclip_e2e_workspace_refs_missing:" + ",".join(missing_refs)
+        )
+    values = {
+        key: str(ctx.platform_env.get(ref, "")).strip() for key, ref in refs.items()
+    }
+    missing_values = sorted(key for key, value in values.items() if not value)
+    if missing_values:
+        raise RuntimeError(
+            "paperclip_e2e_workspace_values_missing:" + ",".join(missing_values)
+        )
+    owner = values["owner"]
+    repository = values["repository"]
+    base_branch = values["baseBranch"]
+    if (
+        not E2E_GITHUB_SLUG_RE.fullmatch(owner)
+        or not E2E_GITHUB_SLUG_RE.fullmatch(repository)
+        or repository in {".", ".."}
+    ):
+        raise RuntimeError("paperclip_e2e_workspace_repository_invalid")
+    invalid_branch = (
+        not E2E_GITHUB_BRANCH_RE.fullmatch(base_branch)
+        or base_branch == "HEAD"
+        or base_branch.startswith(("-", ".", "/"))
+        or base_branch.endswith((".", "/", ".lock"))
+        or ".." in base_branch
+        or "@{" in base_branch
+        or "//" in base_branch
+        or any(
+            not segment
+            or segment.startswith((".", "-"))
+            or segment.endswith((".", ".lock"))
+            for segment in base_branch.split("/")
+        )
+    )
+    if invalid_branch:
+        raise RuntimeError("paperclip_e2e_workspace_base_branch_invalid")
+    return {
+        "name": PAPERCLIP_E2E_WORKSPACE_NAME,
+        "sourceType": "git_repo",
+        "repoUrl": f"https://github.com/{owner}/{repository}.git",
+        "repoRef": base_branch,
+        "defaultRef": base_branch,
+        "visibility": "default",
+        "metadata": {
+            "managedBy": PAPERCLIP_E2E_WORKSPACE_MANAGER,
+            "purpose": PAPERCLIP_E2E_WORKSPACE_PURPOSE,
+        },
+        "isPrimary": True,
+    }
+
+
+def reconcile_paperclip_e2e_project_workspace(
+    ctx: Context,
+    url: str,
+    headers: dict[str, str],
+    project: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Read-before-write reconciliation for the E2E project's primary codebase."""
+
+    project_id = str((project or {}).get("id") or "")
+    if not project_id:
+        return {"status": "needs_configuration", "reason": "project_missing"}
+    desired = paperclip_e2e_workspace_contract(ctx)
+    workspaces = list_value(
+        request_json(
+            "GET", f"{url}/api/projects/{project_id}/workspaces", headers=headers
+        )
+    )
+    managed_workspaces = [
+        row
+        for row in workspaces
+        if isinstance(row.get("metadata"), dict)
+        and row["metadata"].get("managedBy") == PAPERCLIP_E2E_WORKSPACE_MANAGER
+        and row["metadata"].get("purpose") == PAPERCLIP_E2E_WORKSPACE_PURPOSE
+    ]
+    unmanaged_collisions = [
+        row
+        for row in workspaces
+        if row not in managed_workspaces
+        and (
+            row.get("name") == PAPERCLIP_E2E_WORKSPACE_NAME
+            or row.get("repoUrl") == desired["repoUrl"]
+        )
+    ]
+    if unmanaged_collisions:
+        return {
+            "status": "needs_configuration",
+            "reason": "unmanaged_project_workspace_collision",
+            "workspaceId": None,
+            "sourceType": desired["sourceType"],
+            "repoUrl": desired["repoUrl"],
+            "defaultRef": desired["defaultRef"],
+            "isPrimary": False,
+            "policy": None,
+        }
+    if len(managed_workspaces) > 1:
+        return {
+            "status": "needs_configuration",
+            "reason": "duplicate_managed_project_workspaces",
+            "workspaceId": None,
+            "sourceType": desired["sourceType"],
+            "repoUrl": desired["repoUrl"],
+            "defaultRef": desired["defaultRef"],
+            "isPrimary": False,
+            "policy": None,
+        }
+    workspace = managed_workspaces[0] if managed_workspaces else None
+    if workspace is None and ctx.mutate:
+        workspace = request_json(
+            "POST",
+            f"{url}/api/projects/{project_id}/workspaces",
+            headers=headers,
+            body=desired,
+        )
+    elif workspace is not None and ctx.mutate:
+        drifted = any(workspace.get(key) != value for key, value in desired.items())
+        if drifted:
+            workspace = request_json(
+                "PATCH",
+                f"{url}/api/projects/{project_id}/workspaces/{workspace['id']}",
+                headers=headers,
+                body=desired,
+            )
+    workspace_id = str((workspace or {}).get("id") or "")
+    desired_policy = {
+        "enabled": True,
+        "defaultMode": "isolated_workspace",
+        "allowIssueOverride": True,
+        "defaultProjectWorkspaceId": workspace_id or None,
+        "workspaceStrategy": {
+            "type": "cloud_sandbox",
+            "baseRef": desired["defaultRef"],
+        },
+    }
+    if (
+        workspace_id
+        and (project or {}).get("executionWorkspacePolicy") != desired_policy
+    ):
+        if ctx.mutate:
+            updated = request_json(
+                "PATCH",
+                f"{url}/api/projects/{project_id}",
+                headers=headers,
+                body={"executionWorkspacePolicy": desired_policy},
+            )
+            if isinstance(updated, dict) and project is not None:
+                project.update(updated)
+        else:
+            return {
+                "status": "needs_configuration",
+                "reason": "execution_workspace_policy_drift",
+                "workspaceId": workspace_id,
+                "repoUrl": desired["repoUrl"],
+                "defaultRef": desired["defaultRef"],
+            }
+    ready = (
+        bool(workspace_id)
+        and all((workspace or {}).get(key) == value for key, value in desired.items())
+        and (project or {}).get("executionWorkspacePolicy") == desired_policy
+    )
+    return {
+        "status": "ready" if ready else "needs_configuration",
+        "reason": None if ready else "primary_git_workspace_missing_or_drifted",
+        "workspaceId": workspace_id or None,
+        "sourceType": desired["sourceType"],
+        "repoUrl": desired["repoUrl"],
+        "defaultRef": desired["defaultRef"],
+        "isPrimary": bool((workspace or {}).get("isPrimary")),
+        "policy": desired_policy,
+    }
+
+
+def paperclip_daytona_environment(
+    ctx: Context,
+    url: str,
+    headers: dict[str, str],
+    company_id: str,
+) -> dict[str, Any]:
+    """Resolve the existing environment owned by the Daytona reconciler."""
+
+    environment_name = str(
+        ctx.platform_env.get("MTE_DAYTONA_ENVIRONMENT_NAME") or ""
+    ).strip()
+    if not environment_name:
+        return {
+            "status": "needs_configuration",
+            "reason": "daytona_environment_name_missing",
+            "environmentId": None,
+        }
+    environments = list_value(
+        request_json(
+            "GET",
+            f"{url}/api/companies/{company_id}/environments",
+            headers=headers,
+        ),
+        "environments",
+    )
+    managed = [
+        row
+        for row in environments
+        if isinstance(row.get("metadata"), dict)
+        and row["metadata"].get("managedBy") == PAPERCLIP_DAYTONA_ENVIRONMENT_MANAGER
+        and row["metadata"].get("purpose") == PAPERCLIP_DAYTONA_ENVIRONMENT_PURPOSE
+    ]
+    if len(managed) != 1:
+        return {
+            "status": "needs_configuration",
+            "reason": (
+                "daytona_environment_missing"
+                if not managed
+                else "duplicate_managed_daytona_environments"
+            ),
+            "environmentId": None,
+            "name": environment_name,
+        }
+    environment = managed[0]
+    config = (
+        environment.get("config") if isinstance(environment.get("config"), dict) else {}
+    )
+    ready = (
+        environment.get("name") == environment_name
+        and environment.get("driver") == "sandbox"
+        and environment.get("status") == "active"
+        and config.get("provider") == "daytona"
+        and bool(environment.get("id"))
+    )
+    return {
+        "status": "ready" if ready else "needs_configuration",
+        "reason": None if ready else "daytona_environment_drift",
+        "environmentId": str(environment.get("id") or "") or None,
+        "name": environment_name,
+        "driver": environment.get("driver"),
+        "provider": config.get("provider"),
+    }
+
+
+def reconcile_paperclip_agent_environment(
+    ctx: Context,
+    url: str,
+    headers: dict[str, str],
+    agent: dict[str, Any],
+    environment: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Bind a native agent through Paperclip's supported environment field."""
+
+    environment_id = str(environment.get("environmentId") or "")
+    agent_id = str(agent.get("id") or "")
+    if (
+        ctx.mutate
+        and agent_id
+        and environment.get("status") == "ready"
+        and str(agent.get("defaultEnvironmentId") or "") != environment_id
+    ):
+        updated = request_json(
+            "PATCH",
+            f"{url}/api/agents/{agent_id}",
+            headers=headers,
+            body={"defaultEnvironmentId": environment_id},
+        )
+        if isinstance(updated, dict):
+            agent.update(updated.get("agent", updated))
+    default_environment_id = str(agent.get("defaultEnvironmentId") or "")
+    ready = (
+        environment.get("status") == "ready"
+        and bool(agent_id)
+        and default_environment_id == environment_id
+    )
+    return agent, {
+        "agentId": agent_id or None,
+        "defaultEnvironmentId": default_environment_id or None,
+        "environmentId": environment_id or None,
+        "status": "ready" if ready else "needs_configuration",
+    }
+
+
 def paperclip(ctx: Context) -> dict[str, Any]:
     component = "paperclip"
+    board_identity = ensure_paperclip_board_identity(ctx)
+    if board_identity["status"] != "ready":
+        return result(
+            component,
+            "needs_authorization",
+            reason=board_identity["reason"],
+            browserHandoff=board_identity["browserHandoff"],
+        )
     _, saved = ctx.integration(component)
     url = ctx.url(component)
     headers = paperclip_headers(saved, ctx.platform_env)
@@ -2747,6 +3201,9 @@ def paperclip(ctx: Context) -> dict[str, Any]:
             )
         if project and project.get("id") and ctx.mutate:
             ctx.persist_canonical({"PAPERCLIP_PROJECT_ID": str(project["id"])})
+        project_workspace = reconcile_paperclip_e2e_project_workspace(
+            ctx, url, headers, project
+        )
 
         remote_secrets = list_value(
             request_json(
@@ -2884,6 +3341,9 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                 "GET", f"{url}/api/companies/{company_id}/agents", headers=headers
             )
         )
+        daytona_environment = paperclip_daytona_environment(
+            ctx, url, headers, company_id
+        )
         catalog = {str(row["ref"]): row for row in profile_catalog()}
         company_skills = list_value(
             request_json(
@@ -2977,6 +3437,7 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                 agents.append(created_agent.get("agent", created_agent))
         unsafe_inline: list[dict[str, Any]] = []
         bound_agents: list[dict[str, Any]] = []
+        agent_environment_bindings: list[dict[str, Any]] = []
         for agent_row in agents:
             adapter_config = dict(agent_row.get("adapterConfig") or {})
             existing_env = dict(adapter_config.get("env") or {})
@@ -3002,6 +3463,10 @@ def paperclip(ctx: Context) -> dict[str, Any]:
             tool_routing = profile.get("toolRouting") or {}
             toolhive_source_key = str(tool_routing.get("bearerTokenRef") or "")
             toolhive_secret_id = secret_ids.get(toolhive_source_key, "")
+            context7_configured = bool(
+                canonical_secret_value(ctx.platform_env, "CONTEXT7_API_KEY")
+            )
+            context7_secret_id = secret_ids.get("CONTEXT7_API_KEY", "")
             # The profile owns the complete runtime credential envelope.  Do
             # not retain stale plain values or auth-home overrides from an old
             # bootstrap; strict-mode refs are rebuilt declaratively each run.
@@ -3013,6 +3478,7 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                 adapter_type=adapter_type,
                 router_secret_id=router_secret_id,
                 toolhive_secret_id=toolhive_secret_id,
+                context7_secret_id=context7_secret_id,
                 existing=adapter_config,
             )
             config_drift = desired_adapter_config != adapter_config
@@ -3037,22 +3503,38 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                     adapter_type=adapter_type,
                     router_secret_id=router_secret_id,
                     toolhive_secret_id=toolhive_secret_id,
+                    context7_secret_id=context7_secret_id,
                     existing=adapter_config,
                 )
                 config_drift = adapter_config != desired_adapter_config
             elif not ctx.mutate:
                 config_drift = adapter_config != desired_adapter_config
+            agent_row, environment_binding = reconcile_paperclip_agent_environment(
+                ctx,
+                url,
+                headers,
+                agent_row,
+                daytona_environment,
+            )
+            environment_binding["profileRef"] = profile_ref
+            agent_environment_bindings.append(environment_binding)
             # Paperclip may inject its managed per-agent CODEX_HOME while
             # applying a codex_local adapter.  Readiness must use the desired
             # envelope recomputed from that response, never the pre-PATCH one.
-            binding_ready = paperclip_adapter_binding_ready(
-                adapter_config,
-                desired_adapter_config,
-                router_secret_id=router_secret_id,
-                toolhive_secret_id=toolhive_secret_id,
+            binding_ready = (
+                paperclip_adapter_binding_ready(
+                    adapter_config,
+                    desired_adapter_config,
+                    router_secret_id=router_secret_id,
+                    toolhive_secret_id=toolhive_secret_id,
+                    context7_required=context7_configured,
+                    context7_secret_id=context7_secret_id,
+                )
+                and environment_binding["status"] == "ready"
             )
             bound_agents.append(
                 {
+                    "agentId": str(agent_row.get("id") or "") or None,
                     "profileRef": profile_ref,
                     "adapterType": adapter_type,
                     "routerKeyRef": source_key,
@@ -3061,10 +3543,15 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                     "toolhiveSecretId": toolhive_secret_id,
                     "toolhiveUrlRef": str(tool_routing.get("mcpUrlRef") or ""),
                     "gatewayHost": ctx.platform_env.get("MTE_AGENT_GATEWAY_HOST", ""),
+                    "context7": context7_binding_evidence(
+                        ctx, context7_secret_id, adapter_type
+                    ),
                     "status": "ready" if binding_ready else "needs_configuration",
                     "cwd": str(adapter_config.get("cwd") or ""),
                     "envKeys": sorted((adapter_config.get("env") or {}).keys()),
                     "configDrift": config_drift,
+                    "defaultEnvironmentId": environment_binding["defaultEnvironmentId"],
+                    "environmentId": environment_binding["environmentId"],
                 }
             )
 
@@ -3132,17 +3619,68 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                     row
                     for row in agents
                     if (
-                        "gateway" in str(row.get("name", "")).lower()
-                        and any(
-                            token in str(row.get("name", "")).lower()
-                            for token in ("hermes", "platform")
+                        (
+                            isinstance(row.get("metadata"), dict)
+                            and row["metadata"].get("systemRef")
+                            == "hermes-operator"
+                        )
+                        or (
+                            "gateway" in str(row.get("name", "")).lower()
+                            and any(
+                                token in str(row.get("name", "")).lower()
+                                for token in ("hermes", "platform")
+                            )
                         )
                     )
                 ),
                 None,
             )
+        gateway_secret_id = secret_ids.get("HERMES_API_SERVER_KEY", "")
+        gateway_payload = (
+            hermes_gateway_agent_payload(
+                ctx,
+                gateway_secret_id=gateway_secret_id,
+            )
+            if gateway_secret_id
+            else None
+        )
+        if agent is None and gateway_payload and ctx.mutate:
+            created_agent = request_json(
+                "POST",
+                f"{url}/api/companies/{company_id}/agents",
+                headers=headers,
+                body=gateway_payload,
+            )
+            if isinstance(created_agent, dict):
+                agent = created_agent.get("agent", created_agent)
+                if isinstance(agent, dict):
+                    agents.append(agent)
         if agent and agent.get("id"):
             gateway_config = dict(agent.get("adapterConfig") or {})
+            if gateway_payload:
+                desired_gateway_config = dict(gateway_payload["adapterConfig"])
+                desired_gateway_config["env"] = dict(gateway_config.get("env") or {})
+                gateway_identity_drift = (
+                    agent.get("adapterType") != "hermes_gateway"
+                    or gateway_config != desired_gateway_config
+                    or (agent.get("metadata") or {}).get("systemRef")
+                    != "hermes-operator"
+                )
+                if ctx.mutate and gateway_identity_drift:
+                    updated_agent = request_json(
+                        "PATCH",
+                        f"{url}/api/agents/{agent['id']}",
+                        headers=headers,
+                        body={
+                            "adapterType": "hermes_gateway",
+                            "adapterConfig": desired_gateway_config,
+                            "replaceAdapterConfig": True,
+                            "metadata": gateway_payload["metadata"],
+                        },
+                    )
+                    if isinstance(updated_agent, dict):
+                        agent.update(updated_agent.get("agent", updated_agent))
+                    gateway_config = dict(agent.get("adapterConfig") or {})
             gateway_env = dict(gateway_config.get("env") or {})
             for finding in unsafe_paperclip_env(gateway_env):
                 unsafe_inline.append({"agentId": str(agent["id"]), "key": finding})
@@ -3298,8 +3836,12 @@ def paperclip(ctx: Context) -> dict[str, Any]:
             and required_data_content_secrets.issubset(secret_ids)
             and all(row["status"] == "ready" for row in secret_rows)
         )
-        agent_bindings_ready = bool(bound_agents) and all(
-            row["status"] == "ready" for row in bound_agents
+        bound_profile_refs = [str(row.get("profileRef") or "") for row in bound_agents]
+        agent_bindings_ready = (
+            len(bound_agents) == len(catalog)
+            and set(bound_profile_refs) == set(catalog)
+            and len(bound_profile_refs) == len(set(bound_profile_refs))
+            and all(row["status"] == "ready" for row in bound_agents)
         )
         if not agent:
             status = "needs_configuration"
@@ -3316,9 +3858,19 @@ def paperclip(ctx: Context) -> dict[str, Any]:
         elif unsafe_inline:
             status = "error"
             reason = "strict_mode_rejects_inline_sensitive_agent_env"
+        elif daytona_environment["status"] != "ready":
+            status = "needs_configuration"
+            reason = str(
+                daytona_environment.get("reason") or "daytona_environment_incomplete"
+            )
         elif not company_secrets_ready or not agent_bindings_ready:
             status = "needs_configuration"
             reason = "company_secret_or_agent_bindings_incomplete"
+        elif project_workspace["status"] != "ready":
+            status = "needs_configuration"
+            reason = str(
+                project_workspace.get("reason") or "project_workspace_incomplete"
+            )
         elif not user_bindings_ready:
             status = "needs_authorization"
             reason = "required_user_secret_value_missing"
@@ -3330,6 +3882,7 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                 "company",
                 "default_responsible_user",
                 "operations_project",
+                "e2e_primary_git_workspace",
                 "local_encrypted_company_secrets",
                 "user_secret_definitions",
                 "profile_runtime_bindings",
@@ -3348,12 +3901,15 @@ def paperclip(ctx: Context) -> dict[str, Any]:
                 "configured": bool(responsible_member),
                 "userId": responsible_user_id or None,
             },
+            projectWorkspace=project_workspace,
+            daytonaEnvironment=daytona_environment,
             companySecrets=[dict(row) for row in secret_rows],
             userSecretDefinitions=definition_rows,
             agentBindings=bound_agents,
+            agentEnvironmentBindings=agent_environment_bindings,
             unsafeInlineBindings=unsafe_inline,
             limitations=[
-                "The native Hermes runtime must exist before its Paperclip key can be bound; the provisioner never fabricates an agent adapter."
+                "The provisioner creates the official Hermes gateway agent and scoped task-bridge key; the native Hermes runtime is installed separately by the deployment stage."
             ],
         )
     except ApiError as exc:
@@ -3370,7 +3926,6 @@ def paperclip(ctx: Context) -> dict[str, Any]:
 
 ADAPTERS: tuple[Callable[[Context], dict[str, Any]], ...] = (
     mattermost,
-    activepieces,
     kestra,
     ninerouter,
     paperclip,
@@ -3380,93 +3935,55 @@ ADAPTERS: tuple[Callable[[Context], dict[str, Any]], ...] = (
 def build_refs(ctx: Context, rows: list[dict[str, Any]]) -> dict[str, Any]:
     status = {row["component"]: row["status"] for row in rows}
     profile = ctx.platform_env.get("DATA_CONTENT_PROFILE", "")
-    if profile == "baserow-wikijs":
-        data_content_services = {
-            "baserow": {
-                "url": ctx.url("baserow"),
-                "credentialFile": str(SERVICES / "baserow.env"),
-                "agentCredentialBinding": "paperclip_secret_ref",
-                "tokenKey": "BASEROW_PAPERCLIP_TOKEN",
-                "workspaceIdKey": "BASEROW_WORKSPACE_ID",
-                "databaseIdKey": "BASEROW_DATABASE_ID",
-                "tableIdKey": "BASEROW_TABLE_ID",
-                "status": "managed_by_server_baserow",
-            },
-            "wikijs": {
-                "url": ctx.url("wikijs"),
-                "credentialFile": str(SERVICES / "wikijs.env"),
-                "agentCredentialBinding": "paperclip_secret_ref",
-                "tokenKey": "WIKIJS_API_TOKEN",
-                "status": "managed_by_server_wikijs",
-            },
-        }
-    elif profile == "postgres-postgrest-nocodb-nocodocs":
-        data_content_services = {
-            "postgrest": {
-                "url": ctx.url("postgrest"),
-                "credentialFile": str(SERVICES / "postgrest.env"),
-                "agentCredentialBinding": "paperclip_secret_ref",
-                "tokenKey": "POSTGREST_PAPERCLIP_TOKEN",
-                "status": "managed_by_server_postgrest",
-            },
-            "nocodb": {
-                "url": ctx.url("nocodb"),
-                "documentsApi": ctx.url("nocodb").rstrip("/") + "/api/v3/docs",
-                "credentialFile": str(SERVICES / "nocodb.env"),
-                "tokenKey": "NOCODB_API_TOKEN",
-                "status": "managed_by_server_nocodb",
-            },
-        }
-    elif profile == "postgres-notion":
-        data_content_services = {
-            "postgrest": {
-                "url": ctx.url("postgrest"),
-                "role": "internal_ssot_api",
-                "authority": "postgres",
-                "credentialFile": str(SERVICES / "postgrest.env"),
-                "agentCredentialBinding": "paperclip_secret_ref",
-                "managedSecretProvider": "local_encrypted",
-                "tokenKey": "POSTGREST_PAPERCLIP_TOKEN",
-                "capabilities": {
-                    "records": {
-                        "id": "mte.postgres.records",
-                        "sourceOfTruth": True,
-                    }
-                },
-                "status": "managed_by_server_postgrest",
-            },
-            "notion": {
-                "url": ctx.platform_env.get("NOTION_API_BASE_URL", ""),
-                "role": "external_presentation_provider",
-                "authority": "postgres",
-                "sourceOfTruth": False,
-                "canonicalCredentialSource": str(PLATFORM_ENV),
-                "agentCredentialBinding": "toolhive_readonly_tools_only",
-                "agentRawCredential": False,
-                "connectorCredentialBinding": "paperclip_secret_ref",
-                "connectorIdentity": "mte.notion.connector",
-                "connectorExecutable": "server-notion.py",
-                "connectorAgentReachable": False,
-                "managedSecretProvider": "local_encrypted",
-                "connectorTokenKey": "NOTION_TOKEN",
-                "apiVersionKey": "NOTION_API_VERSION",
-                "rootPageIdKey": "NOTION_ROOT_PAGE_ID",
-                "capabilities": {
-                    "tables": {
-                        "id": "mte.notion.tables",
-                        "databaseIdKey": "NOTION_TABLE_DATABASE_ID",
-                        "dataSourceIdKey": "NOTION_TABLE_DATA_SOURCE_ID",
-                    },
-                    "documents": {
-                        "id": "mte.notion.documents",
-                        "parentPageIdKey": "NOTION_DOCUMENTS_PAGE_ID",
-                    },
-                },
-                "status": "managed_external_connector",
-            },
-        }
-    else:
+    if profile != "postgres-notion":
         raise RuntimeError("data_content_profile_unsupported")
+    data_content_services = {
+        "postgrest": {
+            "url": ctx.url("postgrest"),
+            "role": "internal_ssot_api",
+            "authority": "postgres",
+            "credentialFile": str(SERVICES / "postgrest.env"),
+            "agentCredentialBinding": "paperclip_secret_ref",
+            "managedSecretProvider": "local_encrypted",
+            "tokenKey": "POSTGREST_PAPERCLIP_TOKEN",
+            "capabilities": {
+                "records": {
+                    "id": "mte.postgres.records",
+                    "sourceOfTruth": True,
+                }
+            },
+            "status": "managed_by_server_postgrest",
+        },
+        "notion": {
+            "url": ctx.platform_env.get("NOTION_API_BASE_URL", ""),
+            "role": "external_presentation_provider",
+            "authority": "postgres",
+            "sourceOfTruth": False,
+            "canonicalCredentialSource": str(PLATFORM_ENV),
+            "agentCredentialBinding": "toolhive_readonly_tools_only",
+            "agentRawCredential": False,
+            "connectorCredentialBinding": "paperclip_secret_ref",
+            "connectorIdentity": "mte.notion.connector",
+            "connectorExecutable": "server-notion.py",
+            "connectorAgentReachable": False,
+            "managedSecretProvider": "local_encrypted",
+            "connectorTokenKey": "NOTION_TOKEN",
+            "apiVersionKey": "NOTION_API_VERSION",
+            "rootPageIdKey": "NOTION_ROOT_PAGE_ID",
+            "capabilities": {
+                "tables": {
+                    "id": "mte.notion.tables",
+                    "databaseIdKey": "NOTION_TABLE_DATABASE_ID",
+                    "dataSourceIdKey": "NOTION_TABLE_DATA_SOURCE_ID",
+                },
+                "documents": {
+                    "id": "mte.notion.documents",
+                    "parentPageIdKey": "NOTION_DOCUMENTS_PAGE_ID",
+                },
+            },
+            "status": "managed_external_connector",
+        },
+    }
     return {
         "apiVersion": "micro-task-engine/v1alpha1",
         "kind": "AgentAccessReferenceCatalog",
@@ -3480,13 +3997,6 @@ def build_refs(ctx: Context, rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "tokenKey": "MATTERMOST_BOT_TOKEN",
                 "teamIdKey": "MATTERMOST_TEAM_ID",
                 "status": status.get("mattermost"),
-            },
-            "activepieces": {
-                "url": ctx.url("activepieces"),
-                "credentialFile": str(SERVICES / "activepieces.env"),
-                "projectIdKey": "ACTIVEPIECES_PROJECT_ID",
-                "serviceToken": "unsupported_in_community_edition",
-                "status": status.get("activepieces"),
             },
             "kestra": {
                 "url": ctx.url("kestra"),
@@ -3672,9 +4182,14 @@ def write_provision_verify_evidence(value: dict[str, Any]) -> dict[str, Any]:
                 is True,
             },
             "responsibleUser": paperclip_row.get("responsibleUser"),
+            "projectWorkspace": paperclip_row.get("projectWorkspace"),
+            "daytonaEnvironment": paperclip_row.get("daytonaEnvironment"),
             "companySecrets": paperclip_row.get("companySecrets", []),
             "userSecretDefinitions": paperclip_row.get("userSecretDefinitions", []),
             "agentBindings": paperclip_row.get("agentBindings", []),
+            "agentEnvironmentBindings": paperclip_row.get(
+                "agentEnvironmentBindings", []
+            ),
             "unsafeInlineBindings": paperclip_row.get("unsafeInlineBindings", []),
         },
         "security": value.get("security", {}),
@@ -3754,7 +4269,6 @@ def main() -> int:
         action
         not in {
             "bootstrap-router-keys",
-            "provision-activepieces",
             "provision",
             "status",
             "verify",
@@ -3762,15 +4276,12 @@ def main() -> int:
         or len(sys.argv) != 2
     ):
         print(
-            "usage: server-provision.py bootstrap-router-keys|provision-activepieces|provision|status|verify",
+            "usage: server-provision.py bootstrap-router-keys|provision|status|verify",
             file=sys.stderr,
         )
         return 2
     try:
-        if action in {
-            "bootstrap-router-keys",
-            "provision-activepieces",
-        }:
+        if action == "bootstrap-router-keys":
             if not CONFIG.exists() or not PLATFORM_ENV.exists():
                 missing = [
                     str(path) for path in (CONFIG, PLATFORM_ENV) if not path.exists()
@@ -3782,7 +4293,7 @@ def main() -> int:
                     "error": "missing_required_files",
                     "missing": missing,
                 }
-            elif action == "bootstrap-router-keys":
+            else:
                 platform_values = dotenv(PLATFORM_ENV)
                 ctx = Context(
                     config=json.loads(CONFIG.read_text()),
@@ -3792,22 +4303,6 @@ def main() -> int:
                     canonical_mutation_keys=canonical_mutation_plan(platform_values),
                 )
                 value = bootstrap_ninerouter_keys(ctx)
-            elif action == "provision-activepieces":
-                platform_values = dotenv(PLATFORM_ENV)
-                ctx = Context(
-                    config=json.loads(CONFIG.read_text()),
-                    platform_env=platform_values,
-                    mutate=True,
-                    strict=True,
-                    canonical_mutation_keys=canonical_mutation_plan(platform_values),
-                )
-                component = activepieces(ctx)
-                value = {
-                    "action": action,
-                    "timestamp": now(),
-                    "ok": component["status"] in TERMINAL_READY,
-                    "component": component,
-                }
         else:
             value = execute(action)
     except BaseException as exc:

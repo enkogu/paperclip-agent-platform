@@ -34,6 +34,12 @@ class CloudflareRenderingTests(unittest.TestCase):
             "MTE_EXCLUDED_HOST_1",
             "MTE_EXCLUDED_HOST_2",
             "PLATFORM_BASE_DOMAIN",
+            "MTE_PAPERCLIP_IMAGE",
+            "MTE_PAPERCLIP_FORK_SOURCE_URL",
+            "MTE_PAPERCLIP_FORK_REVISION",
+            "MTE_DAYTONA_SANDBOX_IMAGE",
+            "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL",
+            "MTE_DAYTONA_SANDBOX_IMAGE_REVISION",
         }
         self.assertEqual(server_config.REQUIRED_OPERATOR_BOOTSTRAP_KEYS, required)
         self.assertTrue(required.isdisjoint(server_config.ONE_TIME_MIGRATION_SEEDS))
@@ -45,7 +51,7 @@ class CloudflareRenderingTests(unittest.TestCase):
         self.assertIn("CLOUDFLARE_GLOBAL_API_KEY=", example)
 
     def canonical_values(self, config: dict) -> dict[str, str]:
-        values = {"PLATFORM_BASE_DOMAIN": "prin7r.com"}
+        values = {"PLATFORM_BASE_DOMAIN": "agents.example.test"}
         cloudflare = config["spec"]["cloudflare"]
         declarations = [
             row["exposure"]
@@ -77,7 +83,7 @@ class CloudflareRenderingTests(unittest.TestCase):
         values.update(
             {
                 "DATA_CONTENT_PROFILE": "postgres-notion",
-                "POSTGREST_PUBLIC_URL": "https://data-api.prin7r.com",
+                "POSTGREST_PUBLIC_URL": "https://data-api.agents.example.test",
                 "NOTION_API_BASE_URL": "https://api.notion.com/v1",
             }
         )
@@ -98,30 +104,29 @@ class CloudflareRenderingTests(unittest.TestCase):
         projection = server_config.cloudflare_apps_projection(
             filtered_config,
             values,
-            "prin7r.com",
+            "agents.example.test",
             "b" * 64,
             data_content_plane,
             hashlib.sha256(serialized_plane).hexdigest(),
         )
         self.assertNotIn("notion", projection["apps"])
-        self.assertNotIn("nocodb", projection["apps"])
         self.assertEqual(projection["dataContent"]["roles"], {})
 
     def test_renderer_requires_hash_governed_apps_projection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = root / "platform.env"
-            env.write_text("PLATFORM_BASE_DOMAIN=prin7r.com\n")
+            env.write_text("PLATFORM_BASE_DOMAIN=agents.example.test\n")
             digest = hashlib.sha256(env.read_bytes()).hexdigest()
             projection = root / "apps.json"
             projection.write_text(
                 json.dumps(
                     {
                         "_generated": {"sourceSha256": digest},
-                        "baseDomain": "prin7r.com",
+                        "baseDomain": "agents.example.test",
                         "apps": {
                             "paperclip": {
-                                "hostname": "paperclip.prin7r.com",
+                                "hostname": "paperclip.agents.example.test",
                                 "origin": "http://127.0.0.1:3100",
                                 "accessClass": "human",
                             }
@@ -129,11 +134,11 @@ class CloudflareRenderingTests(unittest.TestCase):
                     }
                 )
             )
-            apps = renderer.read_apps_projection(projection, env, "prin7r.com")
+            apps = renderer.read_apps_projection(projection, env, "agents.example.test")
             self.assertEqual(apps["paperclip"]["access_class"], "human")
             env.write_text("PLATFORM_BASE_DOMAIN=other.example\n")
             with self.assertRaises(renderer.RenderError):
-                renderer.read_apps_projection(projection, env, "prin7r.com")
+                renderer.read_apps_projection(projection, env, "agents.example.test")
 
     def test_renderer_requires_exact_logical_data_content_binding(self) -> None:
         config = yaml.safe_load((ROOT / "config/platform.yaml").read_text())
@@ -142,14 +147,14 @@ class CloudflareRenderingTests(unittest.TestCase):
         values.update(
             {
                 "DATA_CONTENT_PROFILE": "postgres-notion",
-                "POSTGREST_PUBLIC_URL": "https://data-api.prin7r.com",
+                "POSTGREST_PUBLIC_URL": "https://data-api.agents.example.test",
                 "NOTION_API_BASE_URL": "https://api.notion.com/v1",
             }
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = root / "platform.env"
-            env.write_text("PLATFORM_BASE_DOMAIN=prin7r.com\n")
+            env.write_text("PLATFORM_BASE_DOMAIN=agents.example.test\n")
             source_sha = hashlib.sha256(env.read_bytes()).hexdigest()
             contract = server_config.data_content_contract()
             plane = contract.resolve_from_paths(
@@ -168,7 +173,7 @@ class CloudflareRenderingTests(unittest.TestCase):
             apps_payload = server_config.cloudflare_apps_projection(
                 filtered_config,
                 values,
-                "prin7r.com",
+                "agents.example.test",
                 source_sha,
                 plane,
                 plane_sha,
@@ -180,7 +185,7 @@ class CloudflareRenderingTests(unittest.TestCase):
             apps = renderer.read_apps_projection(
                 apps_path,
                 env,
-                "prin7r.com",
+                "agents.example.test",
                 plane_path,
             )
             self.assertNotIn("notion", apps)
@@ -191,7 +196,7 @@ class CloudflareRenderingTests(unittest.TestCase):
                 renderer.read_apps_projection(
                     apps_path,
                     env,
-                    "prin7r.com",
+                    "agents.example.test",
                     plane_path,
                 )
 
@@ -204,7 +209,7 @@ class CloudflareRenderingTests(unittest.TestCase):
         values.update(
             {
                 "DATA_CONTENT_PROFILE": "postgres-notion",
-                "POSTGREST_PUBLIC_URL": "https://data-api.prin7r.com",
+                "POSTGREST_PUBLIC_URL": "https://data-api.agents.example.test",
                 "NOTION_API_BASE_URL": "https://api.notion.com/v1",
             }
         )
@@ -212,7 +217,7 @@ class CloudflareRenderingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = root / "platform.env"
-            env.write_text("PLATFORM_BASE_DOMAIN=prin7r.com\n")
+            env.write_text("PLATFORM_BASE_DOMAIN=agents.example.test\n")
             source_sha = hashlib.sha256(env.read_bytes()).hexdigest()
             plane = contract.resolve_from_paths(
                 config,
@@ -234,7 +239,7 @@ class CloudflareRenderingTests(unittest.TestCase):
                 apps_payload = server_config.cloudflare_apps_projection(
                     filtered_config,
                     values,
-                    "prin7r.com",
+                    "agents.example.test",
                     source_sha,
                     plane,
                     hashlib.sha256(plane_path.read_bytes()).hexdigest(),
@@ -247,7 +252,7 @@ class CloudflareRenderingTests(unittest.TestCase):
                     renderer.read_apps_projection(
                         apps_path,
                         env,
-                        "prin7r.com",
+                        "agents.example.test",
                         plane_path,
                     )
 
@@ -285,7 +290,7 @@ class CloudflareRenderingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             env = root / "platform.env"
-            env.write_text("PLATFORM_BASE_DOMAIN=prin7r.com\n")
+            env.write_text("PLATFORM_BASE_DOMAIN=agents.example.test\n")
             source_sha = hashlib.sha256(env.read_bytes()).hexdigest()
             plane = {
                 "_generated": {"sourceSha256": source_sha},
@@ -337,15 +342,15 @@ class CloudflareRenderingTests(unittest.TestCase):
             plane_path.write_text(json.dumps(plane, sort_keys=True) + "\n")
             payload = {
                 "_generated": {"sourceSha256": source_sha},
-                "baseDomain": "prin7r.com",
+                "baseDomain": "agents.example.test",
                 "apps": {
                     "tables-app": {
-                        "hostname": "tables.prin7r.com",
+                        "hostname": "tables.agents.example.test",
                         "origin": "http://127.0.0.1:18085",
                         "accessClass": "human",
                     },
                     "documents-app": {
-                        "hostname": "documents.prin7r.com",
+                        "hostname": "documents.agents.example.test",
                         "origin": "http://127.0.0.1:18086",
                         "accessClass": "human",
                     },
@@ -358,12 +363,12 @@ class CloudflareRenderingTests(unittest.TestCase):
                     "roles": {
                         "tablesUi": {
                             "applicationId": "tables-app",
-                            "hostname": "tables.prin7r.com",
+                            "hostname": "tables.agents.example.test",
                             "accessClass": "human",
                         },
                         "documentsUi": {
                             "applicationId": "documents-app",
-                            "hostname": "documents.prin7r.com",
+                            "hostname": "documents.agents.example.test",
                             "accessClass": "human",
                         },
                     },
@@ -372,7 +377,7 @@ class CloudflareRenderingTests(unittest.TestCase):
             apps_path = root / "apps.json"
             apps_path.write_text(json.dumps(payload, sort_keys=True) + "\n")
             apps = renderer.read_apps_projection(
-                apps_path, env, "prin7r.com", plane_path
+                apps_path, env, "agents.example.test", plane_path
             )
             self.assertEqual(set(apps), {"tables-app", "documents-app"})
 
@@ -388,7 +393,7 @@ class CloudflareRenderingTests(unittest.TestCase):
                     apps_path.write_text(json.dumps(tampered, sort_keys=True) + "\n")
                     with self.assertRaises(renderer.RenderError):
                         renderer.read_apps_projection(
-                            apps_path, env, "prin7r.com", plane_path
+                            apps_path, env, "agents.example.test", plane_path
                         )
 
     def test_terraform_durations_have_no_mutable_defaults(self) -> None:
@@ -402,6 +407,8 @@ class CloudflareRenderingTests(unittest.TestCase):
             key: value
             for key, value in server_config.ONE_TIME_MIGRATION_SEEDS.items()
             if key.startswith("PROFILE_CODING_DAYTONA_")
+            or key.startswith("MTE_AGENT_GATEWAY_TOOLHIVE_")
+            or key.startswith("MTE_CONTEXT7_")
             or key == "MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL"
         }
         rendered, required = server_config.profile_projection(
@@ -426,6 +433,12 @@ class CloudflareRenderingTests(unittest.TestCase):
                 'model_providers.mte9router.env_key="OPENAI_API_KEY"',
                 "-c",
                 'model_providers.mte9router.wire_api="responses"',
+                "-c",
+                'mcp_servers.mte-profile-tools.url="http://172.20.0.1:22081/mcp"',
+                "-c",
+                'mcp_servers.mte-profile-tools.bearer_token_env_var="MTE_TOOLHIVE_BEARER_TOKEN"',
+                "-c",
+                'mcp_servers.context7.url="https://mcp.context7.com/mcp"',
             ],
         )
         self.assertEqual(
@@ -438,10 +451,12 @@ class CloudflareRenderingTests(unittest.TestCase):
         )
         self.assertEqual(
             profiles["coding-daytona-pi"]["nativeAdapterConfig"]["cwd"],
-            "/home/daytona/workspaces/coding-daytona-pi",
+            "/home/daytona/paperclip-workspace",
         )
         self.assertIn("NINEROUTER_PROFILE_CODING_DAYTONA_PI_API_KEY", required)
         self.assertIn("MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL", required)
+        self.assertIn("MTE_CONTEXT7_MCP_URL", required)
+        self.assertIn("MTE_CONTEXT7_PI_VERSION", required)
 
 
 if __name__ == "__main__":

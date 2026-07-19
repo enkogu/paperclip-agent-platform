@@ -117,7 +117,13 @@ def request_json(
     return payload
 
 
-def bearer_verify(account_id: str, token: str) -> bool:
+def bearer_verified_token_id(account_id: str, token: str) -> str | None:
+    """Return the active account-token ID without exposing its value.
+
+    A valid token alone is insufficient: the canonical runtime credential must
+    be the managed least-privilege token, not another active token belonging to
+    the account.  Cloudflare's verification response includes that token ID.
+    """
     request = Request(
         f"https://api.cloudflare.com/client/v4/accounts/{account_id}/tokens/verify",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -127,13 +133,19 @@ def bearer_verify(account_id: str, token: str) -> bool:
             with urlopen(request, timeout=20) as response:
                 payload = json.loads(response.read())
             result = payload.get("result", {}) if isinstance(payload, dict) else {}
-            if payload.get("success") and result.get("status") == "active":
-                return True
+            token_id = result.get("id") if isinstance(result, dict) else None
+            if (
+                payload.get("success")
+                and result.get("status") == "active"
+                and isinstance(token_id, str)
+                and token_id
+            ):
+                return token_id
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
             pass
         if attempt < 4:
             time.sleep(1)
-    return False
+    return None
 
 
 def exact_zone(
@@ -377,7 +389,7 @@ try:
         raise SystemExit("server config producer invalid")
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.render()
+    module.render(lock_fd=descriptor)
     audited=module.audit()
     if audited.get("ok") is not True or audited.get("sourceSha256")!=digest:
         raise SystemExit("server config render audit failed")
@@ -663,7 +675,11 @@ def safe_plan(context: dict[str, Any], action: str) -> dict[str, Any]:
         ]
     )
     origins_green = not context["originBlockers"]
-    ready = origins_green and not context["canonicalConflicts"]
+    # Origin health belongs to the later edge/app preflight. Token bootstrap
+    # must be able to establish the credential needed to render and start
+    # those origins on a clean host, while retaining the observation in its
+    # evidence for operators.
+    ready = not context["canonicalConflicts"]
     return {
         "apiVersion": "micro-task-engine/v1alpha1",
         "kind": "CloudflareTokenBootstrap",
@@ -701,9 +717,6 @@ def safe_plan(context: dict[str, Any], action: str) -> dict[str, Any]:
 
 def reconcile(context: dict[str, Any]) -> dict[str, Any]:
     plan = safe_plan(context, "apply")
-    if not plan["origins"]["green"]:
-        plan["blockers"] = [{"code": "origins_not_green"}]
-        return plan
     if context["canonicalConflicts"]:
         plan["blockers"] = [
             {"code": "canonical_config_conflict", "keys": context["canonicalConflicts"]}
@@ -754,7 +767,7 @@ def reconcile(context: dict[str, Any]) -> dict[str, Any]:
             context["target"],
             Path(context.get("canonicalPath", CANONICAL_ENV)),
         )
-        if candidate and bearer_verify(account_id, candidate):
+        if candidate and bearer_verified_token_id(account_id, candidate) == token_id:
             token_value = candidate
         if not token_value:
             rolled = request_json(
@@ -767,8 +780,10 @@ def reconcile(context: dict[str, Any]) -> dict[str, Any]:
             token_value = extract_token_value(rolled)
             actions.append("rolled_unrecoverable_token_value")
 
-    if not bearer_verify(account_id, token_value):
-        raise BootstrapError("reconciled Cloudflare token did not verify as active")
+    if bearer_verified_token_id(account_id, token_value) != str(token_row.get("id", "")):
+        raise BootstrapError(
+            "reconciled Cloudflare token does not match the managed token"
+        )
     canonical_values = dict(context["canonicalDesired"])
     canonical_values["CLOUDFLARE_API_TOKEN"] = token_value
     canonical_evidence = write_canonical(

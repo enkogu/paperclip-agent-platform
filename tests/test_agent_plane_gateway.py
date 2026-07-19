@@ -11,6 +11,8 @@ import unittest
 import urllib.error
 import urllib.request
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,7 +68,7 @@ class AgentPlaneGatewayTests(unittest.TestCase):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        url = f"http://127.0.0.1:{gateway_ports[1]}"
+        url = f"http://127.0.0.1:{gateway_ports[3]}"
         try:
             for _ in range(100):
                 try:
@@ -96,7 +98,7 @@ class AgentPlaneGatewayTests(unittest.TestCase):
                 data=json.dumps(payload).encode(),
                 method="POST",
                 headers={
-                    "Authorization": "Bearer codex-token",
+                    "Authorization": "Bearer pi-token",
                     "Content-Type": "application/json",
                 },
             )
@@ -108,7 +110,7 @@ class AgentPlaneGatewayTests(unittest.TestCase):
                 url + "/not-mcp",
                 data=b"{}",
                 method="POST",
-                headers={"Authorization": "Bearer codex-token"},
+                headers={"Authorization": "Bearer pi-token"},
             )
             with self.assertRaises(urllib.error.HTTPError) as error:
                 urllib.request.urlopen(forbidden, timeout=2)
@@ -118,7 +120,7 @@ class AgentPlaneGatewayTests(unittest.TestCase):
                 url + "/mcp-evil",
                 data=b"{}",
                 method="POST",
-                headers={"Authorization": "Bearer codex-token"},
+                headers={"Authorization": "Bearer pi-token"},
             )
             with self.assertRaises(urllib.error.HTTPError) as error:
                 urllib.request.urlopen(prefix_confusion, timeout=2)
@@ -130,11 +132,24 @@ class AgentPlaneGatewayTests(unittest.TestCase):
             upstream.server_close()
 
     def test_daytona_sidecar_has_no_host_or_cloudflare_port(self):
-        source = (ROOT / "deployment/steps/60-daytona.sh").read_text()
-        block = source.split("  agent-gateway:", 1)[1].split("  api:", 1)[0]
-        self.assertIn("network_mode: service:runner", block)
-        self.assertNotIn("ports:", block)
-        self.assertIn("agent-plane-gateway.py:/app/agent-plane-gateway.py:ro", block)
+        compose = yaml.safe_load(
+            (ROOT / "deployment/services/daytona/compose.yaml").read_text()
+        )
+        services = compose["services"]
+        gateway = services["agent-gateway"]
+        runner = services["runner"]
+
+        self.assertEqual(gateway["network_mode"], "service:runner")
+        for service in (gateway, runner):
+            self.assertNotIn("ports", service)
+            self.assertNotIn("expose", service)
+        self.assertNotIn("networks", gateway)
+        self.assertNotIn("labels", gateway)
+        self.assertIn(
+            "/opt/mte-platform/bin/agent-plane-gateway.py:"
+            "/app/agent-plane-gateway.py:ro",
+            gateway["volumes"],
+        )
 
 
 if __name__ == "__main__":

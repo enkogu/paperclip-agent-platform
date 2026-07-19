@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -26,6 +27,11 @@ local_verify = load_local_verify()
 
 
 class LocalVerifyRegressionTests(unittest.TestCase):
+    def assert_fresh_render_is_ready(self, result: dict) -> None:
+        self.assertEqual(result["findings"], [])
+        self.assertTrue(result["ok"], result["findings"])
+        self.assertTrue(result["runtimeReady"])
+
     def test_profile_coverage_reads_real_yaml_through_canonical_loader(self):
         source = ROOT / "config/profiles/catalog.yaml"
         self.assertFalse(source.read_text().lstrip().startswith("{"))
@@ -43,6 +49,7 @@ class LocalVerifyRegressionTests(unittest.TestCase):
         documents, yaml_findings = local_verify.yaml_documents()
         self.assertEqual(yaml_findings, [])
         result = local_verify.compose_static(documents)
+        self.assertTrue(result["ok"], result["findings"])
         self.assertNotIn(
             "host_docker_socket_present",
             {finding["finding"] for finding in result["findings"]},
@@ -60,27 +67,75 @@ class LocalVerifyRegressionTests(unittest.TestCase):
             {finding["finding"] for finding in unsafe_result["findings"]},
         )
 
-    def test_activepieces_declares_external_data_plane_owner_dependency(self):
-        platform = yaml.safe_load((ROOT / "config/platform.yaml").read_text())
-        rows = {row["id"]: row for row in platform["spec"]["components"]}
-        self.assertIn("postgres", rows["activepieces"]["dependsOn"])
-
-        documents, yaml_findings = local_verify.yaml_documents()
-        self.assertEqual(yaml_findings, [])
         result = local_verify.platform_consistency(documents)
         self.assertTrue(result["ok"], result["findings"])
 
+    def test_compose_engine_uses_secret_free_isolated_runtime_fixture(self):
+        observed_daytona = False
+
+        def fake_command(argv, timeout=60):
+            nonlocal observed_daytona
+            if argv == ["docker", "compose", "version"]:
+                return {"ok": True, "state": "passed", "outputTail": "v2"}
+            compose_path = Path(argv[argv.index("-f") + 1])
+            self.assertFalse(compose_path.is_relative_to(ROOT))
+            self.assertIn("mte-compose-audit-", str(compose_path))
+            if compose_path.parent.name == "daytona":
+                observed_daytona = True
+                for name in (
+                    "ssh.env",
+                    "api-ssh.env",
+                    "dex.yaml",
+                    "runner-daemon.json",
+                ):
+                    self.assertTrue((compose_path.parent / name).is_file(), name)
+                self.assertEqual((compose_path.parent / "ssh.env").read_text(), "")
+                self.assertEqual((compose_path.parent / "api-ssh.env").read_text(), "")
+            return {"ok": True, "state": "passed", "outputTail": ""}
+
+        with mock.patch.object(local_verify, "command", side_effect=fake_command):
+            result = local_verify.docker_compose_check()
+
+        self.assertTrue(observed_daytona)
+        self.assertTrue(result["ok"], result["results"])
+        self.assertEqual(
+            result["composeFilesTested"], len(local_verify.canonical_compose_sources())
+        )
+
+    def test_only_exact_host_governed_external_networks_are_accepted(self):
+        documents, yaml_findings = local_verify.yaml_documents()
+        self.assertEqual(yaml_findings, [])
+        aggregate_path = ROOT / "deployment/compose.yaml"
+        aggregate = yaml.safe_load(aggregate_path.read_text())
+        aggregate["networks"]["unowned"] = {
+            "name": "arbitrary-unowned-network",
+            "external": True,
+        }
+        mutated = {**documents, aggregate_path: aggregate}
+
+        result = local_verify.platform_consistency(mutated)
+
+        self.assertIn(
+            {
+                "network": "arbitrary-unowned-network",
+                "finding": "aggregate_external_network_not_host_governed",
+            },
+            result["findings"],
+        )
+
     def test_fresh_install_copies_and_projects_reviewed_data_content_lock(self):
         result = local_verify.fresh_install_render()
-        self.assertTrue(result["ok"], result["findings"])
+        self.assert_fresh_render_is_ready(result)
         self.assertGreater(result["projectionCount"], 0)
         self.assertGreater(result["composeFilesRendered"], 0)
 
     def test_postgres_notion_external_inputs_are_typed_and_fail_closed(self):
         result = local_verify.fresh_install_render()
-        self.assertTrue(result["ok"], result["findings"])
+        self.assert_fresh_render_is_ready(result)
         self.assertIn("NOTION_TOKEN", result["externalSecretInputs"])
         self.assertNotIn("NOTION_TOKEN", result["operatorConfigInputs"])
+        self.assertIn("PAPERCLIP_AGENT_JWT_SECRET", result["generatedSecretInputs"])
+        self.assertNotIn("PAPERCLIP_AGENT_JWT_SECRET", result["externalSecretInputs"])
         self.assertIn("NOTION_ROOT_PAGE_ID", result["operatorConfigInputs"])
         self.assertNotIn("NOTION_ROOT_PAGE_ID", result["externalSecretInputs"])
         self.assertTrue(
@@ -104,6 +159,128 @@ class LocalVerifyRegressionTests(unittest.TestCase):
                 "NOTION_WORKSPACE_ID",
             ],
         )
+
+    def test_release_check_requires_a_fully_ready_fresh_install(self):
+        fresh_install = local_verify.fresh_install_render()
+        self.assert_fresh_render_is_ready(fresh_install)
+
+        result = local_verify.release_check_fresh_install_contract(fresh_install)
+        self.assertTrue(result["ok"], result["findings"])
+        self.assertEqual(result["state"], "passed")
+        self.assertEqual(result["runtimeDeployment"], "ready")
+
+    def test_release_check_rejects_an_unready_fresh_install(self):
+        unready = {
+            "ok": False,
+            "runtimeReady": False,
+            "findings": [{"finding": "runtime_image_not_digest_pinned"}],
+        }
+        gate = local_verify.release_check_fresh_install_contract(unready)
+        self.assertFalse(gate["ok"])
+        self.assertEqual(gate["runtimeDeployment"], "blocked")
+
+    def test_configuration_source_normalizer_is_closed_over_canonical_contracts(self):
+        path = ROOT / "tools/platform-cli/server-config.py"
+        spec = importlib.util.spec_from_file_location(
+            "test_local_verify_config_contract", path
+        )
+        assert spec is not None and spec.loader is not None
+        server_config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(server_config)
+
+        known = [
+            {
+                "finding": "compose_seed_catalog_coverage_mismatch",
+                "path": "config/compose-seeds.lock.json",
+                "missing": [
+                    "KESTRA_HEALTH_URL",
+                ],
+                "extra": [],
+            },
+            {
+                "finding": "runtime_domain_alias",
+                "path": "tools/platform-cli/local-verify.py",
+                "alias": "MTE_DOMAIN",
+            },
+            {
+                "finding": "script_configurable_literal_outside_canonical",
+                "path": "tools/platform-cli/server-integration-canaries.py",
+                "key": "API_VERSION",
+            },
+            {
+                "finding": "script_configurable_literal_outside_canonical",
+                "path": "tools/platform-cli/server-config.py",
+                "key": "PAPERCLIP_AGENT_JWT_SECRET",
+            },
+            {
+                "finding": "literal_environment_value_outside_canonical",
+                "path": "deployment/services/observability/compose.yaml",
+                "service": "config-init",
+                "key": "MATTERMOST_ALERT_WEBHOOK_URL",
+            },
+        ]
+        retained, recognized = local_verify.normalize_configuration_source_findings(
+            known, server_config
+        )
+        self.assertEqual(retained, [])
+        self.assertEqual(len(recognized), len(known))
+
+        unknown = [
+            {
+                "finding": "runtime_domain_alias",
+                "path": "tools/platform-cli/local-verify.py",
+                "alias": "MTE_UNRECOGNIZED_ALIAS",
+            },
+            {
+                "finding": "script_configurable_literal_outside_canonical",
+                "path": "tools/platform-cli/server-integration-canaries.py",
+                "key": "UNRECOGNIZED_LITERAL",
+            },
+            {
+                "finding": "script_configurable_literal_outside_canonical",
+                "path": "tools/platform-cli/server-config.py",
+                "key": "UNRECOGNIZED_GENERATED_SECRET",
+            },
+        ]
+        retained, recognized = local_verify.normalize_configuration_source_findings(
+            unknown, server_config
+        )
+        self.assertEqual(retained, unknown)
+        self.assertEqual(recognized, [])
+
+    def test_optional_compose_normalizer_rejects_unreviewed_and_weakened_refs(self):
+        path = ROOT / "tools/platform-cli/server-config.py"
+        spec = importlib.util.spec_from_file_location(
+            "test_local_verify_optional_contract", path
+        )
+        assert spec is not None and spec.loader is not None
+        server_config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(server_config)
+
+        for key in ("OTHER_URL", "NINEROUTER_HEALTH_URL"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                service_root = root / "deployment/services/demo"
+                service_root.mkdir(parents=True)
+                (root / "deployment/compose.yaml").write_text(
+                    "services:\n  demo:\n    extends:\n"
+                    "      file: services/demo/compose.yaml\n      service: demo\n"
+                )
+                service_root.joinpath("compose.yaml").write_text(
+                    "services:\n  demo:\n    image: example.invalid/demo\n"
+                    f"    environment:\n      {key}: ${{{key}:-}}\n"
+                )
+                finding = {
+                    "finding": "literal_environment_value_outside_canonical",
+                    "path": "deployment/services/demo/compose.yaml",
+                    "service": "demo",
+                    "key": key,
+                }
+                self.assertFalse(
+                    local_verify.reviewed_optional_compose_environment_finding(
+                        finding, server_config, root
+                    )
+                )
 
     def test_secret_generator_does_not_invent_notion_operator_inputs(self):
         path = ROOT / "tools/platform-cli/server-secrets.py"
@@ -141,6 +318,12 @@ class LocalVerifyRegressionTests(unittest.TestCase):
             "MTE_EXCLUDED_HOST_1",
             "MTE_EXCLUDED_HOST_2",
             "PLATFORM_BASE_DOMAIN",
+            "MTE_PAPERCLIP_IMAGE",
+            "MTE_PAPERCLIP_FORK_SOURCE_URL",
+            "MTE_PAPERCLIP_FORK_REVISION",
+            "MTE_DAYTONA_SANDBOX_IMAGE",
+            "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL",
+            "MTE_DAYTONA_SANDBOX_IMAGE_REVISION",
         }
         self.assertEqual(
             operator_keys, set(server_config.REQUIRED_OPERATOR_BOOTSTRAP_KEYS)
@@ -160,7 +343,7 @@ class LocalVerifyRegressionTests(unittest.TestCase):
         expected_sources = {
             "config/platform.yaml",
             "config/platform.lock.yaml",
-            "config/connections.yaml",
+            "config/acceptance-requirements.yaml",
             "config/compose-seeds.lock.json",
             "config/profiles/catalog.yaml",
         }

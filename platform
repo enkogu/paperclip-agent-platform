@@ -2,4 +2,16 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! command -v python3 >/dev/null 2>&1 || \
+  ! python3 -c 'import sys, yaml; raise SystemExit(sys.version_info < (3, 11))' \
+    >/dev/null 2>&1; then
+  printf '%s\n' \
+    'platform: Python 3.11+ and the locked Python dependencies are required.' \
+    "platform: install them for python3 with:" \
+    "  python3 -m pip install --require-hashes --only-binary=:all: --requirement $ROOT/tools/platform-cli/requirements-release-check.txt" \
+    >&2
+  exit 1
+fi
+
 exec python3 "$ROOT/tools/platform-cli/platform.py" "$@"

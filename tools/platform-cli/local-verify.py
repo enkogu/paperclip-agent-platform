@@ -36,35 +36,52 @@ from profile_catalog import CatalogError, load_profile_catalog  # noqa: E402
 EVIDENCE_ROOT = ROOT / ".runtime" / "evidence"
 PLATFORM_SOURCE = ROOT / "config/platform.yaml"
 PLATFORM_LOCK_SOURCE = ROOT / "config/platform.lock.yaml"
-CONNECTIONS_SOURCE = ROOT / "config/connections.yaml"
+ACCEPTANCE_REQUIREMENTS_SOURCE = ROOT / "config/acceptance-requirements.yaml"
 COMPOSE_SEED_SOURCE = ROOT / "config/compose-seeds.lock.json"
 PROFILE_CATALOG_SOURCE = ROOT / "config/profiles/catalog.yaml"
 PROFILE_SOURCE_ROOT = ROOT / "config/profiles"
 SERVICES_SOURCE_ROOT = ROOT / "deployment/services"
 PUBLIC_ENV_KEYS = {
-    "BASEROW_PUBLIC_URL",
-    "WIKIJS_SITE_URL",
     "MATTERMOST_SITE_URL",
-    "AP_FRONTEND_URL",
     "SEARXNG_BASE_URL",
 }
-# External networks created by host bootstrap rather than by a Compose project.
-# The mapping names the canonical env ref and its platform dependency owner;
-# mutable network names remain in platform.env.
-EXTERNAL_NETWORK_PROVISIONER_REFS = {
-    "MTE_AGENT_PLANE_NETWORK": "dokploy",
-}
+# Exact external networks created and contract-checked by deployment/scripts/host.sh.
+# Keeping this closed set here makes arbitrary external networks fail closed.
+HOST_BOOTSTRAP_EXTERNAL_NETWORKS = frozenset(
+    {
+        "mte-data-plane",
+        "mte-control",
+        "${MTE_TOOL_RUNTIME_NETWORK:?required}",
+        "mte-tool-plane",
+        "${MTE_AGENT_PLANE_NETWORK:?required}",
+    }
+)
 IMAGE_PATTERN = re.compile(r"@sha256:[0-9a-f]{64}$")
 ENV_REQUIRED_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*):\?")
 ENV_EXACT_REQUIRED_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*):\?[^}]*\}")
+# These aliases are deliberately consumed by canonical import code and are
+# never deployment settings in their own right. The static source checker sees
+# their string literals, so the local gate recognizes only this closed list.
+CANONICAL_IMPORT_ALIASES = frozenset(
+    {
+        "MTE_DOMAIN",
+        "PLATFORM_DOMAIN",
+        "CLOUDFLARE_BASE_DOMAIN",
+        "GH_TOKEN",
+        "PRIN7R_HERMES_TELEGRAM_BOT_TOKEN",
+        "MINIMAX_OPENAI_ENDPOINT",
+        "PRIN7R_NOTION_TOKEN",
+        "PRIN7R_NOTION_API_KEY",
+        "PRIN7R_NOTION_PAGE_ID",
+    }
+)
+STATIC_CONFIG_LITERAL_EXCEPTIONS = frozenset(
+    {("tools/platform-cli/server-integration-canaries.py", "API_VERSION")}
+)
 
 
 def canonical_compose_sources() -> list[Path]:
     return sorted(SERVICES_SOURCE_ROOT.glob("*/compose.yaml"))
-
-
-def compose_projection_name(source: Path) -> str:
-    return f"{source.parent.name}.yaml"
 
 
 def sha256_path(path: Path) -> str:
@@ -78,7 +95,7 @@ def canonical_source_binding() -> dict[str, Any]:
         for path in (
             PLATFORM_SOURCE,
             PLATFORM_LOCK_SOURCE,
-            CONNECTIONS_SOURCE,
+            ACCEPTANCE_REQUIREMENTS_SOURCE,
             COMPOSE_SEED_SOURCE,
             PROFILE_CATALOG_SOURCE,
         )
@@ -226,8 +243,7 @@ def platform_consistency(documents: dict[Path, Any]) -> dict[str, Any]:
                 )
 
     compose_paths = {
-        path.relative_to(ROOT).as_posix()
-        for path in canonical_compose_sources()
+        path.relative_to(ROOT).as_posix() for path in canonical_compose_sources()
     }
     declared_paths = {
         str(row["compose"])
@@ -239,8 +255,34 @@ def platform_consistency(documents: dict[Path, Any]) -> dict[str, Any]:
     for undeclared in sorted(compose_paths - declared_paths):
         findings.append({"path": undeclared, "finding": "compose_not_declared"})
 
-    # Every external Compose network must be created by a component that is in
-    # the consumer's transitive dependency closure.
+    # Owner-scoped manifests may declare a shared network external because the
+    # canonical aggregate owns it once for the whole Compose project.
+    aggregate = documents.get(ROOT / "deployment/compose.yaml", {})
+    aggregate_networks = (
+        aggregate.get("networks", {}) if isinstance(aggregate, dict) else {}
+    )
+    aggregate_owned_networks = {
+        str(definition.get("name", logical))
+        for logical, definition in (aggregate_networks or {}).items()
+        if isinstance(definition, dict) and definition.get("external") is not True
+    }
+    aggregate_external_networks = {
+        str(definition.get("name", logical))
+        for logical, definition in (aggregate_networks or {}).items()
+        if isinstance(definition, dict) and definition.get("external") is True
+    }
+    for network in sorted(
+        aggregate_external_networks - HOST_BOOTSTRAP_EXTERNAL_NETWORKS
+    ):
+        findings.append(
+            {
+                "network": network,
+                "finding": "aggregate_external_network_not_host_governed",
+            }
+        )
+
+    # Every remaining external Compose network must be created by a component
+    # that is in the consumer's transitive dependency closure.
     producers: dict[str, set[str]] = {}
     external: dict[str, set[str]] = {}
     for component_id, component in rows.items():
@@ -275,12 +317,20 @@ def platform_consistency(documents: dict[Path, Any]) -> dict[str, Any]:
         return result
 
     for network, consumers in external.items():
+        if network in aggregate_owned_networks:
+            continue
+        if (
+            network in aggregate_external_networks
+            and network in HOST_BOOTSTRAP_EXTERNAL_NETWORKS
+        ):
+            continue
+        network_ref = re.fullmatch(r"\$\{([A-Z][A-Z0-9_]*):\?required\}", network)
+        if network_ref and all(
+            network_ref.group(1) in set(rows[consumer].get("externalNetworkRefs", []))
+            for consumer in consumers
+        ):
+            continue
         owners = producers.get(network, set())
-        network_ref = ENV_EXACT_REQUIRED_PATTERN.fullmatch(network)
-        if not owners and network_ref:
-            provisioner = EXTERNAL_NETWORK_PROVISIONER_REFS.get(network_ref.group(1))
-            if provisioner:
-                owners = {provisioner}
         if not owners:
             findings.append(
                 {
@@ -330,7 +380,12 @@ def compose_static(documents: dict[Path, Any]) -> dict[str, Any]:
         set(catalog_values)
         | set(server_config.ONE_TIME_MIGRATION_SEEDS)
         | set(server_config.DERIVED_VALUE_KEYS)
+        | set(server_config.REQUIRED_OPERATOR_BOOTSTRAP_KEYS)
     )
+    runtime_values = {
+        **server_config.ONE_TIME_MIGRATION_SEEDS,
+        **catalog_values,
+    }
     for component_id, row in rows.items():
         if not row.get("compose"):
             continue
@@ -359,7 +414,8 @@ def compose_static(documents: dict[Path, Any]) -> dict[str, Any]:
             image = str(service.get("image", ""))
             image_match = ENV_EXACT_REQUIRED_PATTERN.fullmatch(image)
             if image_match:
-                image = str(catalog_values.get(image_match.group(1), ""))
+                image_key = image_match.group(1)
+                image = str(runtime_values.get(image_key, ""))
             if not IMAGE_PATTERN.search(image):
                 findings.append(
                     {
@@ -400,6 +456,123 @@ def compose_static(documents: dict[Path, Any]) -> dict[str, Any]:
     return record("compose-static", not findings, findings=findings)
 
 
+def reviewed_optional_compose_environment_finding(
+    finding: dict[str, Any], server_config: Any, root: Path = ROOT
+) -> bool:
+    """Recognize only optional refs authorized by the aggregate runtime contract."""
+
+    if finding.get("finding") != "literal_environment_value_outside_canonical":
+        return False
+    relative = Path(str(finding.get("path", "")))
+    key = str(finding.get("key", ""))
+    service_name = str(finding.get("service", ""))
+    aggregate = root / "deployment/compose.yaml"
+    try:
+        contract = server_config.aggregate_compose_environment_contract(aggregate)
+        source = (root / relative).resolve(strict=True)
+        if source not in server_config.aggregate_compose_sources(aggregate):
+            return False
+        document = yaml.safe_load(source.read_text())
+    except (OSError, yaml.YAMLError, server_config.ConfigError):
+        return False
+    services = document.get("services") if isinstance(document, dict) else None
+    service = services.get(service_name) if isinstance(services, dict) else None
+    environment = service.get("environment") if isinstance(service, dict) else None
+    return (
+        contract.get(key) is True
+        and isinstance(environment, dict)
+        and environment.get(key) == "${" + key + ":-}"
+    )
+
+
+def normalize_configuration_source_findings(
+    findings: list[dict[str, Any]], server_config: Any
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve only documented canonical indirection in static findings.
+
+    ``server-verify.py`` performs a deliberately conservative syntax scan. The
+    local gate additionally has the canonical contract available, so it can
+    recognize a closed set of legacy imports, derived values, and local
+    test-harness defaults without accepting arbitrary
+    configuration literals.
+    """
+    allowed_seed_omissions = set(server_config.DERIVED_VALUE_KEYS) | set(
+        server_config.CANONICAL_DERIVED_URL_SPECS
+    )
+    retained: list[dict[str, Any]] = []
+    recognized: list[dict[str, Any]] = []
+    for finding in findings:
+        kind = str(finding.get("finding", ""))
+        path = str(finding.get("path", ""))
+        key = str(finding.get("key", ""))
+        if kind == "compose_seed_catalog_coverage_mismatch":
+            missing = finding.get("missing")
+            extra = finding.get("extra")
+            if not isinstance(missing, list) or not isinstance(extra, list):
+                retained.append(finding)
+                continue
+            unresolved = sorted(set(map(str, missing)) - allowed_seed_omissions)
+            if unresolved or extra:
+                retained.append({**finding, "missing": unresolved, "extra": extra})
+            else:
+                recognized.append(
+                    {
+                        "finding": kind,
+                        "path": path,
+                        "missing": sorted(map(str, missing)),
+                    }
+                )
+            continue
+        if (
+            kind == "script_configurable_literal_outside_canonical"
+            and key in CANONICAL_IMPORT_ALIASES
+            and path
+            in {
+                "tools/platform-cli/platform.py",
+                "tools/platform-cli/server-config.py",
+            }
+        ):
+            recognized.append({"finding": kind, "path": path, "key": key})
+            continue
+        if (
+            kind == "script_configurable_literal_outside_canonical"
+            and path == "tools/platform-cli/server-config.py"
+            and key in server_config.CANONICAL_GENERATED_SECRET_LENGTHS
+        ):
+            # These are renderer-owned generation lengths, not operator
+            # configuration. The canonical source persists the generated
+            # value, while this registry remains the narrow ownership
+            # contract used by render and fresh-install classification.
+            recognized.append({"finding": kind, "path": path, "key": key})
+            continue
+        if (
+            kind == "script_configurable_literal_outside_canonical"
+            and (path, key) in STATIC_CONFIG_LITERAL_EXCEPTIONS
+        ):
+            recognized.append({"finding": kind, "path": path, "key": key})
+            continue
+        if reviewed_optional_compose_environment_finding(
+            finding, server_config
+        ):
+            recognized.append({"finding": kind, "path": path, "key": key})
+            continue
+        if (
+            kind == "runtime_domain_alias"
+            and path == "tools/platform-cli/local-verify.py"
+            and str(finding.get("alias", "")) in CANONICAL_IMPORT_ALIASES
+        ):
+            recognized.append(
+                {
+                    "finding": kind,
+                    "path": path,
+                    "alias": str(finding["alias"]),
+                }
+            )
+            continue
+        retained.append(finding)
+    return retained, recognized
+
+
 def configuration_source_static() -> dict[str, Any]:
     os.environ["MTE_PLATFORM_ROOT"] = str(ROOT)
     try:
@@ -408,27 +581,44 @@ def configuration_source_static() -> dict[str, Any]:
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        config_spec = importlib.util.spec_from_file_location(
+            "mte_config_source_contract", TOOL_ROOT / "server-config.py"
+        )
+        server_config = importlib.util.module_from_spec(config_spec)
+        config_spec.loader.exec_module(server_config)
     finally:
         os.environ.pop("MTE_PLATFORM_ROOT", None)
-    findings = module.static_config_findings(ROOT)
+    findings, recognized = normalize_configuration_source_findings(
+        module.static_config_findings(ROOT), server_config
+    )
     return record(
         "configuration-source-static",
         not findings,
         canonicalServerSource="/root/.config/mte-secrets/platform.env",
         projectionManifest="/root/.config/mte-secrets/projections-manifest.json",
+        recognizedCanonicalIndirection=recognized,
         findings=findings,
     )
 
 
-def connection_coverage() -> dict[str, Any]:
-    registry = yaml.safe_load(CONNECTIONS_SOURCE.read_text())
-    rows = registry.get("connections", []) if isinstance(registry, dict) else []
+def acceptance_requirement_coverage() -> dict[str, Any]:
+    registry = yaml.safe_load(ACCEPTANCE_REQUIREMENTS_SOURCE.read_text())
+    rows = registry.get("requirements") if isinstance(registry, dict) else None
     findings: list[dict[str, Any]] = []
+    if not isinstance(registry, dict):
+        findings.append({"finding": "acceptance_registry_not_an_object"})
+    elif registry.get("apiVersion") != "micro-task-engine/v1alpha1":
+        findings.append({"finding": "acceptance_registry_api_version_invalid"})
+    elif registry.get("kind") != "ReleaseEvidenceRegistry":
+        findings.append({"finding": "acceptance_registry_kind_invalid"})
+    if not isinstance(rows, list):
+        findings.append({"finding": "acceptance_requirements_not_a_list"})
+        rows = []
     ids: set[str] = set()
     required_fields = {"id", "from", "to", "required", "auth", "exposure", "check"}
     for row in rows:
         if not isinstance(row, dict):
-            findings.append({"finding": "connection_not_an_object"})
+            findings.append({"finding": "requirement_not_an_object"})
             continue
         missing = sorted(required_fields - set(row))
         if missing:
@@ -456,10 +646,10 @@ def connection_coverage() -> dict[str, Any]:
     }
     for missing in sorted(required_checks - implemented):
         findings.append(
-            {"check": missing, "finding": "required_connection_check_not_implemented"}
+            {"check": missing, "finding": "required_acceptance_check_not_implemented"}
         )
     return record(
-        "connection-coverage",
+        "acceptance-requirement-coverage",
         not findings,
         total=len(rows),
         required=sum(
@@ -573,8 +763,15 @@ def fresh_install_render() -> dict[str, Any]:
         "CLOUDFLARE_ACCESS_ALLOWED_EMAILS": "operator@example.test",
         "CLOUDFLARE_ACCOUNT_ID": "external-test-value",
         "CLOUDFLARE_ZONE_ID": "external-test-value",
+        "E2E_GITHUB_BASE_BRANCH": "main",
+        "E2E_GITHUB_OWNER": "example-org",
+        "E2E_GITHUB_REPOSITORY": "agent-canary",
         "MTE_EXCLUDED_HOST_1": "192.0.2.10",
         "MTE_EXCLUDED_HOST_2": "192.0.2.11",
+        "MTE_DAYTONA_SANDBOX_IMAGE": "ghcr.io/example/daytona@sha256:"
+        + "c" * 64,
+        "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL": "https://github.com/example/platform",
+        "MTE_DAYTONA_SANDBOX_IMAGE_REVISION": "d" * 40,
         "MTE_OPERATOR_SSH_CIDRS": "198.51.100.0/24",
         "MTE_SSH_TARGET": "root@198.51.100.10",
         "MINIMAX_BASE_URL": "https://llm.example.test/v1",
@@ -599,12 +796,15 @@ def fresh_install_render() -> dict[str, Any]:
             temporary = Path(temp)
             platform_root = temporary / "platform"
             secret_root = temporary / "secrets"
-            compose_root = platform_root / "templates/deploy"
             profile_root = platform_root / "templates/profiles"
-            compose_root.mkdir(parents=True)
             profile_root.mkdir(parents=True)
+            aggregate_compose = platform_root / "deployment/compose.yaml"
+            aggregate_compose.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / "deployment/compose.yaml", aggregate_compose)
             for source in canonical_compose_sources():
-                shutil.copy2(source, compose_root / compose_projection_name(source))
+                canonical_copy = platform_root / source.relative_to(ROOT)
+                canonical_copy.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, canonical_copy)
             shutil.copy2(PROFILE_CATALOG_SOURCE, profile_root / "profiles.yaml")
             shutil.copy2(
                 COMPOSE_SEED_SOURCE,
@@ -628,6 +828,8 @@ def fresh_install_render() -> dict[str, Any]:
                 "SECRET_ROOT": secret_root,
                 "SOURCE": canonical,
                 "MANIFEST": secret_root / "projections-manifest.json",
+                "COMPOSE_ENV": secret_root / "compose.env",
+                "AGGREGATE_COMPOSE": aggregate_compose,
                 "LOCK": secret_root / ".platform-env.lock",
                 "CONFIG_SOURCE": config_source,
                 "CONFIG": platform_root / "config/platform.json",
@@ -651,7 +853,6 @@ def fresh_install_render() -> dict[str, Any]:
                 "PLATFORM_ENV": canonical,
                 "SERVICE_ROOT": secret_root / "services",
                 "INTEGRATION_ROOT": secret_root / "integrations",
-                "DOKPLOY_ADMIN_ENV": secret_root / "dokploy-admin.env",
                 "CONFIG": platform_root / "config/platform.json",
                 "CONFIG_TEMPLATE": config_source,
                 "LOCK": secret_root / ".platform-env.lock",
@@ -689,7 +890,7 @@ def fresh_install_render() -> dict[str, Any]:
                     key
                     for key, value in generated.items()
                     if value or key in server_config.OPTIONAL_EMPTY_KEYS
-                }
+                } | set(server_config.CANONICAL_GENERATED_SECRET_LENGTHS)
                 categories = {
                     "generalSeed": set(base_seeds)
                     - set(server_config.OPTIONAL_EMPTY_KEYS),
@@ -807,15 +1008,25 @@ def fresh_install_render() -> dict[str, Any]:
                     )
 
                 for component_id, source_path in server_config.compose_paths(config):
-                    runtime_path = server_config.runtime_compose_path(source_path)
+                    runtime_path = server_config.runtime_compose_path(component_id)
                     env_values = server_config.parse_env(
                         secret_root / f"services/{component_id}.env"
                     )
                     content = server_config.strip_generated_header(
                         runtime_path.read_text()
                     )
+
+                    def replace_runtime_ref(match: re.Match[str]) -> str:
+                        key = match.group(1)
+                        value = env_values.get(key)
+                        if value:
+                            return value
+                        if key in server_config.POST_RENDER_PROVISIONED_KEYS:
+                            return "post-provisioned-test-value"
+                        return match.group(0)
+
                     resolved = server_config.ENV_PATTERN.sub(
-                        lambda match: env_values.get(match.group(1), match.group(0)),
+                        replace_runtime_ref,
                         content,
                     )
                     if server_config.ENV_PATTERN.search(resolved):
@@ -860,11 +1071,14 @@ def fresh_install_render() -> dict[str, Any]:
         findings.append(
             {"finding": "fresh_install_exception", "errorType": type(exc).__name__}
         )
-    return record(
+    runtime_ready = not findings
+    result = record(
         "fresh-install-render",
-        not findings,
+        runtime_ready,
+        runtimeReady=runtime_ready,
         requiredExternalInputs=sorted(expected_external),
         externalSecretInputs=sorted(FRESH_INSTALL_EXTERNAL_SECRET_FIXTURES),
+        generatedSecretInputs=sorted(generated_ready),
         operatorConfigInputs=sorted(FRESH_INSTALL_OPERATOR_CONFIG_FIXTURES),
         postProvisionedNotionInputs=post_provisioned_notion_ids_absent,
         canonicalEnvMode=oct(canonical_mode) if canonical_mode is not None else None,
@@ -877,6 +1091,44 @@ def fresh_install_render() -> dict[str, Any]:
         projectionCount=projection_count,
         findings=findings,
     )
+    return result
+
+
+def release_check_fresh_install_contract(
+    fresh_install: dict[str, Any],
+) -> dict[str, Any]:
+    """Require a fully renderable fresh install with immutable runtime images."""
+    findings = fresh_install.get("findings")
+    if not isinstance(findings, list):
+        return {
+            "name": "fresh-install-contract",
+            "ok": False,
+            "state": "failed",
+            "runtimeDeployment": "blocked",
+            "findings": [{"finding": "fresh_install_result_invalid"}],
+        }
+    runtime_ready = fresh_install.get("runtimeReady") is True
+    fully_ready = fresh_install.get("ok") is True and runtime_ready and not findings
+    if fully_ready:
+        return {
+            "name": "fresh-install-contract",
+            "ok": True,
+            "state": "passed",
+            "runtimeDeployment": "ready",
+            "findings": [],
+        }
+    return {
+        "name": "fresh-install-contract",
+        "ok": False,
+        "state": "failed",
+        "runtimeDeployment": "blocked",
+        "findings": [
+            {
+                "finding": "fresh_install_not_release_check_eligible",
+                "strictFindings": len(findings),
+            }
+        ],
+    }
 
 
 def smoke_evidence(path: Path) -> dict[str, Any]:
@@ -950,6 +1202,49 @@ def local_capacity() -> dict[str, Any]:
         minimumFreeBytes=minimum_free,
         reason=None if ok else "insufficient_disk_headroom_for_smoke_runtime",
     )
+
+
+def prepare_compose_audit_fixture(fixture_root: Path) -> Path:
+    """Copy Compose sources into a secret-free, root-shaped audit fixture."""
+    fixture_services = fixture_root / SERVICES_SOURCE_ROOT.relative_to(ROOT)
+    shutil.copytree(SERVICES_SOURCE_ROOT, fixture_services)
+    for compose_path in sorted(fixture_services.glob("*/compose.yaml")):
+        document = yaml.safe_load(compose_path.read_text())
+        services = document.get("services", {}) if isinstance(document, dict) else {}
+        for service in services.values():
+            if not isinstance(service, dict):
+                continue
+            env_files = service.get("env_file", []) or []
+            if isinstance(env_files, (str, dict)):
+                env_files = [env_files]
+            for env_file in env_files:
+                ref = env_file.get("path") if isinstance(env_file, dict) else env_file
+                if not isinstance(ref, str) or not ref.startswith(("./", "../")):
+                    continue
+                target = (compose_path.parent / ref).resolve()
+                if (
+                    target.is_relative_to(fixture_root.resolve())
+                    and not target.exists()
+                ):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("")
+            for volume in service.get("volumes", []) or []:
+                if isinstance(volume, str):
+                    ref = volume.split(":", 1)[0]
+                elif isinstance(volume, dict) and volume.get("type") == "bind":
+                    ref = volume.get("source") or volume.get("src")
+                else:
+                    continue
+                if not isinstance(ref, str) or not ref.startswith(("./", "../")):
+                    continue
+                target = (compose_path.parent / ref).resolve()
+                if (
+                    target.is_relative_to(fixture_root.resolve())
+                    and not target.exists()
+                ):
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("")
+    return fixture_services
 
 
 def docker_compose_check() -> dict[str, Any]:
@@ -1031,15 +1326,16 @@ def docker_compose_check() -> dict[str, Any]:
             )
     for key in required_refs:
         env_values.setdefault(key, "audit-placeholder-0123456789abcdef0123456789")
-    with tempfile.NamedTemporaryFile(
-        "w", prefix="mte-compose-audit-", delete=False
-    ) as handle:
-        env_path = Path(handle.name)
-        for key, value in sorted(env_values.items()):
-            handle.write(f"{key}={value}\n")
-    try:
+    with tempfile.TemporaryDirectory(prefix="mte-compose-audit-") as temp:
+        fixture_root = Path(temp)
+        fixture_services = prepare_compose_audit_fixture(fixture_root)
+        env_path = fixture_root / "audit.env"
+        env_path.write_text(
+            "".join(f"{key}={value}\n" for key, value in sorted(env_values.items()))
+        )
         results = []
         for path in canonical_compose_sources():
+            fixture_path = fixture_services / path.relative_to(SERVICES_SOURCE_ROOT)
             result = command(
                 [
                     "docker",
@@ -1047,15 +1343,13 @@ def docker_compose_check() -> dict[str, Any]:
                     "--env-file",
                     str(env_path),
                     "-f",
-                    str(path),
+                    str(fixture_path),
                     "config",
                     "--quiet",
                 ],
                 timeout=30,
             )
             results.append({"path": str(path.relative_to(ROOT)), **result})
-    finally:
-        env_path.unlink(missing_ok=True)
     return record(
         "docker-compose-engine",
         all(result["ok"] for result in results),
@@ -1102,7 +1396,7 @@ def main() -> int:
         compose_static(documents),
         configuration_source_static(),
         fresh_install_render(),
-        connection_coverage(),
+        acceptance_requirement_coverage(),
         profile_coverage(),
         {
             "name": "python-compile",

@@ -22,6 +22,7 @@ import socket
 import stat
 import subprocess
 import sys
+import time
 from types import ModuleType
 from typing import Any, Callable, Mapping
 import uuid
@@ -48,6 +49,11 @@ DOCUMENT_MARKER = re.compile(
 )
 IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+# A live canary can run while the systemd consumer owns one of its rows.  This
+# is normal multi-consumer behaviour, not a failed projection.  Wait only for
+# that bounded in-flight lease to settle; do not mask any non-lease drift.
+CANARY_SETTLE_SECONDS = 120
+CANARY_SETTLE_INTERVAL_SECONDS = 0.5
 
 
 class ProjectionError(RuntimeError):
@@ -1190,23 +1196,27 @@ SELECT jsonb_build_object(
     outbox = payload.get("outbox")
     if not isinstance(sync, dict) or not isinstance(outbox, dict):
         raise ProjectionError("projection_canary_state_missing")
-    if (
-        sync.get("desiredOperation") != operation
-        or sync.get("canonicalRevision") != revision
-        or sync.get("canonicalContentHash") != content_hash
-        or sync.get("projectedRevision") != revision
-        or sync.get("projectedContentHash") != content_hash
-        or sync.get("syncStatus") != "synced"
-        or sync.get("errorFree") is not True
-        or sync.get("leaseReleased") is not True
-        or outbox.get("deliveryState") != "delivered"
-        or outbox.get("delivered") is not True
-        or outbox.get("errorFree") is not True
-        or outbox.get("leaseReleased") is not True
-        or not isinstance(outbox.get("attemptCount"), int)
-        or outbox["attemptCount"] < 1
-    ):
-        raise ProjectionError("projection_canary_delivery_state_drift")
+    expected = {
+        "sync.desiredOperation": sync.get("desiredOperation") == operation,
+        "sync.canonicalRevision": sync.get("canonicalRevision") == revision,
+        "sync.canonicalContentHash": sync.get("canonicalContentHash") == content_hash,
+        "sync.projectedRevision": sync.get("projectedRevision") == revision,
+        "sync.projectedContentHash": sync.get("projectedContentHash") == content_hash,
+        "sync.status": sync.get("syncStatus") == "synced",
+        "sync.errorFree": sync.get("errorFree") is True,
+        "sync.leaseReleased": sync.get("leaseReleased") is True,
+        "outbox.deliveryState": outbox.get("deliveryState") == "delivered",
+        "outbox.delivered": outbox.get("delivered") is True,
+        "outbox.errorFree": outbox.get("errorFree") is True,
+        "outbox.leaseReleased": outbox.get("leaseReleased") is True,
+        "outbox.attemptCount": isinstance(outbox.get("attemptCount"), int)
+        and outbox["attemptCount"] >= 1,
+    }
+    drift = sorted(key for key, matches in expected.items() if not matches)
+    if drift:
+        # Diagnostic labels reveal only which invariant failed, never provider
+        # identifiers, payload data, tokens, or Notion content.
+        raise ProjectionError("projection_canary_delivery_state_drift:" + ",".join(drift))
     provider_object_id = sync.get("providerObjectId")
     if not isinstance(provider_object_id, str) or not provider_object_id:
         raise ProjectionError("projection_canary_provider_object_missing")
@@ -1221,6 +1231,47 @@ SELECT jsonb_build_object(
         "leaseReleased": True,
         "errorFree": True,
     }, provider_object_id
+
+
+def settled_canary_state(
+    worker: Consumer,
+    *,
+    object_kind: str,
+    canonical_object_id: str,
+    operation: str,
+    revision: int,
+    content_hash: str,
+    canonical_expected: bool,
+) -> tuple[dict[str, Any], str]:
+    """Read a canary's terminal state without racing another healthy consumer.
+
+    ``SKIP LOCKED`` permits the timer and an interactive canary to process
+    different rows concurrently.  A leased row must therefore be allowed to
+    complete, but every other invariant remains fail-closed immediately.
+    """
+    deadline = time.monotonic() + CANARY_SETTLE_SECONDS
+    while True:
+        try:
+            return canary_state(
+                worker,
+                object_kind=object_kind,
+                canonical_object_id=canonical_object_id,
+                operation=operation,
+                revision=revision,
+                content_hash=content_hash,
+                canonical_expected=canonical_expected,
+            )
+        except ProjectionError as exc:
+            code = str(exc)
+            prefix = "projection_canary_delivery_state_drift:"
+            drift = code.removeprefix(prefix).split(",")
+            leased = code.startswith(prefix) and any(
+                label in {"sync.leaseReleased", "outbox.leaseReleased"}
+                for label in drift
+            )
+            if not leased or time.monotonic() >= deadline:
+                raise
+            time.sleep(CANARY_SETTLE_INTERVAL_SECONDS)
 
 
 def cleanup_canary(
@@ -1411,7 +1462,7 @@ COMMIT;
         )
         created_drain = worker.drain(max_events=8)
         created: dict[str, Any] = {}
-        created["entity"], provider_ids["entity"] = canary_state(
+        created["entity"], provider_ids["entity"] = settled_canary_state(
             worker,
             object_kind="entity",
             canonical_object_id=identifiers["entityId"],
@@ -1420,7 +1471,7 @@ COMMIT;
             content_hash=entity_hash,
             canonical_expected=True,
         )
-        created["document"], provider_ids["document"] = canary_state(
+        created["document"], provider_ids["document"] = settled_canary_state(
             worker,
             object_kind="document",
             canonical_object_id=identifiers["documentId"],
@@ -1447,7 +1498,7 @@ COMMIT;
         )
         updated_drain = worker.drain(max_events=8)
         updated: dict[str, Any] = {}
-        updated["entity"], provider_ids["entity"] = canary_state(
+        updated["entity"], provider_ids["entity"] = settled_canary_state(
             worker,
             object_kind="entity",
             canonical_object_id=identifiers["entityId"],
@@ -1456,7 +1507,7 @@ COMMIT;
             content_hash=entity_hash_updated,
             canonical_expected=True,
         )
-        updated["document"], provider_ids["document"] = canary_state(
+        updated["document"], provider_ids["document"] = settled_canary_state(
             worker,
             object_kind="document",
             canonical_object_id=identifiers["documentId"],
@@ -1475,7 +1526,7 @@ COMMIT;
         )
         archived_drain = worker.drain(max_events=8)
         archived: dict[str, Any] = {}
-        archived["entity"], provider_ids["entity"] = canary_state(
+        archived["entity"], provider_ids["entity"] = settled_canary_state(
             worker,
             object_kind="entity",
             canonical_object_id=identifiers["entityId"],
@@ -1484,7 +1535,7 @@ COMMIT;
             content_hash=entity_hash_updated,
             canonical_expected=False,
         )
-        archived["document"], provider_ids["document"] = canary_state(
+        archived["document"], provider_ids["document"] = settled_canary_state(
             worker,
             object_kind="document",
             canonical_object_id=identifiers["documentId"],

@@ -56,16 +56,16 @@ data "cloudflare_zero_trust_tunnel_cloudflared_token" "platform" {
   tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.platform.id
 }
 
-resource "cloudflare_dns_record" "platform" {
-  for_each = var.apps
+# DNS has a separate batch reconciler because the Cloudflare API guarantees one
+# database transaction for deletes + posts. Forget legacy per-record provider
+# ownership without destroying records one by one; server-cloudflare-dns.py
+# then replaces reserved shipped hostnames in one fail-closed batch request.
+removed {
+  from = cloudflare_dns_record.platform
 
-  zone_id = var.zone_id
-  name    = each.value.hostname
-  type    = "CNAME"
-  content = "${cloudflare_zero_trust_tunnel_cloudflared.platform.id}.cfargotunnel.com"
-  ttl     = 1
-  proxied = true
-  comment = "Managed by MTE platform IaC for ${each.key}"
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "cloudflare_zero_trust_access_policy" "human" {
@@ -90,11 +90,11 @@ resource "cloudflare_zero_trust_access_policy" "human" {
   }
 }
 
-resource "cloudflare_zero_trust_access_service_token" "platform" {
-  count = length(local.service_apps) > 0 ? 1 : 0
+resource "cloudflare_zero_trust_access_service_token" "service" {
+  for_each = local.service_apps
 
   account_id = var.account_id
-  name       = "MTE platform service clients"
+  name       = "MTE ${each.key} service client"
   duration   = var.service_token_duration
 
   lifecycle {
@@ -103,55 +103,39 @@ resource "cloudflare_zero_trust_access_service_token" "platform" {
 }
 
 resource "cloudflare_zero_trust_access_policy" "service" {
-  count = length(local.service_apps) > 0 ? 1 : 0
+  for_each = local.service_apps
 
   account_id = var.account_id
-  name       = "MTE platform service authentication"
+  name       = "MTE ${each.key} service authentication"
   decision   = "non_identity"
   include = [{
     service_token = {
-      token_id = cloudflare_zero_trust_access_service_token.platform[0].id
+      token_id = cloudflare_zero_trust_access_service_token.service[each.key].id
     }
   }]
 }
 
-resource "cloudflare_zero_trust_access_application" "human" {
-  for_each = local.human_apps
+# Cloudflare provider v5 can POST an Access application but then wait forever
+# before writing Terraform state.  The platform's fixed Access app set is
+# therefore reconciled with Cloudflare's documented REST endpoint by
+# server-cloudflare-access.py.  Terraform remains the owner of the tunnel,
+# policies, and per-route service tokens it supplies to that reconciler.
 
-  account_id = var.account_id
-  name       = "MTE ${each.key}"
-  domain     = each.value.hostname
-  type       = "self_hosted"
-  destinations = [{
-    type = "public"
-    uri  = each.value.hostname
-  }]
-  session_duration           = var.human_session_duration
-  app_launcher_visible       = true
-  enable_binding_cookie      = true
-  http_only_cookie_attribute = true
-  same_site_cookie_attribute = "strict"
-  policies = [{
-    id         = cloudflare_zero_trust_access_policy.human[0].id
-    precedence = 1
-  }]
+# Existing test deployments may have partial v5 app state from a stalled
+# create. Forget it without deleting the remote application; the REST
+# reconciler adopts it on the next apply. Fresh deployments have no entries.
+removed {
+  from = cloudflare_zero_trust_access_application.human
+
+  lifecycle {
+    destroy = false
+  }
 }
 
-resource "cloudflare_zero_trust_access_application" "service" {
-  for_each = local.service_apps
+removed {
+  from = cloudflare_zero_trust_access_application.service
 
-  account_id = var.account_id
-  name       = "MTE ${each.key} service"
-  domain     = each.value.hostname
-  type       = "self_hosted"
-  destinations = [{
-    type = "public"
-    uri  = each.value.hostname
-  }]
-  app_launcher_visible      = false
-  service_auth_401_redirect = true
-  policies = [{
-    id         = cloudflare_zero_trust_access_policy.service[0].id
-    precedence = 1
-  }]
+  lifecycle {
+    destroy = false
+  }
 }

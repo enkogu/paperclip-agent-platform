@@ -19,52 +19,6 @@ SENSITIVE_NAME = re.compile(
 COMPOSE_PLACEHOLDER = re.compile(r"(?<!\$)\$\{(?P<name>[A-Z][A-Z0-9_]*)(?::[^}]*)?\}")
 
 RUNTIMES = {
-    "activepieces-data.yaml": {
-        "service": "redis",
-        "password": "AP_REDIS_PASSWORD",
-        "cli_auth": "REDISCLI_AUTH",
-        "exec": "redis-server",
-        "config": "/run/mte-activepieces-redis/redis.conf",
-        "secret_file": "/run/mte-activepieces-redis/redis.password",
-        "secret_mode": "0400",
-        "security_opt": ["no-new-privileges:true"],
-        "tmpfs": (
-            "/run/mte-activepieces-redis:rw,noexec,nosuid,nodev,"
-            "mode=0700,uid=999,gid=1000"
-        ),
-        "old_command": [
-            "redis-server",
-            "--appendonly",
-            "yes",
-            "--save",
-            "60",
-            "1",
-            "--requirepass",
-            "${AP_REDIS_PASSWORD:?required}",
-        ],
-    },
-    "baserow.yaml": {
-        "service": "redis",
-        "password": "BASEROW_REDIS_PASSWORD",
-        "cli_auth": "REDISCLI_AUTH",
-        "exec": "redis-server",
-        "config": "/run/mte-baserow-redis/redis.conf",
-        "tmpfs": (
-            "/run/mte-baserow-redis:rw,noexec,nosuid,nodev,mode=0700,uid=999,gid=1000"
-        ),
-        "old_command": [
-            "redis-server",
-            "--appendonly",
-            "yes",
-            "--save",
-            "60",
-            "1",
-            "--requirepass",
-            "${BASEROW_REDIS_PASSWORD:?required}",
-            "--databases",
-            "16",
-        ],
-    },
     "searxng.yaml": {
         "service": "valkey",
         "password": "SEARXNG_VALKEY_PASSWORD",
@@ -84,8 +38,31 @@ RUNTIMES = {
             "--requirepass",
             "${SEARXNG_VALKEY_PASSWORD:?required}",
         ],
+        # The rendered service preserves its runtime password expansion. These
+        # bounded healthcheck values are required only for Compose validation;
+        # they are representative non-secret platform defaults.
+        "compose_env": {
+            "MTE_HEALTHCHECK_FAST_INTERVAL": "10s",
+            "MTE_HEALTHCHECK_FAST_TIMEOUT": "5s",
+            "MTE_HEALTHCHECK_FAST_RETRIES": "15",
+        },
     },
 }
+
+
+def docker_compose_runtime_available() -> bool:
+    """Docker Desktop's CLI may be installed while its daemon is unavailable."""
+    if not shutil.which("docker"):
+        return False
+    return (
+        subprocess.run(
+            ["docker", "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def load_runtime(filename, spec):
@@ -160,7 +137,10 @@ class ComposeRuntimeSecretCommandTests(unittest.TestCase):
                 self.assertIn("nosuid", runtime["tmpfs"][0])
                 self.assertIn("nodev", runtime["tmpfs"][0])
 
-    @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is required")
+    @unittest.skipUnless(
+        docker_compose_runtime_available(),
+        "Docker daemon with Compose CLI is required",
+    )
     def test_compose_render_never_materializes_password_in_command(self):
         password = "runtime-render-test-not-a-secret"
         for filename, spec in RUNTIMES.items():
@@ -183,7 +163,15 @@ class ComposeRuntimeSecretCommandTests(unittest.TestCase):
                     compose_path = root / "compose.yaml"
                     env_path = root / "platform.env"
                     compose_path.write_text(yaml.safe_dump(minimal, sort_keys=False))
-                    env_path.write_text(f"{spec['password']}={password}\n")
+                    env_path.write_text(
+                        "".join(
+                            f"{key}={value}\n"
+                            for key, value in {
+                                spec["password"]: password,
+                                **spec["compose_env"],
+                            }.items()
+                        )
+                    )
                     result = subprocess.run(
                         [
                             "docker",

@@ -27,6 +27,41 @@ class CloudflareAcceptanceTests(unittest.TestCase):
         self.module = load_module()
 
     @staticmethod
+    def origin_firewall_status_payload() -> dict[str, object]:
+        return {
+            "firewallPolicyVersion": "mte-origin-firewall/v2",
+            "firewallServiceActive": True,
+            "firewallServiceEnabled": True,
+            "firewallRecoveryTimerActive": True,
+            "firewallRecoveryTimerEnabled": True,
+            "publicInterface": "eth0",
+            "publicInterfaceV4": "eth0",
+            "publicInterfaceV6": "eth0",
+            "operatorSshCidrsSha256": "a" * 64,
+            "firewallSshCidrCount": 2,
+            "firewallSshIpv4CidrCount": 1,
+            "firewallSshIpv6CidrCount": 1,
+            "firewallSshCidrsEnforced": True,
+            "firewallV4Established": True,
+            "firewallV6Established": True,
+            "firewallV4InputTcpDrop": True,
+            "firewallV4InputUdpDrop": True,
+            "firewallV4DockerTcpDrop": True,
+            "firewallV4DockerUdpDrop": True,
+            "firewallV6InputTcpDrop": True,
+            "firewallV6InputUdpDrop": True,
+            "firewallV6DockerTcpDrop": True,
+            "firewallV6DockerUdpDrop": True,
+            "firewallV4Input": True,
+            "firewallV4Docker": True,
+            "firewallV6Input": True,
+            "firewallV6Docker": True,
+            "udp443Blocked": True,
+            "publicTcpDefaultDenied": True,
+            "publicUdpDefaultDenied": True,
+        }
+
+    @staticmethod
     def app_config(*app_ids):
         return {
             "spec": {
@@ -57,14 +92,102 @@ class CloudflareAcceptanceTests(unittest.TestCase):
         self.assertTrue(value["ok"])
         self.assertTrue(value["ports"]["22"]["open"])
         self.assertTrue(
-            all(not value["ports"][str(port)]["open"] for port in (80, 443, 3000))
+            all(
+                not value["ports"][str(port)]["open"]
+                for port in (80, 443, 2377, 3000, 7946, 20241)
+            )
         )
         self.assertEqual(
             value["producerSha256"],
             hashlib.sha256(
-                (ROOT / "tools/platform-cli/server-cloudflare-acceptance.py").read_bytes()
+                (
+                    ROOT / "tools/platform-cli/server-cloudflare-acceptance.py"
+                ).read_bytes()
             ).hexdigest(),
         )
+
+    def test_exact_mode_rejects_a_symlink_even_when_the_target_mode_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.json"
+            link = root / "link.json"
+            target.write_text("{}")
+            target.chmod(0o600)
+            link.symlink_to(target)
+            with self.assertRaises(self.module.AcceptanceError) as raised:
+                self.module.exact_mode(link, 0o600, root_owned=False)
+        self.assertEqual(raised.exception.code, "unsafe_file_symlink")
+
+    def test_firewall_status_consumes_the_v2_status_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            step = Path(directory) / "origin-firewall.sh"
+            step.write_text("#!/usr/bin/env bash\n")
+            step.chmod(0o755)
+            completed = subprocess.CompletedProcess(
+                [str(step), "status"],
+                0,
+                json.dumps(self.origin_firewall_status_payload()),
+                "",
+            )
+            with (
+                mock.patch.object(self.module, "origin_firewall_step_path", step),
+                mock.patch.object(self.module, "exact_mode") as exact_mode,
+                mock.patch.object(self.module, "docker_run", return_value=completed),
+            ):
+                result = self.module.firewall_status()
+        exact_mode.assert_called_once_with(step, 0o700)
+        self.assertEqual(result["firewallPolicyVersion"], "mte-origin-firewall/v2")
+        self.assertTrue(result["firewallV4DockerTcpDrop"])
+        self.assertTrue(result["firewallV6InputUdpDrop"])
+
+    def test_firewall_status_fails_closed_for_the_obsolete_rule_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            step = Path(directory) / "origin-firewall.sh"
+            step.write_text("#!/usr/bin/env bash\n")
+            step.chmod(0o755)
+            payload = self.origin_firewall_status_payload()
+            payload["firewallPolicyVersion"] = "mte-origin-firewall/v1"
+            completed = subprocess.CompletedProcess(
+                [str(step), "status"], 0, json.dumps(payload), ""
+            )
+            with (
+                mock.patch.object(self.module, "origin_firewall_step_path", step),
+                mock.patch.object(self.module, "exact_mode"),
+                mock.patch.object(self.module, "docker_run", return_value=completed),
+                self.assertRaises(self.module.AcceptanceError) as raised,
+            ):
+                self.module.firewall_status()
+        self.assertEqual(raised.exception.code, "origin_firewall_contract_failed")
+
+    def test_cloudflared_status_runs_the_canonical_runtime_verifier_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            step = Path(directory) / "cloudflare-tunnel.sh"
+            step.write_text("#!/usr/bin/env bash\n")
+            step.chmod(0o755)
+            calls: list[list[str]] = []
+
+            def run(args, **_kwargs):
+                calls.append(args)
+                if args == [str(step), "verify"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[3] == "{{json .State}}":
+                    return subprocess.CompletedProcess(args, 0, '{"Running": true}', "")
+                if args[3] == "{{.RestartCount}}":
+                    return subprocess.CompletedProcess(args, 0, "0\n", "")
+                raise AssertionError(args)
+
+            with (
+                mock.patch.object(self.module, "cloudflared_step_path", step),
+                mock.patch.object(self.module, "exact_mode") as exact_mode,
+                mock.patch.object(self.module, "docker_run", side_effect=run),
+            ):
+                result = self.module.cloudflared_status(
+                    {"CLOUDFLARED_CONTAINER_NAME": "mte-cloudflared"}
+                )
+        exact_mode.assert_called_once_with(step, 0o700)
+        self.assertEqual(calls[0], [str(step), "verify"])
+        self.assertTrue(result["cloudflaredRunning"])
+        self.assertTrue(result["cloudflaredRuntimeConfigVerified"])
 
     def test_external_observation_is_fresh_hash_bound_and_exact(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -81,7 +204,10 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     "22": {"open": True},
                     "80": {"open": False},
                     "443": {"open": False},
+                    "2377": {"open": False},
                     "3000": {"open": False},
+                    "7946": {"open": False},
+                    "20241": {"open": False},
                 },
                 "ok": True,
             }
@@ -106,7 +232,15 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 result = self.module.validate_observation(path, values, "a" * 64)
             self.assertTrue(result["sshReachable"])
             self.assertEqual(
-                result["externalPortsBlocked"], {"80": True, "443": True, "3000": True}
+                result["externalPortsBlocked"],
+                {
+                    "80": True,
+                    "443": True,
+                    "2377": True,
+                    "3000": True,
+                    "7946": True,
+                    "20241": True,
+                },
             )
             payload["ports"]["443"]["open"] = True
             path.write_text(json.dumps(payload))
@@ -123,35 +257,6 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 self.assertRaises(self.module.AcceptanceError),
             ):
                 self.module.validate_observation(path, values, "a" * 64)
-
-    def test_apps_projection_requires_exact_profile_count_and_canonical_children(self):
-        rows = {
-            f"app-{index}": {
-                "hostname": f"app-{index}.example.test",
-                "origin": f"http://127.0.0.1:{10000 + index}",
-                "accessClass": "human" if index < 9 else "service",
-            }
-            for index in range(12)
-        }
-        result = self.module.app_rows(
-            {
-                "apps": rows,
-                "dataContent": {"profile": "baserow-wikijs"},
-            },
-            {"PLATFORM_BASE_DOMAIN": "example.test"},
-            self.app_config(*rows),
-        )
-        self.assertEqual(len(result), 12)
-        del rows["app-0"]
-        with self.assertRaises(self.module.AcceptanceError):
-            self.module.app_rows(
-                {
-                    "apps": rows,
-                    "dataContent": {"profile": "baserow-wikijs"},
-                },
-                {"PLATFORM_BASE_DOMAIN": "example.test"},
-                self.app_config(*result),
-            )
 
     def test_postgres_notion_apps_projection_uses_exact_declared_app_set(self):
         rows = {
@@ -188,7 +293,7 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "managed_app_declaration_mismatch")
 
-    def test_postgres_notion_real_declarations_resolve_ten_edge_apps(self):
+    def test_postgres_notion_real_declarations_resolve_nine_edge_apps(self):
         contract_path = ROOT / "tools/platform-cli/data_content_plane.py"
         spec = importlib.util.spec_from_file_location(
             "test_cloudflare_data_content_contract", contract_path
@@ -205,13 +310,12 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             self.module.declared_managed_app_ids(active),
             {
                 "9router",
-                "activepieces",
-                "dokploy",
                 "firecrawl",
                 "kestra",
                 "mattermost",
                 "observability",
                 "paperclip",
+                "postgrest",
                 "searxng",
                 "toolhive",
             },
@@ -252,6 +356,7 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                             "type": "CNAME",
                             "content": tunnel_id + ".cfargotunnel.com",
                             "proxied": True,
+                            "ttl": 1,
                             "comment": "Managed by MTE platform IaC for " + app_id,
                         }
                         for index, (app_id, row) in enumerate(apps.items())
@@ -263,12 +368,18 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                                 "name": "paperclip.example.test",
                                 "type": "A",
                                 "content": "192.0.2.10",
+                                "ttl": 1,
+                                "proxied": False,
+                                "comment": "",
                             },
                             {
                                 "id": "foreign-2",
                                 "name": "chat.example.test",
                                 "type": "A",
                                 "content": "192.0.2.11",
+                                "ttl": 1,
+                                "proxied": False,
+                                "comment": "",
                             },
                         ]
                     )
@@ -284,7 +395,7 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                                     "id": (
                                         "policy-human"
                                         if row["accessClass"] == "human"
-                                        else "policy-service"
+                                        else "policy-service-" + app_id
                                     )
                                 }
                             ],
@@ -292,7 +403,7 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                             "service_auth_401_redirect": row["accessClass"]
                             == "service",
                         }
-                        for index, row in enumerate(apps.values())
+                        for index, (app_id, row) in enumerate(apps.items())
                     ]
                 raise AssertionError(path)
 
@@ -306,11 +417,16 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                         "exclude": [],
                         "require": [],
                     }
-                if path.endswith("/policies/policy-service"):
+                if "/policies/policy-service-" in path:
+                    app_id = path.rsplit("policy-service-", 1)[-1]
                     return {
                         "decision": "non_identity",
                         "include": [
-                            {"service_token": {"token_id": "service-token-id-1234"}}
+                            {
+                                "service_token": {
+                                    "token_id": "service-token-id-" + app_id
+                                }
+                            }
                         ],
                         "exclude": [],
                         "require": [],
@@ -334,13 +450,24 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             "CLOUDFLARE_TUNNEL_NAME": "mte-test",
             "PLATFORM_BASE_DOMAIN": "example.test",
             "CLOUDFLARE_ACCESS_ALLOWED_EMAILS": "operator@example.test",
-            "CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID": "service-token-id-1234",
         }
+        for app_id, row in apps.items():
+            if row["accessClass"] != "service":
+                continue
+            prefix = "CLOUDFLARE_ACCESS_ROUTE_" + app_id.upper().replace("-", "_")
+            values.update(
+                {
+                    prefix + "_ID": "service-token-id-" + app_id,
+                    prefix + "_CLIENT_ID": "client-id-123456-" + app_id,
+                    prefix + "_CLIENT_SECRET": "s" * 48,
+                    prefix + "_EXPIRES_AT": "2099-01-01T00:00:00+00:00",
+                }
+            )
         with mock.patch.object(self.module, "CloudflareApi", FakeApi):
             result = self.module.cloudflare_inventory(values, apps)
         self.assertEqual(result["dnsRecordCount"], 12)
         self.assertEqual(result["accessApplicationCount"], 12)
-        self.assertEqual(result["accessPolicyCount"], 2)
+        self.assertEqual(result["accessPolicyCount"], 4)
         self.assertTrue(result["humanAccessPolicyScoped"])
         self.assertTrue(result["serviceAccessTokenScoped"])
         self.assertEqual(len(result["foreign"]), 2)
@@ -359,12 +486,12 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             }
             for app_id in self.module.human_connections.values()
         }
-        apps["wikijs"] = {
+        apps["documents-ui"] = {
             "hostname": "docs.example.test",
             "origin": "http://127.0.0.1:1235",
             "accessClass": "human",
         }
-        apps["baserow"] = {
+        apps["tables-ui"] = {
             "hostname": "tables.example.test",
             "origin": "http://127.0.0.1:1236",
             "accessClass": "human",
@@ -375,18 +502,18 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             "edgeManaged": True,
             "roles": {
                 "tablesUi": {
-                    "applicationId": "baserow",
+                    "applicationId": "tables-ui",
                     "hostname": "tables.example.test",
                     "accessClass": "human",
                 },
                 "documentsUi": {
-                    "applicationId": "wikijs",
+                    "applicationId": "documents-ui",
                     "hostname": "docs.example.test",
                     "accessClass": "human",
                 },
             },
             "roleBindings": {},
-            "applicationIds": ["baserow", "wikijs"],
+            "applicationIds": ["documents-ui", "tables-ui"],
         }
         semantic = {
             app_id: (
@@ -421,7 +548,10 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             self.assertTrue(row["serviceSemanticVerified"])
             self.assertTrue(row["originAuthenticationVerified"])
             self.assertFalse(row["authenticatedCloudflareSessionTested"])
-        self.assertEqual(rows["C029"]["dataContentApplications"], ["baserow", "wikijs"])
+        self.assertEqual(
+            rows["C029"]["dataContentApplications"],
+            ["tables-ui", "documents-ui"],
+        )
         self.assertEqual(rows["C029"]["dataContentProfile"], "provider-a")
         self.assertEqual(len(rows["C029"]["edgeApplications"]), 2)
 
@@ -462,7 +592,9 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             with mock.patch.object(self.module, "data_content_path", plane):
                 value = self.module.data_content_edge_contract(projection, apps)
             self.assertEqual(value["applicationIds"], ["table-app", "docs-app"])
-            projection["dataContent"]["roles"]["tablesUi"]["applicationId"] = "baserow"
+            projection["dataContent"]["roles"]["tablesUi"]["applicationId"] = (
+                "missing-app"
+            )
             with (
                 mock.patch.object(self.module, "data_content_path", plane),
                 self.assertRaises(self.module.AcceptanceError),
@@ -636,7 +768,9 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             }
             source_hash = "6" * 64
             producer_hash = hashlib.sha256(
-                (ROOT / "tools/platform-cli/server-cloudflare-acceptance.py").read_bytes()
+                (
+                    ROOT / "tools/platform-cli/server-cloudflare-acceptance.py"
+                ).read_bytes()
             ).hexdigest()
             with (
                 mock.patch.object(self.module, "root", base),
@@ -687,310 +821,19 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 )
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    def test_ose_storage_semantics_use_authenticated_baserow_and_wikijs_apis(self):
-        calls = []
-
-        def request(method, url, **kwargs):
-            calls.append((method, url, kwargs))
-            if "/api/database/rows/table/" in url:
-                self.assertEqual(
-                    kwargs["headers"]["Authorization"], "Token baserow-token"
-                )
-                return 200, {"count": 1, "results": [{"id": 1}]}, {}
-            self.assertTrue(url.endswith("/graphql"))
-            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer wikijs-token")
-            return (
-                200,
-                {
-                    "data": {
-                        "system": {
-                            "info": {
-                                "currentVersion": "2.5.314",
-                                "dbType": "postgres",
-                                "dbHost": "mte-postgres",
-                            }
-                        }
-                    }
-                },
-                {},
-            )
-
-        with mock.patch.object(self.module, "request", side_effect=request):
-            baserow = self.module.semantic_baserow(
-                {
-                    "BASEROW_PAPERCLIP_TOKEN": "baserow-token",
-                    "BASEROW_TABLE_ID": "42",
-                },
-                "http://127.0.0.1:18085",
-            )
-            wikijs = self.module.semantic_wikijs(
-                {"WIKIJS_API_TOKEN": "wikijs-token"},
-                "http://127.0.0.1:18086",
-            )
-        self.assertEqual(baserow["rowCount"], 1)
-        self.assertEqual(wikijs["version"], "2.5.314")
-        self.assertEqual(len(calls), 2)
-
-    def test_dependency_evidence_requires_current_source_producer_and_c029_semantics(
-        self,
-    ):
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            (base / "bin").mkdir()
-            producer = base / "bin/server-integration-canaries.py"
-            producer.write_text("producer-v1")
-            baserow_producer = base / "bin/server-baserow.py"
-            baserow_producer.write_text("baserow-producer-v1")
-            wikijs_producer = base / "bin/server-wikijs.py"
-            wikijs_producer.write_text("wikijs-producer-v1")
-            evidence = base / "integration-canary-C029.json"
-            baserow_evidence = base / "baserow-verify.json"
-            wikijs_evidence = base / "wikijs-verify.json"
-            source = "7" * 64
-            baserow_persistence = {
-                "databaseId": 1,
-                "tableId": 2,
-                "rowId": 3,
-                "markerSha256": "4" * 64,
-                "restartObserved": True,
-                "persistenceVerified": True,
-                "postDeleteStatus": 404,
-                "cleanupCompleted": True,
-            }
-            wikijs_persistence = {
-                "pageId": 4,
-                "pathHashSha256": "3" * 64,
-                "markerSha256": "5" * 64,
-                "restartObserved": True,
-                "persistenceVerified": True,
-                "postDeleteStatus": 404,
-                "cleanupCompleted": True,
-            }
-            evidence.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "micro-task-engine/v1alpha1",
-                        "kind": "IntegrationCanaryEvidence",
-                        "status": "passed",
-                        "generatedAt": self.module.utcnow(),
-                        "canonicalSourceSha256": source,
-                        "producerSha256": hashlib.sha256(
-                            producer.read_bytes()
-                        ).hexdigest(),
-                        "selected": ["C029"],
-                        "canaries": [
-                            {
-                                "id": "C029",
-                                "ok": True,
-                                "state": "passed",
-                                "source": "controlled_ose_application_restarts",
-                                "dataContentProfile": "baserow-wikijs",
-                                "roles": {
-                                    "tablesUi": "baserow",
-                                    "tablesApi": "baserow",
-                                    "documentsUi": "wikijs",
-                                    "documentsApi": "wikijs",
-                                },
-                                "tablesPersistence": {
-                                    "markerSha256": "4" * 64,
-                                    "restartObserved": True,
-                                    "persistenceVerified": True,
-                                    "postDeleteAbsent": True,
-                                    "cleanupCompleted": True,
-                                },
-                                "documentsPersistence": {
-                                    "markerSha256": "5" * 64,
-                                    "restartObserved": True,
-                                    "persistenceVerified": True,
-                                    "postDeleteAbsent": True,
-                                    "cleanupCompleted": True,
-                                },
-                                "baserowPersistence": baserow_persistence,
-                                "wikijsPersistence": wikijs_persistence,
-                                "osiLicenses": [
-                                    {
-                                        "component": "baserow",
-                                        "version": "2.3.1",
-                                        "spdx": "MIT",
-                                        "imageDigest": "sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a",
-                                        "verified": True,
-                                    },
-                                    {
-                                        "component": "wikijs",
-                                        "version": "2.5.314",
-                                        "spdx": "AGPL-3.0-only",
-                                        "imageDigest": "sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e",
-                                        "verified": True,
-                                    },
-                                ],
-                                "tablePersistenceVerified": True,
-                                "documentPersistenceVerified": True,
-                                "applicationRestartObserved": True,
-                                "cleanupCompleted": True,
-                                "dependencyEvidence": {},
-                            }
-                        ],
-                    }
-                )
-            )
-            evidence.chmod(0o600)
-            baserow_evidence.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "mte.example.test/v1",
-                        "kind": "BaserowAcceptance",
-                        "status": "passed",
-                        "ok": True,
-                        "generatedAt": self.module.utcnow(),
-                        "canonicalSourceSha256": source,
-                        "producerSha256": hashlib.sha256(
-                            baserow_producer.read_bytes()
-                        ).hexdigest(),
-                        "distribution": {
-                            "name": "Baserow OSE",
-                            "version": "2.3.1",
-                            "image": "baserow/baserow:2.3.1@sha256:496889c4fe22ee6b632698c3c74f7ccaee734c8002b5ebc8d194c5fcacffc98a",
-                            "platformDigest": "sha256:16d9dd21b3f282c9300d876da66c8036e217143cae0af8f1dd2da5b45af0e30b",
-                            "license": "MIT",
-                            "licenseSource": "https://github.com/baserow/baserow/blob/2.3.1/LICENSE",
-                            "licenseSourceSha256": "1c1fa26d7bb6fddee61c4120803a7190ee3199ac29062bcc1ff0f00a0de08e2b",
-                            "enterpriseLicenseConfigured": False,
-                            "premiumFeaturesUsed": False,
-                        },
-                        "restApi": {
-                            "ok": True,
-                            "tokenCheckStatus": 200,
-                            "rowsStatus": 200,
-                        },
-                        "mcp": {
-                            "ok": True,
-                            "initializeOk": True,
-                            "toolsListOk": True,
-                            "toolNames": ["list_rows"],
-                        },
-                        "baserowPersistence": baserow_persistence,
-                    }
-                )
-            )
-            baserow_evidence.chmod(0o600)
-            wikijs_evidence.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "micro-task-engine/v1alpha1",
-                        "kind": "WikiJsVerification",
-                        "status": "passed",
-                        "ok": True,
-                        "generatedAt": self.module.utcnow(),
-                        "canonicalSourceSha256": source,
-                        "producerSha256": hashlib.sha256(
-                            wikijs_producer.read_bytes()
-                        ).hexdigest(),
-                        "image": {
-                            "ref": "ghcr.io/requarks/wiki:2.5.314@sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e",
-                            "version": "2.5.314",
-                            "digest": "sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e",
-                            "upstreamCommit": "6f042e97cc2d3acda6b6ff611de8e0faacce91c1",
-                            "license": {
-                                "spdx": "AGPL-3.0-only",
-                                "source": "https://github.com/requarks/wiki/blob/v2.5.314/LICENSE",
-                            },
-                        },
-                        "graphql": {
-                            "pageId": 4,
-                            "bearerAuthenticated": True,
-                            "restartObserved": True,
-                            "persistenceVerified": True,
-                            "cleanupCompleted": True,
-                            "postDeleteGraphqlMissing": True,
-                            "postDeleteStatus404": 404,
-                            "pathHashSha256": "3" * 64,
-                            "markerSha256": "5" * 64,
-                        },
-                        "secretAudit": {
-                            "rawSecretsPresent": False,
-                            "contentMarkerPresent": False,
-                        },
-                    }
-                )
-            )
-            wikijs_evidence.chmod(0o600)
-            document = json.loads(evidence.read_text())
-            document["canaries"][0]["dependencyEvidence"] = {
-                "baserow": {
-                    "path": str(baserow_evidence),
-                    "sha256": hashlib.sha256(baserow_evidence.read_bytes()).hexdigest(),
-                    "kind": "BaserowAcceptance",
-                    "producerSha256": hashlib.sha256(
-                        baserow_producer.read_bytes()
-                    ).hexdigest(),
-                },
-                "wikijs": {
-                    "path": str(wikijs_evidence),
-                    "sha256": hashlib.sha256(wikijs_evidence.read_bytes()).hexdigest(),
-                    "kind": "WikiJsVerification",
-                    "producerSha256": hashlib.sha256(
-                        wikijs_producer.read_bytes()
-                    ).hexdigest(),
-                },
-            }
-            evidence.write_text(json.dumps(document))
-            with (
-                mock.patch.object(
-                    self.module, "c029_integration_evidence_path", evidence
-                ),
-                mock.patch.object(
-                    self.module, "baserow_evidence_path", baserow_evidence
-                ),
-                mock.patch.object(self.module, "wikijs_evidence_path", wikijs_evidence),
-                mock.patch.object(self.module, "root", base),
-                mock.patch.object(self.module, "exact_mode"),
-            ):
-                dependencies = self.module.c029_persistence_dependencies(
-                    {
-                        "sourceSha256": source,
-                        "generatorVersion": self.module.generator_contract,
-                    },
-                    "example.test",
-                )
-            self.assertEqual(len(dependencies), 3)
-            self.assertEqual(
-                dependencies[0]["sha256"],
-                hashlib.sha256(evidence.read_bytes()).hexdigest(),
-            )
-            document = json.loads(evidence.read_text())
-            document["canaries"][0]["applicationRestartObserved"] = False
-            evidence.write_text(json.dumps(document))
-            with (
-                mock.patch.object(
-                    self.module, "c029_integration_evidence_path", evidence
-                ),
-                mock.patch.object(
-                    self.module, "baserow_evidence_path", baserow_evidence
-                ),
-                mock.patch.object(self.module, "wikijs_evidence_path", wikijs_evidence),
-                mock.patch.object(self.module, "root", base),
-                mock.patch.object(self.module, "exact_mode"),
-                self.assertRaises(self.module.AcceptanceError),
-            ):
-                self.module.c029_persistence_dependencies(
-                    {
-                        "sourceSha256": source,
-                        "generatorVersion": self.module.generator_contract,
-                    },
-                    "example.test",
-                )
-
-    def test_postgres_notion_c029_binds_fresh_canary_and_connector_verification(self):
+    def test_postgres_notion_c029_requires_consumer_canary_and_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             (base / "bin").mkdir()
             integration_producer = base / "bin/server-integration-canaries.py"
-            notion_producer = base / "bin/server-notion.py"
+            notion_producer = base / "bin/server-notion-sync.py"
             integration_producer.write_text("integration-producer-v1")
-            notion_producer.write_text("notion-producer-v1")
+            notion_producer.write_text("notion-consumer-producer-v1")
             integration = base / "integration-canary-C029.json"
-            notion_evidence = base / "notion-connector-verify.json"
+            canary_evidence = base / "notion-projection-live-canary.json"
+            verification_evidence = base / "notion-projection-consumer-verify.json"
             source = "7" * 64
+            producer_sha = hashlib.sha256(notion_producer.read_bytes()).hexdigest()
 
             def postgres_item(seed):
                 return {
@@ -1007,8 +850,12 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     "cleanupVerified": True,
                 }
 
+            postgres = {
+                "record": postgres_item("a"),
+                "document": postgres_item("b"),
+            }
             table = {
-                "pageIdSha256": hashlib.sha256(b"page-table").hexdigest(),
+                "pageIdSha256": "c" * 64,
                 "created": True,
                 "queryVerified": True,
                 "updated": True,
@@ -1016,8 +863,8 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 "cleanupVerified": True,
                 "linkageVerified": True,
             }
-            document = {
-                "pageIdSha256": hashlib.sha256(b"page-document").hexdigest(),
+            notion_document = {
+                "pageIdSha256": "d" * 64,
                 "created": True,
                 "appendVerified": True,
                 "readBackVerified": True,
@@ -1025,27 +872,84 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 "cleanupVerified": True,
                 "linkageVerified": True,
             }
-            cleanup = {
-                "postgresRecordDeleted": True,
-                "postgresDocumentDeleted": True,
-                "postgresProjectionRowsDeleted": True,
-                "notionTableRowArchived": True,
-                "notionDocumentArchived": True,
-                "verified": True,
+            canary = {
+                "apiVersion": "micro-task-engine/v1alpha1",
+                "kind": "NotionProjectionLiveCanary",
+                "status": "passed",
+                "ok": True,
+                "generatedAt": self.module.utcnow(),
+                "canonicalSourceSha256": source,
+                "producerSha256": producer_sha,
+                "dataContentProfile": "postgres-notion",
+                "provider": "notion",
+                "linkage": {
+                    "entity": {
+                        "canonicalObjectIdSha256": postgres["record"]["objectIdSha256"],
+                        "providerObjectIdSha256": table["pageIdSha256"],
+                        "initialRevision": 1,
+                        "finalRevision": 2,
+                        "initialContentSha256": "2" * 64,
+                        "finalContentSha256": "3" * 64,
+                    },
+                    "document": {
+                        "canonicalObjectIdSha256": postgres["document"][
+                            "objectIdSha256"
+                        ],
+                        "providerObjectIdSha256": notion_document["pageIdSha256"],
+                        "initialRevision": 1,
+                        "finalRevision": 2,
+                        "initialContentSha256": "2" * 64,
+                        "finalContentSha256": "3" * 64,
+                    },
+                },
+                "cleanup": {"verified": True},
+                "evidence": {"path": str(canary_evidence), "mode": "0600"},
+                "redacted": True,
             }
-            dependency = {
-                "path": str(notion_evidence),
-                "sha256": "0" * 64,
-                "kind": "NotionConnectorVerification",
-                "producerSha256": hashlib.sha256(
-                    notion_producer.read_bytes()
+            verification = {
+                "apiVersion": "micro-task-engine/v1alpha1",
+                "kind": "NotionProjectionConsumerVerification",
+                "status": "passed",
+                "ok": True,
+                "generatedAt": self.module.utcnow(),
+                "canonicalSourceSha256": source,
+                "producerSha256": producer_sha,
+                "dataContentProfile": "postgres-notion",
+                "provider": "notion",
+                "delivery": {
+                    "pending": 0,
+                    "processing": 0,
+                    "failed": 0,
+                    "eligible": 0,
+                    "exhausted": 0,
+                    "expiredLeases": 0,
+                    "schemaReady": True,
+                },
+                "systemd": {"serviceActive": True, "timerActive": True},
+                "evidence": {"path": str(verification_evidence), "mode": "0600"},
+                "redacted": True,
+            }
+            canary_evidence.write_text(json.dumps(canary))
+            verification_evidence.write_text(json.dumps(verification))
+            canary_reference = {
+                "path": str(canary_evidence),
+                "sha256": hashlib.sha256(canary_evidence.read_bytes()).hexdigest(),
+                "kind": "NotionProjectionLiveCanary",
+                "producerSha256": producer_sha,
+            }
+            verification_reference = {
+                "path": str(verification_evidence),
+                "sha256": hashlib.sha256(
+                    verification_evidence.read_bytes()
                 ).hexdigest(),
+                "kind": "NotionProjectionConsumerVerification",
+                "producerSha256": producer_sha,
             }
             row = {
                 "id": "C029",
                 "ok": True,
                 "state": "passed",
-                "source": "server_notion_connector_canary",
+                "source": "server_notion_projection_consumer_canary",
                 "dataContentProfile": "postgres-notion",
                 "roles": {
                     "tablesUi": "notion",
@@ -1053,18 +957,23 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     "documentsUi": "notion",
                     "documentsApi": "notion",
                 },
-                "postgresSsot": {
-                    "record": postgres_item("a"),
-                    "document": postgres_item("b"),
-                },
-                "notion": {"table": table, "document": document},
+                "postgresSsot": postgres,
+                "notion": {"table": table, "document": notion_document},
                 "tablePersistenceVerified": True,
                 "documentPersistenceVerified": True,
                 "crossProviderLinkageVerified": True,
                 "cleanupCompleted": True,
-                "cleanup": cleanup,
+                "cleanup": {
+                    "postgresRecordDeleted": True,
+                    "postgresDocumentDeleted": True,
+                    "postgresProjectionRowsDeleted": True,
+                    "notionTableRowArchived": True,
+                    "notionDocumentArchived": True,
+                    "verified": True,
+                },
                 "redacted": True,
-                "dependencyEvidence": dependency,
+                "dependencyEvidence": canary_reference,
+                "consumerVerificationEvidence": verification_reference,
             }
             integration.write_text(
                 json.dumps(
@@ -1082,90 +991,23 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     }
                 )
             )
-            notion_evidence.write_text(
-                json.dumps(
-                    {
-                        "apiVersion": "micro-task-engine/v1alpha1",
-                        "kind": "NotionConnectorVerification",
-                        "status": "passed",
-                        "ok": True,
-                        "generatedAt": self.module.utcnow(),
-                        "canonicalSourceSha256": source,
-                        "producerSha256": hashlib.sha256(
-                            notion_producer.read_bytes()
-                        ).hexdigest(),
-                        "dataContentProfile": "postgres-notion",
-                        "notionApiVersion": "2025-09-03",
-                        "identity": {
-                            "botId": "bot-id",
-                            "workspaceId": "workspace-id",
-                            "botExact": True,
-                            "workspaceExact": True,
-                        },
-                        "resources": {
-                            "root": {"exact": True},
-                            "documents": {"exact": True},
-                            "database": {"exact": True},
-                            "dataSource": {"exact": True},
-                        },
-                        "schema": {
-                            "exact": True,
-                            "properties": {"Name": {"type": "title"}},
-                        },
-                        "canary": {
-                            "kind": "NotionConnectorCanary",
-                            "status": "passed",
-                            "ok": True,
-                            "dataContentProfile": "postgres-notion",
-                            "canonicalSourceSha256": source,
-                            "producerSha256": hashlib.sha256(
-                                notion_producer.read_bytes()
-                            ).hexdigest(),
-                            "linkage": {
-                                kind: {
-                                    key: value
-                                    for key, value in row["postgresSsot"][kind].items()
-                                    if key
-                                    in {
-                                        "objectIdSha256",
-                                        "initialRevision",
-                                        "finalRevision",
-                                        "initialContentSha256",
-                                        "finalContentSha256",
-                                    }
-                                }
-                                for kind in ("record", "document")
-                            },
-                            "notion": {
-                                "table": {**table, "pageId": "page-table"},
-                                "document": {
-                                    **document,
-                                    "pageId": "page-document",
-                                },
-                            },
-                            "redacted": True,
-                        },
-                        "cleanup": {"verified": True},
-                        "redacted": True,
-                        "secretAudit": {
-                            "tokenPresent": False,
-                            "rawMarkerPresent": False,
-                        },
-                    }
-                )
-            )
-            integration_document = json.loads(integration.read_text())
-            integration_document["canaries"][0]["dependencyEvidence"]["sha256"] = (
-                hashlib.sha256(notion_evidence.read_bytes()).hexdigest()
-            )
-            integration.write_text(json.dumps(integration_document))
-            integration.chmod(0o600)
-            notion_evidence.chmod(0o600)
+            for path in (integration, canary_evidence, verification_evidence):
+                path.chmod(0o600)
+
             with (
                 mock.patch.object(
                     self.module, "c029_integration_evidence_path", integration
                 ),
-                mock.patch.object(self.module, "notion_evidence_path", notion_evidence),
+                mock.patch.object(
+                    self.module,
+                    "notion_projection_canary_evidence_path",
+                    canary_evidence,
+                ),
+                mock.patch.object(
+                    self.module,
+                    "notion_consumer_verification_evidence_path",
+                    verification_evidence,
+                ),
                 mock.patch.object(self.module, "root", base),
                 mock.patch.object(self.module, "exact_mode"),
             ):
@@ -1176,19 +1018,37 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     },
                     "example.test",
                 )
-            self.assertEqual(len(dependencies), 2)
-            self.assertEqual(dependencies[0]["kind"], "IntegrationCanaryEvidence")
-            self.assertEqual(dependencies[1]["kind"], "NotionConnectorVerification")
-            self.assertEqual(dependencies[1]["path"], str(notion_evidence))
+            self.assertEqual(
+                [row["kind"] for row in dependencies],
+                [
+                    "IntegrationCanaryEvidence",
+                    "NotionProjectionLiveCanary",
+                    "NotionProjectionConsumerVerification",
+                ],
+            )
+            self.assertTrue(
+                all(row["producerSha256"] == producer_sha for row in dependencies[1:])
+            )
 
-            notion_document = json.loads(notion_evidence.read_text())
-            notion_document["secretAudit"]["tokenPresent"] = True
-            notion_evidence.write_text(json.dumps(notion_document))
+            integration_document = json.loads(integration.read_text())
+            integration_document["canaries"][0]["source"] = (
+                "server_notion_connector_canary"
+            )
+            integration.write_text(json.dumps(integration_document))
             with (
                 mock.patch.object(
                     self.module, "c029_integration_evidence_path", integration
                 ),
-                mock.patch.object(self.module, "notion_evidence_path", notion_evidence),
+                mock.patch.object(
+                    self.module,
+                    "notion_projection_canary_evidence_path",
+                    canary_evidence,
+                ),
+                mock.patch.object(
+                    self.module,
+                    "notion_consumer_verification_evidence_path",
+                    verification_evidence,
+                ),
                 mock.patch.object(self.module, "root", base),
                 mock.patch.object(self.module, "exact_mode"),
                 self.assertRaises(self.module.AcceptanceError) as raised,
@@ -1201,7 +1061,8 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     "example.test",
                 )
             self.assertEqual(
-                raised.exception.code, "notion_connector_canary_dependency_invalid"
+                raised.exception.code,
+                "notion_projection_canary_dependency_invalid",
             )
 
     def test_observability_dependency_requires_all_three_real_datasource_queries(self):
@@ -1258,8 +1119,7 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 dependency["sha256"], hashlib.sha256(evidence.read_bytes()).hexdigest()
             )
 
-    def test_firecrawl_requires_unauthorized_anonymous_and_controlled_marker(self):
-        marker = "MTE-C026-" + "ab" * 12
+    def test_firecrawl_requires_unauthorized_anonymous_and_live_scrape(self):
         get_urls = []
 
         def fake_request(method, url, **kwargs):
@@ -1269,23 +1129,30 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     return 401, None, {}
                 return 200, {"status": "ok"}, {}
             self.assertIn("/v1/scrape", url)
-            self.assertTrue(kwargs["body"]["url"].startswith("http://mte-cf-marker-"))
-            return 200, {"data": {"markdown": marker}}, {}
+            self.assertEqual(kwargs["body"]["url"], "https://example.com/")
+            self.assertEqual(kwargs["body"]["maxAge"], 0)
+            return (
+                200,
+                {
+                    "success": True,
+                    "data": {
+                        "markdown": "# Example Domain",
+                        "metadata": {"statusCode": 200},
+                    },
+                },
+                {},
+            )
 
-        completed = subprocess.CompletedProcess([], 0, "removed", "")
         values = {
-            "CLOUDFLARE_ACCESS_CLIENT_ID": "cf-client-id-value-7f4a9c21",
-            "CLOUDFLARE_ACCESS_CLIENT_SECRET": "cf-client-secret-value-a83bd695",
-            "CLOUDFLARE_ACCESS_SERVICE_TOKEN_ID": "cf-service-token-value-31c6e2d8",
-            "CLOUDFLARE_ACCESS_EXPIRES_AT": "2099-01-01T00:00:00.000000+00:00",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_ID": "cf-client-id-value-7f4a9c21",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_CLIENT_SECRET": "cf-client-secret-value-a83bd695",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_ID": "cf-service-token-value-31c6e2d8",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_EXPIRES_AT": "2099-01-01T00:00:00.000000+00:00",
             "FIRECRAWL_API_KEY": "firecrawl-key-value-d40b8e17",
             "FIRECRAWL_HEALTH_URL": "http://127.0.0.1:13002/",
         }
         with (
             mock.patch.object(self.module, "request", side_effect=fake_request),
-            mock.patch.object(self.module, "docker_run", return_value=completed),
-            mock.patch.object(self.module.secrets, "token_hex", return_value="ab" * 12),
-            mock.patch.object(self.module.time, "sleep"),
         ):
             row = self.module.firecrawl_row(
                 values,
@@ -1304,10 +1171,145 @@ class CloudflareAcceptanceTests(unittest.TestCase):
         self.assertTrue(all(not url.endswith("/health") for url in get_urls))
         self.assertTrue(row["serviceTokenExpiryVerified"])
         self.assertFalse(row["serviceTokenCredentialValuesEmitted"])
-        self.assertTrue(row["controlledScrapeMarkerObserved"])
-        self.assertTrue(row["markerContainerRemoved"])
+        self.assertTrue(row["liveScrapeKnownDocumentObserved"])
+        self.assertEqual(row["liveScrapeMetadataStatus"], 200)
+        self.assertTrue(row["liveScrapeCacheBypassed"])
         encoded = json.dumps(row, sort_keys=True)
         self.assertTrue(all(values[key] not in encoded for key in values))
+
+    def test_every_service_route_denies_anonymous_and_cross_route_tokens(self):
+        apps = {
+            "9router": {
+                "hostname": "router.example.test",
+                "origin": "http://127.0.0.1:12080",
+                "accessClass": "service",
+            },
+            "toolhive": {
+                "hostname": "tools.example.test",
+                "origin": "http://127.0.0.1:12081",
+                "accessClass": "service",
+            },
+        }
+        config = {
+            "spec": {
+                "components": [
+                    {
+                        "id": "9router",
+                        "health": {"url": "http://127.0.0.1:12080/health"},
+                    },
+                    {
+                        "id": "toolhive",
+                        "health": {"url": "http://127.0.0.1:12081/ready"},
+                    },
+                ]
+            }
+        }
+        values = {}
+        clients = {"router-client": "router-secret", "tools-client": "tools-secret"}
+        for app_id, (client_id, secret) in zip(apps, clients.items(), strict=True):
+            prefix = "CLOUDFLARE_ACCESS_ROUTE_" + app_id.upper().replace("-", "_")
+            values.update(
+                {
+                    prefix + "_ID": "service-token-id-" + app_id,
+                    prefix + "_CLIENT_ID": client_id,
+                    prefix + "_CLIENT_SECRET": secret * 4,
+                    prefix + "_EXPIRES_AT": "2099-01-01T00:00:00+00:00",
+                }
+            )
+
+        def fake_request(_method, url, **kwargs):
+            headers = kwargs.get("headers", {})
+            if not headers:
+                return 401, None, {}
+            expected_client = "router-client" if "router." in url else "tools-client"
+            return (
+                (200 if headers["CF-Access-Client-Id"] == expected_client else 401),
+                None,
+                {},
+            )
+
+        with mock.patch.object(self.module, "request", side_effect=fake_request):
+            checks = self.module.service_edge_checks(values, apps, config)
+        self.assertEqual(set(checks), set(apps))
+        self.assertTrue(all(row["anonymousDenied"] for row in checks.values()))
+        self.assertTrue(
+            all(row["intendedTokenStatus"] == 200 for row in checks.values())
+        )
+        self.assertTrue(all(row["crossTokenDenied"] for row in checks.values()))
+        encoded = json.dumps(checks, sort_keys=True)
+        self.assertTrue(all(secret not in encoded for secret in clients.values()))
+
+    def test_searxng_semantic_retries_empty_results_then_validates_json_result(self):
+        calls = []
+        responses = [
+            (200, {"query": "OpenAI", "results": []}, {}),
+            (200, {"query": "OpenAI", "results": []}, {}),
+            (
+                200,
+                {
+                    "query": "OpenAI",
+                    "results": [{"title": "OpenAI", "url": "https://openai.com/"}],
+                },
+                {},
+            ),
+        ]
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            return responses.pop(0)
+
+        with (
+            mock.patch.object(self.module, "request", side_effect=fake_request),
+            mock.patch.object(self.module.time, "sleep") as sleep,
+        ):
+            value = self.module.semantic_searxng({}, "http://127.0.0.1:13004")
+        self.assertEqual(value["attemptCount"], 3)
+        self.assertEqual(value["validResultCount"], 1)
+        self.assertRegex(value["canaryQuerySha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(call[0] == "GET" for call in calls))
+        self.assertEqual(len({call[1] for call in calls}), 1)
+        self.assertIn("q=OpenAI", calls[0][1])
+        self.assertIn("format=json", calls[0][1])
+        self.assertIn("language=en", calls[0][1])
+        self.assertTrue(all(call[2]["timeout"] == 60 for call in calls))
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_searxng_semantic_rejects_nonempty_malformed_search_results(self):
+        with (
+            mock.patch.object(
+                self.module,
+                "request",
+                return_value=(
+                    200,
+                    {"query": "OpenAI", "results": [{"title": "missing url"}]},
+                    {},
+                ),
+            ),
+            mock.patch.object(self.module.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                self.module.AcceptanceError,
+                "searxng_live_search_contract_invalid",
+            ),
+        ):
+            self.module.semantic_searxng({}, "http://127.0.0.1:13004")
+        sleep.assert_not_called()
+
+    def test_searxng_semantic_fails_closed_after_bounded_empty_retries(self):
+        with (
+            mock.patch.object(
+                self.module,
+                "request",
+                return_value=(200, {"query": "OpenAI", "results": []}, {}),
+            ) as request,
+            mock.patch.object(self.module.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                self.module.AcceptanceError, "searxng_live_search_empty"
+            ),
+        ):
+            self.module.semantic_searxng({}, "http://127.0.0.1:13004")
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_grafana_semantic_validates_exact_declarative_dashboard(self):
         calls = []
@@ -1456,8 +1458,8 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                     json.dumps(
                         {
                             "timestamp": self.module.utcnow(),
-                            "applyable": False,
-                            "complete": True,
+                            "applyable": None,
+                            "complete": None,
                             "errored": False,
                             "resource_changes": [
                                 {"change": {"actions": ["create"]}} for _ in range(29)
@@ -1481,6 +1483,130 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             ):
                 self.module.tofu_status({"CLOUDFLARE_API_TOKEN": "not-a-real-token"})
             self.assertFalse((iac / "acceptance-empty.tfplan").exists())
+
+    def test_tofu_gate_accepts_opentofu_null_metadata_only_for_empty_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            iac = base / "iac"
+            iac.mkdir()
+            (iac / "terraform.tfstate").write_text("{}")
+            (iac / "terraform.tfvars.json").write_text(
+                json.dumps({"base_domain": "example.test"})
+            )
+            api_env = base / "api.env"
+            api_env.write_text("CLOUDFLARE_API_TOKEN=not-a-real-token\n")
+            lock = base / "platform.lock.yaml"
+            lock.write_text(
+                "spec:\n  images:\n    openTofu: example/tofu@sha256:" + "1" * 64 + "\n"
+            )
+
+            def run(command, **_kwargs):
+                if "plan" in command:
+                    output = next(
+                        value.split("/workspace/", 1)[1]
+                        for value in command
+                        if value.startswith("-out=/workspace/")
+                    )
+                    (iac / output).write_bytes(b"fresh-opentofu-empty-plan")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps(
+                        {
+                            "format_version": "1.2",
+                            "terraform_version": "1.12.1",
+                            "timestamp": self.module.utcnow(),
+                            "applyable": None,
+                            "complete": None,
+                            "errored": False,
+                            "resource_changes": [{"change": {"actions": ["no-op"]}}],
+                            "resource_drift": [],
+                            "output_changes": {},
+                        }
+                    ),
+                    "",
+                )
+
+            with (
+                mock.patch.object(self.module, "iac_root", iac),
+                mock.patch.object(self.module, "api_env_path", api_env),
+                mock.patch.object(self.module, "lock_path", lock),
+                mock.patch.object(self.module, "exact_mode"),
+                mock.patch.object(self.module.subprocess, "run", side_effect=run),
+            ):
+                value = self.module.tofu_status(
+                    {"CLOUDFLARE_API_TOKEN": "not-a-real-token"}
+                )
+        self.assertIsNone(value["savedPlanApplyable"])
+        self.assertIsNone(value["savedPlanComplete"])
+        self.assertFalse(value["savedPlanErrored"])
+        self.assertEqual(value["savedPlanMetadataMode"], "opentofu-null-empty")
+        self.assertEqual(value["savedPlanActionCounts"]["no-op"], 1)
+
+    def test_saved_plan_metadata_rejects_ambiguous_mixed_null_state(self):
+        counts = {
+            "create": 0,
+            "update": 0,
+            "delete": 0,
+            "forget": 0,
+            "import": 0,
+            "read": 0,
+            "no-op": 0,
+        }
+        with self.assertRaisesRegex(
+            self.module.AcceptanceError, "opentofu_saved_plan_metadata_invalid"
+        ):
+            self.module.saved_plan_metadata(
+                {"applyable": None, "complete": True, "errored": False}, counts
+            )
+
+    def test_saved_plan_metadata_rejects_null_state_without_action_sections(self):
+        counts = {
+            "create": 0,
+            "update": 0,
+            "delete": 0,
+            "forget": 0,
+            "import": 0,
+            "read": 0,
+            "no-op": 0,
+        }
+        with self.assertRaisesRegex(
+            self.module.AcceptanceError, "opentofu_saved_plan_metadata_invalid"
+        ):
+            self.module.saved_plan_metadata(
+                {
+                    "format_version": "1.2",
+                    "terraform_version": "1.12.1",
+                    "applyable": None,
+                    "complete": None,
+                    "errored": False,
+                },
+                counts,
+            )
+
+    def test_saved_plan_metadata_rejects_missing_or_true_error_flag(self):
+        counts = {
+            "create": 0,
+            "update": 0,
+            "delete": 0,
+            "forget": 0,
+            "import": 0,
+            "read": 0,
+            "no-op": 0,
+        }
+        for errored in (None, True):
+            with (
+                self.subTest(errored=errored),
+                self.assertRaisesRegex(
+                    self.module.AcceptanceError,
+                    "opentofu_saved_plan_metadata_invalid",
+                ),
+            ):
+                self.module.saved_plan_metadata(
+                    {"applyable": None, "complete": None, "errored": errored},
+                    counts,
+                )
 
     def test_run_acceptance_emits_exact_connection_contract_and_hash_fields(self):
         source_hash = "1" * 64
@@ -1514,9 +1640,9 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 "accessClass": "human",
             },
         }
-        # Notion is external; the active Platform declarations govern the ten
+        # Notion is external; the active Platform declarations govern the nine
         # locally deployed edge applications without a parallel magic count.
-        self.assertEqual(len(apps), 10)
+        self.assertEqual(len(apps), 9)
         app_config = self.app_config(*apps)
         human = {
             cid: {
@@ -1599,24 +1725,55 @@ class CloudflareAcceptanceTests(unittest.TestCase):
             "dependencyEvidence": [],
             "anonymousDenied": True,
             "serviceTokenStatus": 200,
-            "controlledScrapeMarkerObserved": True,
+            "liveScrapeKnownDocumentObserved": True,
+            "liveScrapeMetadataStatus": 200,
+            "liveScrapeCacheBypassed": True,
         }
         inventory = {
+            "tunnelId": "00000000-0000-0000-0000-000000000001",
             "tunnelName": "mte-test",
             "tunnelHealthy": True,
             "connectorCount": 4,
-            "routes": {str(index): str(index) for index in range(10)},
-            "dnsRecordCount": 10,
-            "accessApplicationCount": 10,
+            "routes": {str(index): str(index) for index in range(9)},
+            "dnsRecordCount": 9,
+            "accessApplicationCount": 9,
             "accessPolicyCount": 2,
             "humanAccessPolicyScoped": True,
             "serviceAccessTokenScoped": True,
+            "desiredHostnamesReserved": True,
+            "dnsTargetTunnelBound": True,
+            "proxiedDnsOnly": True,
+            "originAddressRecordCount": 0,
             "foreign": [{}, {}],
+            "foreignRecordSetSha256": "8" * 64,
+        }
+        dns_reconcile = {
+            "dependencyEvidence": {
+                "path": "/opt/mte-platform/evidence/cloudflare-dns-reconcile.json",
+                "sha256": "8" * 64,
+            },
+            "batchApplied": True,
+            "batchDatabaseTransactionAtomic": True,
+            "edgePropagationAtomic": False,
+            "desiredHostnamesReserved": True,
+            "desiredRecordsExact": True,
+            "proxiedDnsOnly": True,
+            "originAddressRecordCount": 0,
+            "foreignRecordCount": 2,
+            "foreignRecordsPreserved": True,
+            "foreignRecordSetSha256": "8" * 64,
         }
         external = {
             "expectedHost": "198.51.100.10",
             "evidenceSha256": "2" * 64,
-            "externalPortsBlocked": {"80": True, "443": True, "3000": True},
+            "externalPortsBlocked": {
+                "80": True,
+                "443": True,
+                "2377": True,
+                "3000": True,
+                "7946": True,
+                "20241": True,
+            },
         }
         firewall = {
             "firewallV4Input": True,
@@ -1678,13 +1835,26 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                 },
             ),
             mock.patch.object(self.module, "app_rows", return_value=apps),
-            mock.patch.object(
+            mock.patch.multiple(
                 self.module,
-                "data_content_edge_contract",
-                return_value=data_content,
+                data_content_edge_contract=mock.Mock(return_value=data_content),
+                cloudflare_inventory=mock.Mock(return_value=inventory),
+                service_edge_checks=mock.Mock(
+                    return_value={
+                        "firecrawl": {
+                            "hostname": "firecrawl.example.test",
+                            "healthPath": "/",
+                            "anonymousDenied": True,
+                            "intendedTokenStatus": 200,
+                            "crossTokenDenied": True,
+                            "crossTokenRoute": "9router",
+                            "credentialValuesEmitted": False,
+                        }
+                    }
+                ),
             ),
             mock.patch.object(
-                self.module, "cloudflare_inventory", return_value=inventory
+                self.module, "dns_reconcile_status", return_value=dns_reconcile
             ),
             mock.patch.object(self.module, "human_rows", return_value=human),
             mock.patch.object(self.module, "firecrawl_row", return_value=firecrawl),
@@ -1720,9 +1890,15 @@ class CloudflareAcceptanceTests(unittest.TestCase):
                         "producerSha256": "d" * 64,
                     },
                     {
-                        "path": "/opt/mte-platform/evidence/notion-connector-verify.json",
+                        "path": "/opt/mte-platform/evidence/notion-projection-live-canary.json",
                         "sha256": "7" * 64,
-                        "kind": "NotionConnectorVerification",
+                        "kind": "NotionProjectionLiveCanary",
+                        "producerSha256": "e" * 64,
+                    },
+                    {
+                        "path": "/opt/mte-platform/evidence/notion-projection-consumer-verify.json",
+                        "sha256": "8" * 64,
+                        "kind": "NotionProjectionConsumerVerification",
                         "producerSha256": "e" * 64,
                     },
                 ],
@@ -1776,9 +1952,18 @@ class CloudflareAcceptanceTests(unittest.TestCase):
         )
         self.assertFalse(payload["connections"]["C029"]["cloudflareManaged"])
         self.assertFalse(payload["connections"]["C029"]["edgeGateApplicable"])
-        self.assertTrue(payload["connections"]["C029"]["notionConnectorVerified"])
-        self.assertEqual(len(payload["connections"]["C029"]["dependencyEvidence"]), 2)
+        self.assertTrue(
+            payload["connections"]["C029"]["notionProjectionConsumerVerified"]
+        )
+        self.assertEqual(len(payload["connections"]["C029"]["dependencyEvidence"]), 3)
         self.assertTrue(payload["connections"]["C046"]["dashboardProvisioned"])
+        self.assertTrue(payload["connections"]["C066"]["desiredRecordsExact"])
+        self.assertTrue(payload["connections"]["C066"]["foreignDnsPreserved"])
+        self.assertFalse(payload["connections"]["C066"]["edgePropagationAtomic"])
+        self.assertEqual(
+            payload["connections"]["C066"]["dependencyEvidence"],
+            [dns_reconcile["dependencyEvidence"]],
+        )
         self.assertEqual(payload["connections"]["C067"]["savedPlanSha256"], "c" * 64)
         for connection_id in ("C029", "C046", "C065", "C066", "C067"):
             self.assertEqual(

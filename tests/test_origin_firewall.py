@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import importlib.util
 import ipaddress
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "deployment/steps/91-origin-firewall.sh"
+SCRIPT = ROOT / "deployment/steps/origin-firewall.sh"
 
 
 def load_server_config():
@@ -38,6 +40,62 @@ class OriginFirewallShellContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_permission_mask_accepts_0600_and_rejects_0644_at_runtime(self) -> None:
+        function_source = self.source.split("\nrequire_root\nrequire_tools\n", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            functions = root / "origin-firewall-functions.sh"
+            functions.write_text(function_source)
+            config = root / "platform.env"
+            config.write_text("MTE_OPERATOR_SSH_CIDRS=203.0.113.0/24\n")
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_mode = fake_bin / "mode"
+            fake_stat = fake_bin / "stat"
+            fake_stat.write_text(
+                "#!/bin/sh\n"
+                "case $2 in\n"
+                "  %u) printf '0\\n' ;;\n"
+                "  %a) cat \"${0%/*}/mode\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n"
+            )
+            fake_stat.chmod(0o755)
+            environment = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            }
+
+            def normalized_cidrs(mode: int) -> subprocess.CompletedProcess[str]:
+                config.chmod(mode)
+                fake_mode.write_text(f"{mode:o}\n")
+                return subprocess.run(
+                    [
+                        "/bin/bash",
+                        "-c",
+                        'source "$1"; CONFIG="$2"; normalized_cidrs',
+                        "origin-firewall-test",
+                        str(functions),
+                        str(config),
+                    ],
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            secure = normalized_cidrs(0o600)
+            self.assertEqual(secure.returncode, 0, secure.stderr)
+            self.assertEqual(secure.stdout, "4\t203.0.113.0/24\n")
+
+            exposed = normalized_cidrs(0o644)
+            self.assertNotEqual(exposed.returncode, 0)
+            self.assertIn(
+                "canonical config must not be group/world accessible",
+                exposed.stderr,
+            )
+
     def test_ipv4_and_ipv6_cover_host_and_docker_tcp_and_udp(self) -> None:
         source = self.source
         self.assertIn('reconcile_family iptables 4 "$interface_v4"', source)
@@ -54,6 +112,57 @@ class OriginFirewallShellContractTests(unittest.TestCase):
         )
         self.assertNotIn("PORTS='80,443,3000'", source)
         self.assertNotIn("--dports", source)
+
+    def test_managed_rule_parser_runs_on_system_awk(self) -> None:
+        function_source = self.source.split("\nrequire_root\nrequire_tools\n", 1)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            functions = Path(temporary) / "origin-firewall-functions.sh"
+            functions.write_text(function_source)
+            completed = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    (
+                        'source "$1"; '
+                        "fake_tool() { printf '%s\\n' "
+                        "'-A INPUT -i eth0 -m comment --comment "
+                        'mte-origin-v2-input -j MTEOIabcdef123456\'; }; '
+                        "line=$(managed_jump_lines fake_tool INPUT "
+                        "mte-origin-v2-input); "
+                        'test "$(jump_target "$line")" = MTEOIabcdef123456'
+                    ),
+                    "origin-firewall-parser-test",
+                    str(functions),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_policy_recovers_after_docker_restart_and_periodic_drift(self) -> None:
+        self.assertIn("SELF='/usr/local/libexec/mte-origin-firewall'", self.source)
+        self.assertIn('install -o root -g root -m 0700 "$source_self"', self.source)
+        self.assertIn("PartOf=docker.service", self.source)
+        self.assertIn("ExecStart=$SELF recover", self.source)
+        self.assertIn("OnUnitInactiveSec=15s", self.source)
+        self.assertIn(
+            "systemctl enable --now mte-cloudflare-origin-firewall-recover.timer",
+            self.source,
+        )
+        self.assertIn('"firewallRecoveryTimerActive"', self.source)
+        self.assertIn('"firewallRecoveryTimerEnabled"', self.source)
+
+    def test_apply_releases_reconciliation_lock_before_systemd_restart(self) -> None:
+        apply_block = self.source.split("  apply)\n", 1)[1].split("    ;;", 1)[0]
+        self.assertLess(
+            apply_block.index("flock -u 9"),
+            apply_block.index("systemctl restart"),
+        )
+        self.assertLess(
+            apply_block.index("systemctl restart"),
+            apply_block.index("flock -x 9"),
+        )
 
     def test_ssh_allowlist_and_established_session_precede_default_deny(self) -> None:
         body = self.source.split("build_input_chain()", 1)[1].split(
@@ -85,6 +194,8 @@ class OriginFirewallShellContractTests(unittest.TestCase):
             "firewallPolicyVersion",
             "firewallServiceActive",
             "firewallServiceEnabled",
+            "firewallRecoveryTimerActive",
+            "firewallRecoveryTimerEnabled",
             "publicInterface",
             "operatorSshCidrsSha256",
             "firewallSshCidrCount",

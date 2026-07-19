@@ -1,0 +1,27 @@
+{
+  "providers": {
+    "mte9router": {
+      "api": "openai-completions",
+      "apiKey": "$OPENAI_API_KEY",
+      "baseUrl": "http://172.20.0.1:22080/v1",
+      "models": [
+        {
+          "contextWindow": 200000,
+          "cost": {
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "input": 0,
+            "output": 0
+          },
+          "id": "mte-minimax/MiniMax-M2.7-highspeed",
+          "input": [
+            "text"
+          ],
+          "maxTokens": 32768,
+          "name": "MTE MiniMax",
+          "reasoning": false
+        }
+      ]
+    }
+  }
+}

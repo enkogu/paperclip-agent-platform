@@ -25,10 +25,26 @@ from pathlib import Path
 
 import yaml
 
+
+_HARNESS_VERSION_PATTERNS = {
+    "codex": re.compile(r"(?:codex(?:-cli)?\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)"),
+    "claude": re.compile(
+        r"(?:claude\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)(?: \(Claude Code\))?"
+    ),
+    "pi": re.compile(r"(?:pi\s+)?v?([0-9]+\.[0-9]+\.[0-9]+)"),
+}
+
+
+def normalized_harness_version(name: str, output: object) -> str | None:
+    """Return the sole exact CLI semantic version, or fail closed."""
+    pattern = _HARNESS_VERSION_PATTERNS.get(name)
+    match = pattern.fullmatch(str(output or "").strip()) if pattern else None
+    return match.group(1) if match else None
+
 ROOT = Path(os.environ.get("MTE_PLATFORM_ROOT", "/opt/mte-platform"))
 SECRET_ROOT = Path(os.environ.get("MTE_SECRET_ROOT", "/root/.config/mte-secrets"))
 CONFIG = ROOT / "config/platform.json"
-CONNECTIONS = ROOT / "config/connections.yaml"
+ACCEPTANCE_REQUIREMENTS = ROOT / "config/acceptance-requirements.yaml"
 EVIDENCE = ROOT / "evidence"
 CANONICAL_ENV = SECRET_ROOT / "platform.env"
 PROJECTION_MANIFEST = SECRET_ROOT / "projections-manifest.json"
@@ -53,32 +69,26 @@ CONNECTION_CHECK_COMPONENTS = {
     "toolhive-mcp-initialize": "connection-C010",
     "hermes-native-terminal": "connection-C011",
     "toolhive-workload-canary": "connection-C012",
-    "activepieces-curated-tool": "connection-C013",
     "provision-paperclip": "connection-C014",
     "provision-9router": "connection-C015",
     "provision-toolhive": "connection-C016",
     "profile-llm-completion": "connection-C017",
     "harness-scoped-router-auth": "connection-C018",
     "profile-reconcile": "connection-C019",
-    "cloudflare-activepieces": "connection-C020",
-    "activepieces-oauth-callback": "connection-C021",
-    "activepieces-oauth-read-canary": "connection-C022",
     "firecrawl-scrape": "connection-C023",
     "searxng-json-search": "connection-C024",
     "cloudflare-searxng": "connection-C025",
     "cloudflare-firecrawl": "connection-C026",
     "paperclip-tables-api-scoped-token": "connection-C027",
-    "activepieces-tables-api-native-flow": "connection-C028",
     "data-content-persistence": "connection-C029",
     "mattermost-notification": "connection-C030",
     "hermes-mattermost-auth": "connection-C031",
     "cloudflare-mattermost": "connection-C032",
     "hermes-telegram-auth": "connection-C033",
     "hermes-platform-status": "connection-C034",
-    "hermes-host-operator": "connection-C035",
+    "hermes-host-operator-policy": "connection-C035",
     "provision-data-content": "connection-C036",
     "provision-mattermost": "connection-C037",
-    "provision-activepieces": "connection-C038",
     "provision-kestra": "connection-C039",
     "telemetry-canary": "connection-C040",
     "host-container-metrics": "connection-C041",
@@ -92,8 +102,6 @@ CONNECTION_CHECK_COMPONENTS = {
     "blackbox-probes": "connection-C049",
     "provision-grafana": "connection-C050",
     "host-preflight": "connection-C060",
-    "dokploy-api": "connection-C061",
-    "dokploy-compose-canary": "connection-C062",
     "postgres-ready-query": "connection-C063",
     "redis-auth-ping": "connection-C064",
     "tunnel-health": "connection-C065",
@@ -160,24 +168,6 @@ CONNECTION_CONTRACT_EXPECTATIONS = {
         "exposure": "internal",
         "check": "harness-scoped-router-auth",
     },
-    "C021": {
-        "from": "saas-provider",
-        "to": "activepieces-callback",
-        "required": True,
-        "condition": "external-provider-consent",
-        "auth": "oauth-state-pkce",
-        "exposure": "webhook",
-        "check": "activepieces-oauth-callback",
-    },
-    "C022": {
-        "from": "activepieces",
-        "to": "saas-api",
-        "required": True,
-        "condition": "external-provider-consent",
-        "auth": "encrypted-oauth-connection",
-        "exposure": "egress",
-        "check": "activepieces-oauth-read-canary",
-    },
     "C033": {
         "from": "telegram",
         "to": "hermes",
@@ -207,9 +197,9 @@ CONNECTION_CONTRACT_EXPECTATIONS = {
         "from": "hermes",
         "to": "platform-host",
         "required": True,
-        "auth": "explicit-unrestricted-sudo",
+        "auth": "declared-operator-mode",
         "exposure": "none",
-        "check": "hermes-host-operator",
+        "check": "hermes-host-operator-policy",
     },
     "C069": {
         "from": "indexed-deploy",
@@ -314,6 +304,10 @@ NATIVE_HARNESS_PROFILES = (
     "coding-daytona-claude",
     "coding-daytona-pi",
 )
+# R1 treats the three installed native clients as independent paths: the
+# routing protocol differs for Codex, Claude Code, and Pi even though every
+# profile terminates at the same MiniMax provider through 9router.
+R1_E2E_HARNESS_PROFILES = NATIVE_HARNESS_PROFILES
 ACCOUNT_PROFILE_ENV_KEYS = {
     "coding-daytona-codex": frozenset(
         {
@@ -366,6 +360,7 @@ ACCOUNT_PROFILE_ENV_KEYS = {
 }
 E2E_EVIDENCE = ROOT / "evidence/kestra-paperclip-github-e2e.json"
 E2E_VERIFY_EVIDENCE = ROOT / "evidence/kestra-paperclip-github-e2e-verify.json"
+E2E_PORTABLE_BUNDLE = ROOT / "evidence/kestra-paperclip-github-e2e-bundle.json"
 INTEGRATION_EVIDENCE = ROOT / "evidence/integration-canaries.json"
 C029_INTEGRATION_EVIDENCE = ROOT / "evidence/integration-canary-C029.json"
 HERMES_EVIDENCE = ROOT / "evidence/hermes-live.json"
@@ -386,7 +381,6 @@ CLOUDFLARE_SEMANTIC_EVIDENCE = ROOT / "evidence/cloudflare-app-semantics.json"
 CLOUDFLARE_SPLIT_CONNECTION_IDS = (
     "C004",
     "C005",
-    "C020",
     "C025",
     "C026",
     "C032",
@@ -395,15 +389,13 @@ CLOUDFLARE_CONNECTION_EVIDENCE = {
     connection_id: ROOT / f"evidence/cloudflare-connection-{connection_id}.json"
     for connection_id in CLOUDFLARE_SPLIT_CONNECTION_IDS
 }
-BASEROW_VERIFY_EVIDENCE = ROOT / "evidence/baserow-verify.json"
-WIKIJS_VERIFY_EVIDENCE = ROOT / "evidence/wikijs-verify.json"
 POSTGREST_VERIFY_EVIDENCE = ROOT / "evidence/postgrest-verify.json"
-NOCODB_VERIFY_EVIDENCE = ROOT / "evidence/nocodb-verify.json"
 NOTION_VERIFY_EVIDENCE = ROOT / "evidence/notion-connector-verify.json"
 SERVER_NOTION_SOURCE = ROOT / "bin/server-notion.py"
 NOTION_PROJECTION_VERIFY_EVIDENCE = (
     ROOT / "evidence/notion-projection-consumer-verify.json"
 )
+NOTION_PROJECTION_CANARY_EVIDENCE = ROOT / "evidence/notion-projection-live-canary.json"
 SERVER_NOTION_PROJECTION_SOURCE = ROOT / "bin/server-notion-sync.py"
 SERVER_CLOUDFLARE_ACCEPTANCE_SOURCE = ROOT / "bin/server-cloudflare-acceptance.py"
 PAPERCLIP_DAYTONA_CONTROL_PLANE_EVIDENCE = (
@@ -412,28 +404,21 @@ PAPERCLIP_DAYTONA_CONTROL_PLANE_EVIDENCE = (
 PAPERCLIP_DAYTONA_VERIFY_EVIDENCE = ROOT / "evidence/paperclip-daytona-verify.json"
 DAYTONA_IMAGES_EVIDENCE = ROOT / "evidence/daytona-images.json"
 DAYTONA_LIFECYCLE_EVIDENCE = ROOT / "evidence/daytona-lifecycle.json"
-HOST_DOKPLOY_EVIDENCE = ROOT / "evidence/host-dokploy-acceptance.json"
-SERVER_HOST_DOKPLOY_SOURCE = ROOT / "bin/server-host-dokploy-acceptance.py"
 PROFILE_RECONCILE_EVIDENCE = ROOT / "evidence/profile-reconcile.json"
 PROFILE_ACCESS_EVIDENCE = ROOT / "evidence/profile-access.json"
 SERVER_PROFILE_RECONCILE_SOURCE = ROOT / "bin/server-profile-reconcile.py"
 KESTRA_RECONCILE_VERIFY_EVIDENCE = ROOT / "evidence/kestra-reconcile-verify.json"
 SERVER_KESTRA_RECONCILE_SOURCE = ROOT / "bin/server-kestra-reconcile.py"
-ACTIVEPIECES_PROVISION_EVIDENCE = ROOT / "evidence/provision-activepieces.json"
-SERVER_ACTIVEPIECES_PROVISION_SOURCE = (
-    ROOT / "bin/server-activepieces-provision-verify.py"
-)
 ACCOUNT_PROVISION_VERIFY_EVIDENCE = ROOT / "evidence/account-provisioning-verify.json"
 SERVER_CONFIG_SOURCE = ROOT / "bin/server-config.py"
 SERVER_PROVISION_SOURCE = ROOT / "bin/server-provision.py"
 SERVER_TOOLHIVE_SOURCE = ROOT / "bin/server-toolhive.py"
-SERVER_DOKPLOY_SOURCE = ROOT / "bin/server-dokploy.py"
 SERVER_OBSERVABILITY_SOURCE = ROOT / "bin/server-observability-canary.py"
 SERVER_INTEGRATION_SOURCE = ROOT / "bin/server-integration-canaries.py"
 SERVER_E2E_SOURCE = ROOT / "bin/server-e2e-canary.py"
 SERVER_AGENT_GATEWAY_SOURCE = ROOT / "bin/agent-plane-gateway.py"
 SERVER_PAPERCLIP_EXPERIMENTAL_SOURCE = ROOT / "bin/server-paperclip-experimental.py"
-PAPERCLIP_DAYTONA_STEP_SOURCE = ROOT / "steps/60-daytona.sh"
+PAPERCLIP_DAYTONA_STEP_SOURCE = ROOT / "steps/daytona.sh"
 CONNECTION_EVIDENCE_MAX_AGE_SECONDS = 600
 E2E_PROFILE_SOURCE = ROOT / "templates/profiles/profiles.yaml"
 E2E_PROFILES = ROOT / "runtime/profiles/profiles.yaml"
@@ -443,7 +428,7 @@ E2E_SOURCE_PATHS = {
     "flowSha256": ROOT / "manifests/kestra/flows/paperclip-github-e2e.yaml",
     "profileSourceSha256": E2E_PROFILE_SOURCE,
     "profilesSha256": E2E_PROFILES,
-    "paperclipRuntimeSha256": ROOT / "steps/50-paperclip.sh",
+    "paperclipRuntimeSha256": ROOT / "steps/paperclip.sh",
     "daytonaEvidenceSha256": PAPERCLIP_DAYTONA_CONTROL_PLANE_EVIDENCE,
     "runnerSha256": SERVER_E2E_SOURCE,
 }
@@ -470,11 +455,9 @@ STRUCTURAL_ENV_DEFAULT_KEYS = {
     "MTE_PAPERCLIP_CONTAINER",
 }
 DOMAIN_ALIAS_KEYS = {"PLATFORM_DOMAIN", "CLOUDFLARE_BASE_DOMAIN", "MTE_DOMAIN"}
-BANNED_SECRET_SIDECAR_NAMES = ("dokploy" + "-api.env",)
 DOMAIN_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 LOCK_TOP_LEVEL_KEYS = {"apiVersion", "kind", "metadata", "spec"}
 LOCK_SPEC_VERSION_KEYS = {
-    "dokploy",
     "paperclip",
     "kestra",
     "9router",
@@ -489,11 +472,7 @@ LOCK_IMAGE_KEYS = {
     "cloudflared",
     "mcpEverything",
     "postgres",
-    "activepieces",
-    "baserow",
-    "wikijs",
     "postgrest",
-    "nocodb",
     "searxng",
 }
 BOOTSTRAP_LITERAL_ASSIGNMENTS = {
@@ -502,8 +481,16 @@ BOOTSTRAP_LITERAL_ASSIGNMENTS = {
     "ONE_TIME_MIGRATION_SEEDS",
 }
 STRUCTURAL_LITERAL_ASSIGNMENTS = {
+    "HERMES_NATIVE_ENV_NAMES",
     "PUBLIC_URL_PROJECTIONS",
     "PUBLIC_COMPONENT_SUBDOMAINS",
+}
+# This reviewed table is compatibility metadata used only to recognize the
+# former nested-default Compose projection during its one-way migration. It is
+# deliberately separate from bootstrap and structural defaults: no runtime
+# setting may use this exemption.
+COMPATIBILITY_MIGRATION_METADATA_ASSIGNMENTS = {
+    "REVIEWED_LEGACY_COMPOSE_VALUE_MIGRATIONS",
 }
 TEST_FIXTURE_LITERAL_ASSIGNMENTS = {
     "FRESH_INSTALL_EXTERNAL_FIXTURES",
@@ -511,19 +498,26 @@ TEST_FIXTURE_LITERAL_ASSIGNMENTS = {
     "FRESH_INSTALL_OPERATOR_CONFIG_FIXTURES",
     "FRESH_INSTALL_PATH_REPLACEMENTS",
 }
-TEST_ONLY_SCRIPT_DEFAULT_KEYS = {
-    "tools/platform-cli/start-paperclip.sh": {"PAPERCLIP_DATA_DIR", "PAPERCLIP_BIND"},
+IMMUTABLE_STRUCTURAL_ENV_DEFAULT_KEYS = {
+    # These are values reported by /etc/os-release. They select the supported
+    # Ubuntu bootstrap branch and are not platform runtime configuration.
+    "deployment/steps/host.sh": {"ID", "UBUNTU_CODENAME"},
+    # The release gate's private scratch directory is an execution location,
+    # not an operator-controlled platform setting.
+    "tools/platform-cli/release-check.sh": {"TMPDIR"},
 }
 IMMUTABLE_GLOBAL_CONSTANTS = {
+    "deployment/steps/origin-firewall.sh": {"POLICY_VERSION"},
     "tools/platform-cli/server-config.py": {"GENERATOR_VERSION"},
-    "tools/platform-cli/server-deploy-transaction.py": {"API_VERSION"},
-    "tools/platform-cli/server-dokploy.py": {"CONFIG_GENERATOR_VERSION"},
+    "tools/platform-cli/server-hermes.py": {
+        "CONTEXT7_MCP_PROTOCOL_VERSION",
+        "CONTEXT7_MCP_URL",
+    },
     "tools/platform-cli/server-kestra-reconcile.py": {"API_VERSION"},
     "tools/platform-cli/server-observability-canary.py": {
         "GENERATOR_VERSION",
         "OBSERVABILITY_EVIDENCE_SCHEMA_VERSION",
     },
-    "tools/platform-cli/server-host-dokploy-acceptance.py": {"GENERATOR_VERSION"},
     "tools/platform-cli/server-paperclip-experimental.py": {"API_VERSION"},
     "tools/platform-cli/server-notion.py": {
         "OFFICIAL_NOTION_BASE_URL",
@@ -534,6 +528,10 @@ IMMUTABLE_GLOBAL_CONSTANTS = {
         "NOTION_API_VERSION",
         "TOOLHIVE_RUNTIME_HOST",
     },
+    "tools/platform-cli/server-toolhive.py": {
+        "TCP_PING_URL",
+        "UNIX_DOCKER_HOST",
+    },
 }
 LEGACY_PROJECTION_REGISTRY_OWNERS = {
     "activepieces-admin.env": "activepieces",
@@ -541,13 +539,7 @@ LEGACY_PROJECTION_REGISTRY_OWNERS = {
     "orloj.env": "orloj",
 }
 INACTIVE_PROFILE_KEY_PREFIXES = {
-    "postgres-notion": ("BASEROW_", "WIKIJS_", "NOCODB_", "NOCODOCS_"),
-    "baserow-wikijs": ("NOTION_", "NOCODB_", "NOCODOCS_"),
-    "postgres-postgrest-nocodb-nocodocs": (
-        "NOTION_",
-        "BASEROW_",
-        "WIKIJS_",
-    ),
+    "postgres-notion": (),
 }
 LEGACY_ALIAS_MAPPING = {
     "MTE_DOMAIN": "PLATFORM_BASE_DOMAIN",
@@ -557,23 +549,38 @@ LEGACY_ALIAS_MAPPING = {
     "MINIMAX_OPENAI_ENDPOINT": "MINIMAX_BASE_URL",
     "PRIN7R_NOTION_TOKEN": "NOTION_TOKEN",
     "PRIN7R_NOTION_API_KEY": "NOTION_TOKEN",
-    "NOCODB_DB_USER": "POSTGRES_ADMIN_USER",
-    "NOCODB_DB_PASSWORD": "POSTGRES_ADMIN_PASSWORD",
-    "NOCODB_DB_NAME": "POSTGRES_ADMIN_DB",
 }
 COMPOSE_DERIVED_KEYS = {
-    "BASEROW_PUBLIC_URL",
-    "BASEROW_DATABASE_URL",
-    "BASEROW_REDIS_URL",
+    # These values are generated into canonical platform.env from host/port
+    # sources. Keeping them out of the bootstrap seed catalog preserves one
+    # source of truth for URLs while allowing Compose to consume them.
+    "NINEROUTER_HEALTH_URL",
+    "KESTRA_HEALTH_URL",
+    "PAPERCLIP_HEALTH_URL",
+    "TOOLHIVE_HEALTH_URL",
+    "MATTERMOST_HEALTH_URL",
+    "SEARXNG_HEALTH_URL",
+    "FIRECRAWL_HEALTH_URL",
+    "OBSERVABILITY_HEALTH_URL",
+    "MTE_DAYTONA_DASHBOARD_BASE_API_URL",
+    "MTE_DAYTONA_DASHBOARD_URL",
+    "MTE_DAYTONA_DEFAULT_RUNNER_DOMAIN",
+    "MTE_DAYTONA_INTERNAL_API_URL",
+    "MTE_DAYTONA_INTERNAL_OIDC_URL",
+    "MTE_DAYTONA_INTERNAL_REGISTRY_URL",
+    "MTE_DAYTONA_INTERNAL_RUNNER_URL",
+    "MTE_DAYTONA_MINIO_ENDPOINT_URL",
+    "MTE_DAYTONA_MINIO_STS_ENDPOINT_URL",
+    "MTE_DAYTONA_PROXY_DOMAIN",
+    "MTE_DAYTONA_PROXY_TEMPLATE_URL",
+    "MTE_DAYTONA_PUBLIC_OIDC_URL",
+    "MTE_DAYTONA_SSH_GATEWAY_URL",
     "MATTERMOST_SITE_URL",
-    "AP_FRONTEND_URL",
     "SEARXNG_BASE_URL",
-    "AP_REDIS_URL",
     "FIRECRAWL_REDIS_URL",
-    "NOCODB_META_DSN",
-    "NOCODB_PUBLIC_URL",
     "SEARXNG_VALKEY_URL",
 }
+OPTIONAL_CANONICAL_COMPOSE_DEFAULTS = {"MATTERMOST_ALERT_WEBHOOK_URL"}
 SENSITIVE_SEED_KEY_PATTERN = re.compile(
     r"(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|ENCRYPT|JWT|SALT|"
     r"COOKIE|CREDENTIAL|AUTH|WEBHOOK|CONNECTION_STRING)",
@@ -738,6 +745,7 @@ def compose_seed_catalog_findings(root: Path) -> list[dict]:
             ENV_REF_PATTERN.findall(compose_path.read_text(errors="ignore"))
         )
     general_seed_keys: set[str] = set()
+    post_render_keys: set[str] = set()
     for config_source in (
         root / "tools/platform-cli/server-config.py",
         root / "bin/server-config.py",
@@ -752,20 +760,30 @@ def compose_seed_catalog_findings(root: Path) -> list[dict]:
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if not any(
-                isinstance(target, ast.Name) and target.id == "ONE_TIME_MIGRATION_SEEDS"
-                for target in targets
-            ):
-                continue
-            if isinstance(node.value, ast.Dict):
+            names = {
+                target.id for target in targets if isinstance(target, ast.Name)
+            }
+            if "ONE_TIME_MIGRATION_SEEDS" in names and isinstance(node.value, ast.Dict):
                 general_seed_keys.update(
                     str(key.value)
                     for key in node.value.keys
                     if isinstance(key, ast.Constant) and isinstance(key.value, str)
                 )
+            if "POST_RENDER_PROVISIONED_KEYS" in names and isinstance(
+                node.value, (ast.Set, ast.Tuple, ast.List)
+            ):
+                post_render_keys.update(
+                    str(item.value)
+                    for item in node.value.elts
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                )
         break
     expected = (
-        compose_required - component_secrets - COMPOSE_DERIVED_KEYS - general_seed_keys
+        compose_required
+        - component_secrets
+        - COMPOSE_DERIVED_KEYS
+        - general_seed_keys
+        - post_render_keys
     )
     actual = {str(key) for key in raw_seeds}
     if expected != actual:
@@ -970,7 +988,17 @@ def sha256(path: Path) -> str:
 def dotenv(path: Path) -> tuple[dict[str, str], list[dict]]:
     values: dict[str, str] = {}
     findings: list[dict] = []
-    for line_number, line in enumerate(path.read_text().splitlines(), 1):
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        return values, [
+            {
+                "finding": "dotenv_unreadable",
+                "path": str(path),
+                "error": type(exc).__name__,
+            }
+        ]
+    for line_number, line in enumerate(lines, 1):
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -1235,11 +1263,110 @@ def required_config_keys(root: Path) -> set[str]:
     return keys
 
 
+def canonical_compose_environment_value(value: object) -> bool:
+    """Accept a direct canonical ref or an endpoint composed only from refs."""
+    text = str(value)
+    if re.fullmatch(r"\$\{[A-Z][A-Z0-9_]*:\?[^}]*\}", text):
+        return True
+    if re.fullmatch(r"\$\{MATTERMOST_ALERT_WEBHOOK_URL:-\}", text):
+        return True
+    refs = ENV_REF_PATTERN.findall(text)
+    remainder = ENV_REF_PATTERN.sub("", text)
+    return bool(refs) and remainder in {"http://", "https://", "http://:", "https://:"}
+
+
+def hash_governed_generated_projections(root: Path) -> set[Path]:
+    """Return generated runtime JSON files proven by the canonical manifest.
+
+    A self-declared ``_generated`` marker is not sufficient: the path, source
+    hash, generator version, content hash, and restrictive mode must all match
+    the registered projection.  The allowlist is intentionally limited to the
+    two JSON runtime projections that legitimately contain resolved domains.
+    """
+
+    allowed = {
+        root / "config/platform.json",
+        root / "config/public-urls.json",
+    }
+    if (
+        not CANONICAL_ENV.is_file()
+        or CANONICAL_ENV.is_symlink()
+        or not PROJECTION_MANIFEST.is_file()
+        or PROJECTION_MANIFEST.is_symlink()
+    ):
+        return set()
+    try:
+        source_hash = sha256(CANONICAL_ENV)
+        manifest = json.loads(PROJECTION_MANIFEST.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(manifest, dict):
+        return set()
+    generator = str(manifest.get("generatorVersion") or "")
+    if manifest.get("sourceSha256") != source_hash or not generator:
+        return set()
+    rows = manifest.get("projections")
+    if not isinstance(rows, list):
+        return set()
+
+    governed: set[Path] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        path = Path(str(row.get("path") or ""))
+        if (
+            path not in allowed
+            or not path.is_file()
+            or path.is_symlink()
+            or path.stat().st_mode & 0o777 != 0o600
+            or row.get("sourceSha256") != source_hash
+            or row.get("generatorVersion") != generator
+            or row.get("contentSha256") != sha256(path)
+        ):
+            continue
+        try:
+            document = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        generated = document.get("_generated") if isinstance(document, dict) else None
+        if not isinstance(generated, dict):
+            continue
+        if (
+            generated.get("doNotEdit") is True
+            and generated.get("sourceSha256") == source_hash
+            and generated.get("generatorVersion") == generator
+        ):
+            governed.add(path)
+    return governed
+
+
 def static_config_findings(
     root: Path, canonical_base_domain: str | None = None
 ) -> list[dict]:
     """Reject duplicated defaults and mutable values outside platform.env."""
     findings: list[dict] = []
+    declared_component_secrets: set[str] = set()
+    platform_source = reviewed_platform_source(root)
+    if platform_source.is_file():
+        try:
+            platform_document = (
+                json.loads(platform_source.read_text())
+                if platform_source.suffix == ".json"
+                else yaml.safe_load(platform_source.read_text())
+            )
+        except (OSError, json.JSONDecodeError, yaml.YAMLError):
+            platform_document = {}
+        components = (
+            platform_document.get("spec", {}).get("components", [])
+            if isinstance(platform_document, dict)
+            else []
+        )
+        for component in components if isinstance(components, list) else []:
+            if isinstance(component, dict):
+                declared_component_secrets.update(
+                    str(key) for key in component.get("secrets", [])
+                )
+    governed_projections = hash_governed_generated_projections(root)
     findings.extend(configuration_writer_findings(root))
     if reviewed_platform_source(root).is_file():
         findings.extend(compose_seed_catalog_findings(root))
@@ -1257,13 +1384,14 @@ def static_config_findings(
             # hashes below. Their rendered literals are not parallel sources.
             continue
         for match in ENV_DEFAULT_PATTERN.finditer(raw):
-            findings.append(
-                {
-                    "finding": "configurable_default_outside_canonical",
-                    "path": relative,
-                    "key": match.group(1),
-                }
-            )
+            if match.group(1) not in OPTIONAL_CANONICAL_COMPOSE_DEFAULTS:
+                findings.append(
+                    {
+                        "finding": "configurable_default_outside_canonical",
+                        "path": relative,
+                        "key": match.group(1),
+                    }
+                )
         try:
             document = yaml.safe_load(raw)
         except yaml.YAMLError:
@@ -1304,9 +1432,9 @@ def static_config_findings(
             environment = service.get("environment", {})
             if isinstance(environment, dict):
                 for key, value in environment.items():
-                    if MUTABLE_KEY_PATTERN.search(str(key)) and not re.fullmatch(
-                        r"\$\{[A-Z][A-Z0-9_]*:\?[^}]*\}", str(value)
-                    ):
+                    if MUTABLE_KEY_PATTERN.search(
+                        str(key)
+                    ) and not canonical_compose_environment_value(value):
                         findings.append(
                             {
                                 "finding": "literal_environment_value_outside_canonical",
@@ -1332,8 +1460,7 @@ def static_config_findings(
             )
         except (json.JSONDecodeError, yaml.YAMLError):
             continue
-        generated = document.get("_generated") if isinstance(document, dict) else None
-        if isinstance(generated, dict) and generated.get("doNotEdit") is True:
+        if path in governed_projections:
             continue
 
         def visit(value, location: str, mutable_context: bool = False) -> None:
@@ -1344,7 +1471,17 @@ def static_config_findings(
                         mutable_context
                         or key_text in {"images", "harnesses", "versions", "limits"}
                         or key_text.lower()
-                        in {"ssh", "enabled", "baseurl", "origin", "url", "tunnelname"}
+                        in {
+                            "ssh",
+                            "enabled",
+                            "baseurl",
+                            "origin",
+                            "url",
+                            "tunnelname",
+                            "githubowner",
+                            "githubrepository",
+                            "basebranch",
+                        }
                         or MUTABLE_KEY_PATTERN.search(key_text) is not None
                     )
                     if key_text.endswith("Ref") or key_text == "operatorMode":
@@ -1424,16 +1561,6 @@ def static_config_findings(
         for line_number, line in enumerate(
             path.read_text(errors="ignore").splitlines(), 1
         ):
-            for sidecar in BANNED_SECRET_SIDECAR_NAMES:
-                if sidecar in line:
-                    findings.append(
-                        {
-                            "finding": "standalone_secret_sidecar_forbidden",
-                            "path": relative,
-                            "line": line_number,
-                            "sidecar": sidecar,
-                        }
-                    )
             for alias in DOMAIN_ALIAS_KEYS:
                 if not re.search(rf"\b{re.escape(alias)}\b", line):
                     continue
@@ -1448,9 +1575,12 @@ def static_config_findings(
                     relative == "tools/platform-cli/server-verify.py"
                     and line.lstrip().startswith("DOMAIN_ALIAS_KEYS =")
                 )
-                policy_mapping = relative == "tools/platform-cli/server-verify.py" and re.search(
-                    rf"['\"]{re.escape(alias)}['\"]\s*:\s*['\"]PLATFORM_BASE_DOMAIN['\"]",
-                    line,
+                policy_mapping = (
+                    relative == "tools/platform-cli/server-verify.py"
+                    and re.search(
+                        rf"['\"]{re.escape(alias)}['\"]\s*:\s*['\"]PLATFORM_BASE_DOMAIN['\"]",
+                        line,
+                    )
                 )
                 if not (migration_mapping or policy_declaration or policy_mapping):
                     findings.append(
@@ -1461,7 +1591,11 @@ def static_config_findings(
                             "alias": alias,
                         }
                     )
-            if canonical_base_domain and canonical_base_domain in line:
+            if (
+                canonical_base_domain
+                and canonical_base_domain in line
+                and path not in governed_projections
+            ):
                 findings.append(
                     {
                         "finding": "hardcoded_base_domain_outside_canonical_source",
@@ -1470,7 +1604,7 @@ def static_config_findings(
                     }
                 )
 
-    script_roots = [root / "tools/platform-cli"]
+    script_roots = [root / "tools/platform-cli", root / "deployment/steps"]
     for base in script_roots:
         if not base.exists():
             continue
@@ -1479,8 +1613,52 @@ def static_config_findings(
                 continue
             relative = str(path.relative_to(root))
             raw = path.read_text(errors="ignore")
+            compatibility_migration_metadata_lines: set[int] = set()
+            if path.suffix == ".py" and relative == "tools/platform-cli/server-config.py":
+                try:
+                    source_tree = ast.parse(raw)
+                except SyntaxError:
+                    source_tree = None
+                if source_tree is not None:
+                    for assignment in ast.walk(source_tree):
+                        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)):
+                            continue
+                        targets = (
+                            assignment.targets
+                            if isinstance(assignment, ast.Assign)
+                            else [assignment.target]
+                        )
+                        names = {
+                            target.id
+                            for target in targets
+                            if isinstance(target, ast.Name)
+                        }
+                        value = assignment.value
+                        if (
+                            names == COMPATIBILITY_MIGRATION_METADATA_ASSIGNMENTS
+                            and isinstance(value, ast.Dict)
+                        ):
+                            compatibility_migration_metadata_lines.update(
+                                range(value.lineno, value.end_lineno + 1)
+                            )
+            if relative == "deployment/steps/daytona.sh":
+                for assignment in ("defaults", "profile_defaults"):
+                    match = re.search(rf"^\s*{assignment}\s*=\s*\{{", raw, re.MULTILINE)
+                    if match:
+                        findings.append(
+                            {
+                                "finding": "deployment_step_config_catalog_outside_canonical",
+                                "path": relative,
+                                "assignment": assignment,
+                                "line": raw[: match.start()].count("\n") + 1,
+                            }
+                        )
             for match in ENV_DEFAULT_PATTERN.finditer(raw):
-                if match.group(1) in TEST_ONLY_SCRIPT_DEFAULT_KEYS.get(relative, set()):
+                if match.group(1) in IMMUTABLE_STRUCTURAL_ENV_DEFAULT_KEYS.get(
+                    relative, set()
+                ) or raw[: match.start()].count("\n") + 1 in (
+                    compatibility_migration_metadata_lines
+                ):
                     continue
                 findings.append(
                     {
@@ -1501,14 +1679,25 @@ def static_config_findings(
                             "key": match.group(1),
                         }
                     )
+            assignment_key = (
+                r"(?:[A-Z][A-Z0-9_]*_)?(?:PORT|URL|URI|HOST|DOMAIN|ENDPOINT|"
+                r"IMAGE|VERSION|LIMIT|ENABLED|NAME)"
+                if relative.startswith("deployment/steps/")
+                else r"[A-Z][A-Z0-9_]*(?:PORT|URL|URI|HOST|DOMAIN|ENDPOINT|IMAGE|VERSION|LIMIT|ENABLED)"
+            )
             for match in re.finditer(
-                r"^\s*([A-Z][A-Z0-9_]*(?:PORT|URL|URI|HOST|DOMAIN|ENDPOINT|IMAGE|VERSION|LIMIT|ENABLED))\s*=\s*(?!os\.environ)(?!None\b)(?:['\"][^'\"]+['\"]|[0-9][^\n#]*)",
+                rf"^\s*({assignment_key})\s*=\s*((?!os\.environ)(?!None\b)(?:['\"][^'\"]+['\"]|[0-9][^\n#]*))",
                 raw,
                 re.MULTILINE,
             ):
-                if match.group(1) in TEST_ONLY_SCRIPT_DEFAULT_KEYS.get(relative, set()):
-                    continue
                 if match.group(1) in IMMUTABLE_GLOBAL_CONSTANTS.get(relative, set()):
+                    continue
+                if re.fullmatch(
+                    r"['\"]\$(?:[A-Z][A-Z0-9_]*|\{[A-Z][A-Z0-9_]*\})['\"]",
+                    match.group(2),
+                ):
+                    # A command-scoped export of a value already read from the
+                    # canonical source is a consumer, not another default.
                     continue
                 findings.append(
                     {
@@ -1539,6 +1728,15 @@ def static_config_findings(
                         continue
                     if relative == "tools/platform-cli/server-config.py" and names & (
                         BOOTSTRAP_LITERAL_ASSIGNMENTS | STRUCTURAL_LITERAL_ASSIGNMENTS
+                    ):
+                        allowed_dicts.update(
+                            id(nested)
+                            for nested in ast.walk(value)
+                            if isinstance(nested, ast.Dict)
+                        )
+                    if (
+                        relative == "tools/platform-cli/server-config.py"
+                        and names == COMPATIBILITY_MIGRATION_METADATA_ASSIGNMENTS
                     ):
                         allowed_dicts.update(
                             id(nested)
@@ -1668,6 +1866,49 @@ def static_config_findings(
                             return derived_expression(function.value)
                     return False
 
+                def generated_secret_expression(value_node: ast.AST) -> bool:
+                    """Recognize secret material built only by a CSPRNG call.
+
+                    Prefixing generated material (for example, an API-key type
+                    marker) remains generation, not a configurable default.
+                    The caller additionally requires the key to be declared as
+                    a component secret in the reviewed platform manifest.
+                    """
+                    if isinstance(value_node, ast.Call):
+                        function = value_node.func
+                        name = (
+                            function.id
+                            if isinstance(function, ast.Name)
+                            else (
+                                function.attr
+                                if isinstance(function, ast.Attribute)
+                                else ""
+                            )
+                        )
+                        return name in {
+                            "token",
+                            "token_hex",
+                            "token_urlsafe",
+                            "password",
+                        }
+                    if isinstance(value_node, ast.BinOp) and isinstance(
+                        value_node.op, ast.Add
+                    ):
+                        left_constant = isinstance(
+                            value_node.left, ast.Constant
+                        ) and isinstance(value_node.left.value, str)
+                        right_constant = isinstance(
+                            value_node.right, ast.Constant
+                        ) and isinstance(value_node.right.value, str)
+                        return (
+                            left_constant
+                            and generated_secret_expression(value_node.right)
+                        ) or (
+                            right_constant
+                            and generated_secret_expression(value_node.left)
+                        )
+                    return False
+
                 for node in ast.walk(tree):
                     if not isinstance(node, ast.Dict):
                         continue
@@ -1683,24 +1924,9 @@ def static_config_findings(
                             r"[A-Z][A-Z0-9_]*", key
                         ) or not CONFIG_KEY_PATTERN.search(key):
                             continue
-                        generated_secret = False
-                        if isinstance(value_node, ast.Call):
-                            function = value_node.func
-                            name = (
-                                function.id
-                                if isinstance(function, ast.Name)
-                                else (
-                                    function.attr
-                                    if isinstance(function, ast.Attribute)
-                                    else ""
-                                )
-                            )
-                            generated_secret = name in {
-                                "token",
-                                "token_hex",
-                                "token_urlsafe",
-                                "password",
-                            }
+                        generated_secret = generated_secret_expression(value_node)
+                        if generated_secret and not isinstance(value_node, ast.Call):
+                            generated_secret = key in declared_component_secrets
                         source_reference = derived_expression(value_node)
                         structural_metadata = isinstance(
                             value_node, (ast.Tuple, ast.List)
@@ -1793,7 +2019,8 @@ def configuration_writer_findings(root: Path) -> list[dict]:
                         if re.search(r"platform\.env(?:['\"]|\s*$)", expression):
                             canonical.update(names)
                         if ".env" in expression and re.search(
-                            r"(?:services|integrations|[-_]admin\.env|[-_]api\.env)",
+                            r"(?:services|integrations|[-_]admin\.env|[-_]api\.env|"
+                            r"hermes[-_]runtime\.env)",
                             expression,
                         ):
                             projections.update(names)
@@ -1910,7 +2137,10 @@ def configuration_writer_findings(root: Path) -> list[dict]:
                         "lines": sorted(set(canonical_mutations)),
                     }
                 )
-            if projection_mutations and relative != "tools/platform-cli/server-config.py":
+            if (
+                projection_mutations
+                and relative != "tools/platform-cli/server-config.py"
+            ):
                 findings.append(
                     {
                         "finding": "projection_write_outside_renderer",
@@ -1997,14 +2227,6 @@ def data_content_projection_findings(
         if not isinstance(config_source, dict) or not isinstance(lock, dict):
             raise ValueError("reviewed inputs must be objects")
         values = dict(source_values)
-        base_domain = values.get("PLATFORM_BASE_DOMAIN", "").strip().strip(".")
-        for key, subdomain_ref, suffix in (
-            ("BASEROW_PUBLIC_URL", "BASEROW_SUBDOMAIN", ""),
-            ("WIKIJS_SITE_URL", "WIKIJS_SUBDOMAIN", ""),
-        ):
-            subdomain = values.get(subdomain_ref, "").strip().strip(".")
-            if subdomain and base_domain:
-                values[key] = f"https://{subdomain}.{base_domain}{suffix}"
         generated = observed.get("_generated")
         generator = (
             str(generated.get("generatorVersion", ""))
@@ -2788,7 +3010,7 @@ def harness_scoped_router_auth_evidence() -> dict:
     if not isinstance(e2e, dict):
         findings.append({"finding": "e2e_contract_missing"})
         e2e = {}
-    expected_profiles = list(NATIVE_HARNESS_PROFILES)
+    expected_profiles = list(R1_E2E_HARNESS_PROFILES)
     if e2e.get("profiles") != expected_profiles:
         findings.append({"finding": "e2e_profile_contract_mismatch"})
     contracts = e2e.get("profileContracts")
@@ -2897,7 +3119,7 @@ def harness_scoped_router_auth_evidence() -> dict:
             "status": "passed",
             "profileRef": profile,
             "nativeAdapter": adapter,
-            "nativeSubscriptionCredentials": False,
+            "evidenceSource": "9router-server-side-usage",
             "routerBaseUrl": expected_base,
             "routerProfileKeyRef": key_ref,
             "model": model,
@@ -2913,15 +3135,6 @@ def harness_scoped_router_auth_evidence() -> dict:
                     "finding": "profile_semantic_value_mismatch",
                     "profile": profile,
                     "fields": mismatched,
-                }
-            )
-        if semantic.get("authHomeMode") not in {"empty", "read_only"}:
-            findings.append({"finding": "native_auth_home_unsafe", "profile": profile})
-        if semantic.get("credentialFilesFound") != []:
-            findings.append(
-                {
-                    "finding": "native_subscription_credentials_present",
-                    "profile": profile,
                 }
             )
         counters = (
@@ -3083,6 +3296,24 @@ def _canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _portable_e2e_redaction(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _portable_e2e_redaction(nested) for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_portable_e2e_redaction(nested) for nested in value]
+    if isinstance(value, str):
+        canonical = str(CANONICAL_ENV)
+        root = str(ROOT).rstrip("/")
+        if value == canonical:
+            return "$MTE_PLATFORM_ENV"
+        if root and (value == root or value.startswith(root + "/")):
+            suffix = value[len(root) :].lstrip("/")
+            return "$MTE_ROOT" + (f"/{suffix}" if suffix else "")
+    return value
+
+
 def _file_security_contract(path: Path, mode: int) -> dict:
     return {
         "path": str(path),
@@ -3219,7 +3450,7 @@ def _bound_evidence(
 
 
 def _daytona_control_plane_evidence() -> tuple[dict | None, list[dict]]:
-    """Validate the live, secret-free runner/gateway topology attestation."""
+    """Validate the direct-Compose Daytona control-plane attestation."""
     document, findings = _bound_evidence(
         PAPERCLIP_DAYTONA_CONTROL_PLANE_EVIDENCE,
         kind="PaperclipDaytonaControlPlaneEvidence",
@@ -3231,78 +3462,51 @@ def _daytona_control_plane_evidence() -> tuple[dict | None, list[dict]]:
     )
     if document is None:
         return None, findings
-    gateway = (
-        document.get("agentGateway")
-        if isinstance(document.get("agentGateway"), dict)
-        else {}
-    )
-    profiles = (
-        gateway.get("profiles") if isinstance(gateway.get("profiles"), list) else []
-    )
-    if CANONICAL_ENV.is_file():
-        values, canonical_findings = dotenv(CANONICAL_ENV)
-        findings.extend(canonical_findings)
-    else:
-        values = {}
-        findings.append(
-            {"finding": "canonical_env_missing", "path": str(CANONICAL_ENV)}
-        )
-    expected_profiles = []
-    for profile_ref, harness, upstream_port in (
-        ("coding-daytona-codex", "CODEX", 19011),
-        ("coding-daytona-claude", "CLAUDE", 19012),
-        ("coding-daytona-pi", "PI", 19013),
-    ):
-        upstream_ref = f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_UPSTREAM"
-        gateway_port = values.get(f"MTE_AGENT_GATEWAY_TOOLHIVE_{harness}_PORT", "")
-        expected_profiles.append(
-            {
-                "profileRef": profile_ref,
-                "upstreamRef": upstream_ref,
-                "host": "toolhive",
-                "port": upstream_port,
-                "gatewayPort": int(gateway_port) if gateway_port.isdigit() else None,
-                "httpStatus": 200,
-                "initialize": True,
-            }
-        )
-    runner_id = gateway.get("runnerContainerId")
-    gateway_id = gateway.get("gatewayContainerId")
-    expected_networks = ["mte-agent-plane", "mte-daytona-net", "mte-tool-runtime"]
+    values, canonical_findings = dotenv(CANONICAL_ENV)
+    findings.extend(canonical_findings)
+    expected_control_plane = {
+        "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+        "sourceCommit": values.get("MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"),
+    }
     _expect(
         findings,
-        document.get("producerPath") == str(PAPERCLIP_DAYTONA_STEP_SOURCE)
-        and document.get("secretValuesPrinted") is False
-        and set(gateway)
+        set(document)
         == {
+            "apiVersion",
+            "kind",
             "status",
-            "profileCount",
-            "runnerContainerId",
-            "gatewayContainerId",
-            "gatewayNetworkMode",
-            "runnerNetworks",
-            "expectedRunnerNetworks",
-            "privateToolRuntimeNetwork",
-            "noPublishedPorts",
-            "profiles",
+            "generatedAt",
+            "producerSha256",
+            "canonicalSourceSha256",
+            "controlPlane",
+            "sandboxVersion",
+            "composeServices",
+            "runtimeEvidence",
+            "secretValuesPrinted",
         }
-        and gateway.get("status") == "passed"
-        and gateway.get("profileCount") == 3
-        and isinstance(runner_id, str)
-        and bool(re.fullmatch(r"[0-9a-f]{64}", runner_id))
-        and isinstance(gateway_id, str)
-        and bool(re.fullmatch(r"[0-9a-f]{64}", gateway_id))
-        and gateway.get("gatewayNetworkMode") == f"container:{runner_id}"
-        and gateway.get("runnerNetworks") == expected_networks
-        and gateway.get("expectedRunnerNetworks") == expected_networks
-        and gateway.get("privateToolRuntimeNetwork") == "mte-tool-runtime"
-        and gateway.get("noPublishedPorts") is True
-        and profiles == expected_profiles
-        and all(
-            values.get(row["upstreamRef"]) == f"http://toolhive:{row['port']}"
-            for row in expected_profiles
-        ),
-        "daytona_private_gateway_topology_invalid",
+        and document.get("composeServices")
+        == [
+            "agent-gateway",
+            "api",
+            "db",
+            "dex",
+            "minio",
+            "proxy",
+            "redis",
+            "registry",
+            "runner",
+            "ssh-gateway",
+        ]
+        and document.get("runtimeEvidence")
+        == {
+            "images": str(DAYTONA_IMAGES_EVIDENCE),
+            "lifecycle": str(DAYTONA_LIFECYCLE_EVIDENCE),
+        }
+        and document.get("controlPlane") == expected_control_plane
+        and document.get("sandboxVersion")
+        == values.get("MTE_DAYTONA_SANDBOX_VERSION")
+        and document.get("secretValuesPrinted") is False,
+        "daytona_compose_control_plane_invalid",
     )
     return document, findings
 
@@ -3489,6 +3693,7 @@ def _notion_c029_row_valid(row: dict) -> bool:
         "cleanup",
         "redacted",
         "dependencyEvidence",
+        "consumerVerificationEvidence",
         "internalApiEvidence",
     }
     postgres = (
@@ -3511,7 +3716,7 @@ def _notion_c029_row_valid(row: dict) -> bool:
         and row.get("id") == "C029"
         and row.get("ok") is True
         and row.get("state") == "passed"
-        and row.get("source") == "server_notion_connector_canary"
+        and row.get("source") == "server_notion_projection_consumer_canary"
         and row.get("dataContentProfile") == "postgres-notion"
         and row.get("roles")
         == {
@@ -3543,9 +3748,15 @@ def _notion_c029_row_valid(row: dict) -> bool:
         and row.get("redacted") is True
         and row.get("dependencyEvidence")
         == _dependency_ref(
-            NOTION_VERIFY_EVIDENCE,
-            "NotionConnectorVerification",
-            SERVER_NOTION_SOURCE,
+            NOTION_PROJECTION_CANARY_EVIDENCE,
+            "NotionProjectionLiveCanary",
+            SERVER_NOTION_PROJECTION_SOURCE,
+        )
+        and row.get("consumerVerificationEvidence")
+        == _dependency_ref(
+            NOTION_PROJECTION_VERIFY_EVIDENCE,
+            "NotionProjectionConsumerVerification",
+            SERVER_NOTION_PROJECTION_SOURCE,
         )
         and row.get("internalApiEvidence")
         == _dependency_ref(
@@ -3583,10 +3794,7 @@ def _postgrest_verify_findings(profile: str) -> list[dict]:
         if isinstance(document.get("dataOwnership"), dict)
         else {}
     )
-    expected_projection_provider = {
-        "postgres-notion": "notion",
-        "postgres-postgrest-nocodb-nocodocs": "nocodb",
-    }.get(profile)
+    expected_projection_provider = "notion" if profile == "postgres-notion" else None
     _expect(
         findings,
         document.get("ok") is True
@@ -3596,7 +3804,7 @@ def _postgrest_verify_findings(profile: str) -> list[dict]:
         and authorization.get("anonymousDenied") is True
         and authorization.get("readerWriteDenied") is True
         and authorization.get("rlsEnabled") is True
-        and authorization.get("rolesDistinct") is True
+        and authorization.get("paperclipRoleScoped") is True
         and _is_full_sha256(persistence.get("markerSha256"))
         and all(
             persistence.get(key) is True
@@ -3795,6 +4003,164 @@ def _notion_projection_consumer_findings() -> list[dict]:
         and document.get("redacted") is True
         and not _raw_notion_material_present(document, values),
         "notion_projection_consumer_evidence_invalid",
+    )
+    return findings
+
+
+def _notion_projection_canary_findings() -> list[dict]:
+    document, findings = _bound_evidence(
+        NOTION_PROJECTION_CANARY_EVIDENCE,
+        kind="NotionProjectionLiveCanary",
+        status="passed",
+        time_fields=("generatedAt",),
+        canonical_field=("canonicalSourceSha256",),
+        producer_field=("producerSha256",),
+        producer_path=SERVER_NOTION_PROJECTION_SOURCE,
+    )
+    if document is None:
+        return findings
+    values, canonical_findings = dotenv(CANONICAL_ENV)
+    findings.extend(canonical_findings)
+    dependencies = (
+        document.get("dependencies")
+        if isinstance(document.get("dependencies"), dict)
+        else {}
+    )
+    phases = document.get("phases") if isinstance(document.get("phases"), dict) else {}
+    linkage = (
+        document.get("linkage") if isinstance(document.get("linkage"), dict) else {}
+    )
+    cleanup = (
+        document.get("cleanup") if isinstance(document.get("cleanup"), dict) else {}
+    )
+    expected_top_keys = {
+        "apiVersion",
+        "kind",
+        "status",
+        "ok",
+        "generatedAt",
+        "dataContentProfile",
+        "provider",
+        "runIdSha256",
+        "canonicalSourceSha256",
+        "producerSha256",
+        "dependencies",
+        "phases",
+        "linkage",
+        "cleanup",
+        "evidence",
+        "redacted",
+    }
+    state_keys = {
+        "canonicalExact",
+        "syncStateExact",
+        "outboxDelivered",
+        "attemptCount",
+        "leaseReleased",
+        "errorFree",
+    }
+
+    def drain_exact(value: object) -> bool:
+        return (
+            isinstance(value, dict)
+            and set(value) == {"claimed", "delivered", "superseded", "failed"}
+            and all(isinstance(count, int) and count >= 0 for count in value.values())
+            and value.get("failed") == 0
+        )
+
+    def object_state_exact(value: object) -> bool:
+        return (
+            isinstance(value, dict)
+            and set(value) == state_keys
+            and value.get("canonicalExact") is True
+            and value.get("syncStateExact") is True
+            and value.get("outboxDelivered") is True
+            and isinstance(value.get("attemptCount"), int)
+            and value["attemptCount"] >= 1
+            and value.get("leaseReleased") is True
+            and value.get("errorFree") is True
+        )
+
+    def phase_exact(name: str) -> bool:
+        phase = phases.get(name)
+        if not isinstance(phase, dict):
+            return False
+        expected = {"drain", "objects"}
+        if name == "archive":
+            expected.add("notionArchived")
+        objects = phase.get("objects")
+        exact = (
+            set(phase) == expected
+            and drain_exact(phase.get("drain"))
+            and isinstance(objects, dict)
+            and set(objects) == {"entity", "document"}
+            and all(
+                object_state_exact(objects.get(kind)) for kind in ("entity", "document")
+            )
+        )
+        if name == "archive":
+            exact = exact and phase.get("notionArchived") == {
+                "entity": True,
+                "document": True,
+            }
+        return exact
+
+    def linkage_exact(value: object) -> bool:
+        return (
+            isinstance(value, dict)
+            and set(value)
+            == {
+                "canonicalObjectIdSha256",
+                "providerObjectIdSha256",
+                "initialRevision",
+                "finalRevision",
+                "initialContentSha256",
+                "finalContentSha256",
+            }
+            and all(
+                _is_full_sha256(value.get(field))
+                for field in (
+                    "canonicalObjectIdSha256",
+                    "providerObjectIdSha256",
+                    "initialContentSha256",
+                    "finalContentSha256",
+                )
+            )
+            and value.get("initialRevision") == 1
+            and value.get("finalRevision") == 2
+            and value.get("initialContentSha256") != value.get("finalContentSha256")
+        )
+
+    _expect(
+        findings,
+        set(document) == expected_top_keys
+        and document.get("ok") is True
+        and document.get("dataContentProfile") == "postgres-notion"
+        and document.get("provider") == "notion"
+        and _is_full_sha256(document.get("runIdSha256"))
+        and dependencies
+        == {
+            "notionConnectorProducerSha256": _sha256_file(SERVER_NOTION_SOURCE),
+            "postgrestProducerSha256": _sha256_file(ROOT / "bin/server-postgrest.py"),
+        }
+        and set(phases) == {"create", "update", "archive"}
+        and all(phase_exact(name) for name in ("create", "update", "archive"))
+        and set(linkage) == {"entity", "document"}
+        and all(linkage_exact(linkage.get(kind)) for kind in ("entity", "document"))
+        and cleanup
+        == {
+            "postgresCanonicalAbsent": True,
+            "postgresSyncStateAbsent": True,
+            "postgresOutboxAbsent": True,
+            "notionEntityArchived": True,
+            "notionDocumentArchived": True,
+            "verified": True,
+        }
+        and document.get("evidence")
+        == {"path": str(NOTION_PROJECTION_CANARY_EVIDENCE), "mode": "0600"}
+        and document.get("redacted") is True
+        and not _raw_notion_material_present(document, values),
+        "notion_projection_live_canary_invalid",
     )
     return findings
 
@@ -4071,7 +4437,7 @@ def _notion_connector_evidence() -> tuple[dict | None, list[dict]]:
 
 
 def _c029_integration_evidence() -> tuple[dict | None, list[dict]]:
-    """Validate the selected data/content profile's C029 persistence attestation."""
+    """Validate the single reviewed data/content profile's C029 attestation."""
     document, findings = _bound_evidence(
         C029_INTEGRATION_EVIDENCE,
         kind="IntegrationCanaryEvidence",
@@ -4088,218 +4454,58 @@ def _c029_integration_evidence() -> tuple[dict | None, list[dict]]:
     )
     row = rows[0] if len(rows) == 1 and isinstance(rows[0], dict) else {}
     profile = row.get("dataContentProfile")
-    roles = row.get("roles") if isinstance(row.get("roles"), dict) else {}
-    tables = (
-        row.get("tablesPersistence")
-        if isinstance(row.get("tablesPersistence"), dict)
-        else {}
-    )
-    documents = (
-        row.get("documentsPersistence")
-        if isinstance(row.get("documentsPersistence"), dict)
-        else {}
-    )
-    dependencies = (
-        row.get("dependencyEvidence")
-        if isinstance(row.get("dependencyEvidence"), dict)
-        else {}
-    )
-    profile_specs = {
-        "postgres-notion": {
-            "roles": {
-                "tablesUi": "notion",
-                "tablesApi": "notion",
-                "documentsUi": "notion",
-                "documentsApi": "notion",
-            },
-            "source": "server_notion_connector_canary",
-            "dependencies": {
-                "notion": (
-                    NOTION_VERIFY_EVIDENCE,
-                    "NotionConnectorVerification",
-                    SERVER_NOTION_SOURCE,
-                ),
-            },
-        },
-        "baserow-wikijs": {
-            "roles": {
-                "tablesUi": "baserow",
-                "tablesApi": "baserow",
-                "documentsUi": "wikijs",
-                "documentsApi": "wikijs",
-            },
-            "source": "controlled_ose_application_restarts",
-            "dependencies": {
-                "baserow": (
-                    BASEROW_VERIFY_EVIDENCE,
-                    "BaserowAcceptance",
-                    ROOT / "bin/server-baserow.py",
-                ),
-                "wikijs": (
-                    WIKIJS_VERIFY_EVIDENCE,
-                    "WikiJsVerification",
-                    ROOT / "bin/server-wikijs.py",
-                ),
-            },
-        },
-        "postgres-postgrest-nocodb-nocodocs": {
-            "roles": {
-                "tablesUi": "nocodb",
-                "tablesApi": "postgrest",
-                "documentsUi": "nocodb",
-                "documentsApi": "nocodb",
-            },
-            "source": "controlled_data_content_application_restarts",
-            "dependencies": {
-                "postgrest": (
-                    POSTGREST_VERIFY_EVIDENCE,
-                    "PostgrestVerification",
-                    ROOT / "bin/server-postgrest.py",
-                ),
-                "nocodb": (
-                    NOCODB_VERIFY_EVIDENCE,
-                    "NocoDbNocoDocsVerification",
-                    ROOT / "bin/server-nocodb.py",
-                ),
-            },
-        },
+    values, canonical_findings = dotenv(CANONICAL_ENV)
+    findings.extend(canonical_findings)
+    findings.extend(_notion_projection_canary_findings())
+    findings.extend(_notion_projection_consumer_findings())
+    findings.extend(_postgrest_verify_findings("postgres-notion"))
+    expected_dependency = {
+        "path": str(NOTION_PROJECTION_CANARY_EVIDENCE),
+        "sha256": _sha256_file(NOTION_PROJECTION_CANARY_EVIDENCE),
+        "kind": "NotionProjectionLiveCanary",
+        "producerSha256": _sha256_file(SERVER_NOTION_PROJECTION_SOURCE),
     }
-    spec = profile_specs.get(str(profile), {})
-    expected_dependency_specs = spec.get("dependencies", {})
-    dependencies_valid = set(dependencies) == set(expected_dependency_specs)
-    for name, (path, kind, producer) in expected_dependency_specs.items():
-        ref = dependencies.get(name) if isinstance(dependencies.get(name), dict) else {}
-        dependencies_valid = dependencies_valid and ref == {
-            "path": str(path),
-            "sha256": _sha256_file(path),
-            "kind": kind,
-            "producerSha256": _sha256_file(producer),
-        }
-
-    if profile == "postgres-notion":
-        values, canonical_findings = dotenv(CANONICAL_ENV)
-        findings.extend(canonical_findings)
-        _notion_document, notion_findings = _notion_connector_evidence()
-        findings.extend(notion_findings)
-        postgrest_findings = _postgrest_verify_findings("postgres-notion")
-        findings.extend(postgrest_findings)
-        _expect(
-            findings,
-            set(document)
-            == {
-                "apiVersion",
-                "kind",
-                "generatedAt",
-                "runId",
-                "dataContentProfile",
-                "canonicalSourceSha256",
-                "producerSha256",
-                "ok",
-                "status",
-                "selected",
-                "canaries",
-                "externalProviderConsent",
-            }
-            and document.get("ok") is True
-            and document.get("dataContentProfile") == "postgres-notion"
-            and document.get("selected") == ["C029"]
-            and len(rows) == 1
-            and _notion_c029_row_valid(row)
-            and not _raw_notion_material_present(document, values),
-            "data_content_persistence_evidence_invalid",
-        )
-        return document, findings
-
-    persistence_valid = all(
-        item.get("restartObserved") is True
-        and item.get("persistenceVerified") is True
-        and item.get("postDeleteAbsent") is True
-        and item.get("cleanupCompleted") is True
-        and _is_full_sha256(item.get("markerSha256"))
-        for item in (tables, documents)
-    )
-    if profile == "postgres-postgrest-nocodb-nocodocs":
-        persistence_valid = (
-            persistence_valid
-            and tables.get("nocodbVisibilityVerified") is True
-            and tables.get("singlePostgresStateVerified") is True
-            and documents.get("endpoint") == "/api/v3/docs"
-            and documents.get("requiredPlan")
-            == "licensed-self-hosted-business-or-higher"
-            and row.get("licenses")
-            == [
-                {
-                    "component": "postgrest",
-                    "license": "MIT",
-                    "image": "postgrest/postgrest:v14.15@sha256:2f8e7b656f09db697a8875177694b417b35cb76c21370de07fc54e711e902326",
-                    "exception": None,
-                },
-                {
-                    "component": "nocodb",
-                    "license": "LicenseRef-NocoDB-Sustainable-Use-1.0",
-                    "image": "nocodb/nocodb:2026.06.2@sha256:0745850b14869bde4c972181c52607d72b1f3f85b9f7c96180803f0ced76e465",
-                    "exception": {
-                        "component": "nocodb",
-                        "scope": "internal-self-hosted-tables-ui-and-nocodocs",
-                        "approval": "user-approved-2026-07-15",
-                        "source": "https://github.com/nocodb/nocodb/blob/2026.06.2/LICENSE.md",
-                    },
-                },
-            ]
-        )
-    elif profile == "baserow-wikijs":
-        baserow = (
-            row.get("baserowPersistence")
-            if isinstance(row.get("baserowPersistence"), dict)
-            else {}
-        )
-        wikijs = (
-            row.get("wikijsPersistence")
-            if isinstance(row.get("wikijsPersistence"), dict)
-            else {}
-        )
-        persistence_valid = (
-            persistence_valid
-            and baserow.get("markerSha256") == tables.get("markerSha256")
-            and baserow.get("restartObserved") is True
-            and baserow.get("persistenceVerified") is True
-            and baserow.get("postDeleteStatus") == 404
-            and baserow.get("cleanupCompleted") is True
-            and wikijs.get("markerSha256") == documents.get("markerSha256")
-            and wikijs.get("restartObserved") is True
-            and wikijs.get("persistenceVerified") is True
-            and wikijs.get("postDeleteStatus") == 404
-            and wikijs.get("cleanupCompleted") is True
-        )
+    expected_consumer_verification = {
+        "path": str(NOTION_PROJECTION_VERIFY_EVIDENCE),
+        "sha256": _sha256_file(NOTION_PROJECTION_VERIFY_EVIDENCE),
+        "kind": "NotionProjectionConsumerVerification",
+        "producerSha256": _sha256_file(SERVER_NOTION_PROJECTION_SOURCE),
+    }
     _expect(
         findings,
-        document.get("selected") == ["C029"]
+        set(document)
+        == {
+            "apiVersion",
+            "kind",
+            "generatedAt",
+            "runId",
+            "dataContentProfile",
+            "canonicalSourceSha256",
+            "producerSha256",
+            "ok",
+            "status",
+            "selected",
+            "canaries",
+        }
+        and document.get("ok") is True
+        and document.get("dataContentProfile") == "postgres-notion"
+        and profile == "postgres-notion"
+        and document.get("selected") == ["C029"]
         and len(rows) == 1
-        and not _contains_legacy_storage_key(document)
-        and bool(spec)
-        and row.get("id") == "C029"
-        and row.get("ok") is True
-        and row.get("state") == "passed"
-        and row.get("source") == spec.get("source")
-        and roles == spec.get("roles")
-        and persistence_valid
-        and row.get("applicationRestartObserved") is True
-        and row.get("tablePersistenceVerified") is True
-        and row.get("documentPersistenceVerified") is True
-        and row.get("cleanupCompleted") is True
-        and dependencies_valid,
+        and _notion_c029_row_valid(row)
+        and row.get("dependencyEvidence") == expected_dependency
+        and row.get("consumerVerificationEvidence") == expected_consumer_verification
+        and not _raw_notion_material_present(document, values),
         "data_content_persistence_evidence_invalid",
     )
     return document, findings
 
 
 def _ose_provision_connection_proofs(requested: set[str]) -> dict[str, dict]:
-    """Prove C036 from the two current OSE component acceptance producers."""
+    """Prove C036 from the active PostgREST and Notion connectors."""
     if "C036" not in requested:
         return {}
     findings: list[dict] = []
-    baserow = _json_object(BASEROW_VERIFY_EVIDENCE)
-    wikijs = _json_object(WIKIJS_VERIFY_EVIDENCE)
     if CANONICAL_ENV.is_file():
         values, canonical_findings = dotenv(CANONICAL_ENV)
         findings.extend(canonical_findings)
@@ -4308,252 +4514,21 @@ def _ose_provision_connection_proofs(requested: set[str]) -> dict[str, dict]:
         findings.append(
             {"finding": "canonical_env_missing", "path": str(CANONICAL_ENV)}
         )
-    base_domain = values.get("PLATFORM_BASE_DOMAIN", "").strip().lower().rstrip(".")
-    canonical_sha = _canonical_sha256()
     profile = values.get("DATA_CONTENT_PROFILE", "")
-    if profile == "postgres-notion":
-        findings.extend(_data_content_projection_contract_findings(profile))
-        findings.extend(_postgrest_verify_findings(profile))
-        _notion, notion_findings = _notion_connector_evidence()
-        findings.extend(notion_findings)
-        return {
-            "C036": _connection_result(
-                "C036",
-                findings,
-                evidence=NOTION_VERIFY_EVIDENCE,
-                details={
-                    "postgrestEvidence": str(POSTGREST_VERIFY_EVIDENCE),
-                    "notionEvidence": str(NOTION_VERIFY_EVIDENCE),
-                    "dataContentProjection": str(DATA_CONTENT_PLANE),
-                },
-            )
-        }
-    if profile == "postgres-postgrest-nocodb-nocodocs":
-        postgrest = _json_object(POSTGREST_VERIFY_EVIDENCE)
-        nocodb = _json_object(NOCODB_VERIFY_EVIDENCE)
-        _expect(
-            findings,
-            isinstance(postgrest, dict)
-            and _mode_is_0600(POSTGREST_VERIFY_EVIDENCE)
-            and postgrest.get("apiVersion") == "micro-task-engine/v1alpha1"
-            and postgrest.get("kind") == "PostgrestVerification"
-            and postgrest.get("status") == "passed"
-            and _fresh_field(postgrest, ("generatedAt",))
-            and postgrest.get("profile") == profile
-            and postgrest.get("canonicalSourceSha256") == canonical_sha
-            and postgrest.get("producerSha256")
-            == _sha256_file(ROOT / "bin/server-postgrest.py")
-            and _nested(postgrest, "release", "license") == "MIT"
-            and _nested(postgrest, "authorization", "anonymousDenied") is True
-            and _nested(postgrest, "authorization", "readerWriteDenied") is True
-            and all(
-                _nested(postgrest, "persistence", key) is True
-                for key in (
-                    "restartObserved",
-                    "persistenceVerified",
-                    "postDeleteAbsent",
-                    "cleanupCompleted",
-                )
-            ),
-            "postgrest_provisioning_semantics_invalid",
-        )
-        _expect(
-            findings,
-            isinstance(nocodb, dict)
-            and _mode_is_0600(NOCODB_VERIFY_EVIDENCE)
-            and nocodb.get("apiVersion") == "micro-task-engine/v1alpha1"
-            and nocodb.get("kind") == "NocoDbNocoDocsVerification"
-            and nocodb.get("status") == "passed"
-            and _fresh_field(nocodb, ("generatedAt",))
-            and nocodb.get("profile") == profile
-            and nocodb.get("canonicalSourceSha256") == canonical_sha
-            and nocodb.get("producerSha256")
-            == _sha256_file(ROOT / "bin/server-nocodb.py")
-            and _nested(nocodb, "release", "license")
-            == "LicenseRef-NocoDB-Sustainable-Use-1.0"
-            and _nested(nocodb, "release", "exception", "approval")
-            == "user-approved-2026-07-15"
-            and _nested(nocodb, "dataState", "owner") == "postgres-postgrest"
-            and _nested(nocodb, "dataState", "nocodbUniqueTableState") is False
-            and _nested(nocodb, "dataState", "postgrestCreated") is True
-            and _nested(nocodb, "dataState", "nocodbDiagnosticReadVisible") is True
-            and _nested(nocodb, "dataState", "cleanupCompleted") is True
-            and _nested(nocodb, "documentsApi", "endpoint") == "/api/v3/docs"
-            and _nested(nocodb, "documentsApi", "requiredPlan")
-            == "licensed-self-hosted-business-or-higher"
-            and all(
-                _nested(nocodb, "documentsApi", key) is True
-                for key in (
-                    "restartObserved",
-                    "persistenceVerified",
-                    "postDeleteAbsent",
-                    "cleanupCompleted",
-                )
-            ),
-            "nocodb_nocodocs_provisioning_semantics_invalid",
-        )
-        return {
-            "C036": _connection_result(
-                "C036",
-                findings,
-                evidence=C029_INTEGRATION_EVIDENCE,
-                details={
-                    "postgrestEvidence": str(POSTGREST_VERIFY_EVIDENCE),
-                    "nocodbEvidence": str(NOCODB_VERIFY_EVIDENCE),
-                },
-            )
-        }
-    _expect(
-        findings,
-        profile == "baserow-wikijs",
-        "data_content_profile_unsupported",
-    )
-    _expect(
-        findings,
-        isinstance(baserow, dict)
-        and _mode_is_0600(BASEROW_VERIFY_EVIDENCE)
-        and baserow.get("apiVersion") == f"mte.{base_domain}/v1"
-        and baserow.get("kind") == "BaserowAcceptance"
-        and baserow.get("status") == "passed"
-        and _fresh_field(baserow, ("generatedAt",))
-        and baserow.get("canonicalSourceSha256") == canonical_sha
-        and baserow.get("producerSha256")
-        == _sha256_file(ROOT / "bin/server-baserow.py"),
-        "baserow_evidence_envelope_invalid",
-    )
-    _expect(
-        findings,
-        isinstance(wikijs, dict)
-        and _mode_is_0600(WIKIJS_VERIFY_EVIDENCE)
-        and wikijs.get("apiVersion") == "micro-task-engine/v1alpha1"
-        and wikijs.get("kind") == "WikiJsVerification"
-        and wikijs.get("status") == "passed"
-        and _fresh_field(wikijs, ("generatedAt",))
-        and wikijs.get("canonicalSourceSha256") == canonical_sha
-        and wikijs.get("producerSha256") == _sha256_file(ROOT / "bin/server-wikijs.py"),
-        "wikijs_evidence_envelope_invalid",
-    )
-    baserow = baserow or {}
-    wikijs = wikijs or {}
-    ids = baserow.get("ids") if isinstance(baserow.get("ids"), dict) else {}
-    rest = baserow.get("restApi") if isinstance(baserow.get("restApi"), dict) else {}
-    mcp = baserow.get("mcp") if isinstance(baserow.get("mcp"), dict) else {}
-    distribution = (
-        baserow.get("distribution")
-        if isinstance(baserow.get("distribution"), dict)
-        else {}
-    )
-    secrets_audit = (
-        baserow.get("secrets") if isinstance(baserow.get("secrets"), dict) else {}
-    )
-    bootstrap = (
-        wikijs.get("bootstrap") if isinstance(wikijs.get("bootstrap"), dict) else {}
-    )
-    wiki_image = wikijs.get("image") if isinstance(wikijs.get("image"), dict) else {}
-    wiki_graphql = (
-        wikijs.get("graphql") if isinstance(wikijs.get("graphql"), dict) else {}
-    )
-    wiki_secret_audit = (
-        wikijs.get("secretAudit") if isinstance(wikijs.get("secretAudit"), dict) else {}
-    )
-
-    def canonical_int(key: str) -> int | None:
-        raw = values.get(key, "")
-        return int(raw) if raw.isdigit() and int(raw) > 0 else None
-
-    paperclip_token = values.get("BASEROW_PAPERCLIP_TOKEN", "")
-    activepieces_token = values.get("BASEROW_ACTIVEPIECES_TOKEN", "")
-    mcp_key = values.get("BASEROW_MCP_ENDPOINT_KEY", "")
-    wiki_token = values.get("WIKIJS_API_TOKEN", "")
-    _expect(
-        findings,
-        not _contains_legacy_storage_key(baserow)
-        and ids
-        == {
-            "workspaceId": canonical_int("BASEROW_WORKSPACE_ID"),
-            "databaseId": canonical_int("BASEROW_DATABASE_ID"),
-            "tableId": canonical_int("BASEROW_TABLE_ID"),
-            "paperclipTokenId": canonical_int("BASEROW_PAPERCLIP_TOKEN_ID"),
-            "activepiecesTokenId": canonical_int("BASEROW_ACTIVEPIECES_TOKEN_ID"),
-            "mcpEndpointId": canonical_int("BASEROW_MCP_ENDPOINT_ID"),
-        }
-        and all(value is not None for value in ids.values())
-        and bool(paperclip_token)
-        and bool(activepieces_token)
-        and paperclip_token != activepieces_token
-        and rest.get("ok") is True
-        and rest.get("paperclipTokenCheckStatus") == 200
-        and rest.get("activepiecesTokenCheckStatus") == 200
-        and rest.get("rowsStatus") == 200
-        and rest.get("tokensDistinct") is True
-        and rest.get("tokenFingerprints")
-        == {
-            "paperclip": hashlib.sha256(paperclip_token.encode()).hexdigest(),
-            "activepieces": hashlib.sha256(activepieces_token.encode()).hexdigest(),
-        }
-        and mcp.get("ok") is True
-        and mcp.get("transport") == "sse"
-        and mcp.get("initializeOk") is True
-        and mcp.get("toolsListOk") is True
-        and isinstance(mcp.get("toolNames"), list)
-        and bool(mcp.get("toolNames"))
-        and mcp.get("endpointId") == canonical_int("BASEROW_MCP_ENDPOINT_ID")
-        and bool(mcp_key)
-        and mcp.get("keyFingerprint") == hashlib.sha256(mcp_key.encode()).hexdigest()
-        and secrets_audit
-        == {
-            "rawValuesIncluded": False,
-            "tokensDistinct": True,
-            "paperclipTokenFingerprint": hashlib.sha256(
-                paperclip_token.encode()
-            ).hexdigest(),
-            "activepiecesTokenFingerprint": hashlib.sha256(
-                activepieces_token.encode()
-            ).hexdigest(),
-            "mcpKeyFingerprint": hashlib.sha256(mcp_key.encode()).hexdigest(),
-        }
-        and distribution.get("name") == "Baserow OSE"
-        and distribution.get("version") == "2.3.1"
-        and distribution.get("license") == "MIT"
-        and distribution.get("enterpriseLicenseConfigured") is False
-        and distribution.get("premiumFeaturesUsed") is False
-        and distribution.get("runtimeImagesExact") is True,
-        "baserow_provisioning_semantics_invalid",
-    )
-    _expect(
-        findings,
-        not _contains_legacy_storage_key(wikijs)
-        and wikijs.get("ok") is True
-        and wiki_image.get("version") == "2.5.314"
-        and wiki_image.get("digest")
-        == "sha256:68f0d1848261ae76492ba358e30a96a76fed5d97a3fff381656082bf90f70d7e"
-        and _nested(wiki_image, "license", "spdx") == "AGPL-3.0-only"
-        and bootstrap.get("adminId") == 1
-        and bootstrap.get("apiEnabled") is True
-        and bootstrap.get("apiKeyId") == canonical_int("WIKIJS_API_TOKEN_ID")
-        and bootstrap.get("apiKeyName") == values.get("WIKIJS_API_KEY_NAME")
-        and bootstrap.get("secondRunNoOp") is True
-        and bool(wiki_token)
-        and bootstrap.get("apiTokenFingerprint")
-        == hashlib.sha256(wiki_token.encode()).hexdigest()[:16]
-        and wiki_graphql.get("bearerAuthenticated") is True
-        and wiki_graphql.get("restartObserved") is True
-        and wiki_graphql.get("persistenceVerified") is True
-        and wiki_graphql.get("postDeleteGraphqlMissing") is True
-        and wiki_graphql.get("postDeleteStatus404") == 404
-        and wiki_graphql.get("cleanupCompleted") is True
-        and wiki_secret_audit
-        == {"rawSecretsPresent": False, "contentMarkerPresent": False},
-        "wikijs_provisioning_semantics_invalid",
-    )
+    _expect(findings, profile == "postgres-notion", "data_content_profile_unsupported")
+    findings.extend(_data_content_projection_contract_findings(profile))
+    findings.extend(_postgrest_verify_findings(profile))
+    _notion, notion_findings = _notion_connector_evidence()
+    findings.extend(notion_findings)
     return {
         "C036": _connection_result(
             "C036",
             findings,
-            evidence=C029_INTEGRATION_EVIDENCE,
+            evidence=NOTION_VERIFY_EVIDENCE,
             details={
-                "baserowEvidence": str(BASEROW_VERIFY_EVIDENCE),
-                "wikijsEvidence": str(WIKIJS_VERIFY_EVIDENCE),
+                "postgrestEvidence": str(POSTGREST_VERIFY_EVIDENCE),
+                "notionEvidence": str(NOTION_VERIFY_EVIDENCE),
+                "dataContentProjection": str(DATA_CONTENT_PLANE),
             },
         )
     }
@@ -4593,11 +4568,10 @@ def _toolhive_gateway_audit_findings(audit: dict | None) -> list[dict]:
     )
     daytona_document, daytona_findings = _daytona_control_plane_evidence()
     findings.extend(daytona_findings)
-    daytona_gateway = (
-        daytona_document.get("agentGateway")
-        if isinstance(daytona_document, dict)
-        and isinstance(daytona_document.get("agentGateway"), dict)
-        else {}
+    _expect(
+        findings,
+        isinstance(daytona_document, dict),
+        "daytona_compose_control_plane_missing",
     )
     values, canonical_findings = dotenv(CANONICAL_ENV)
     findings.extend(canonical_findings)
@@ -4630,7 +4604,7 @@ def _toolhive_gateway_audit_findings(audit: dict | None) -> list[dict]:
         == str(SERVER_PROFILE_RECONCILE_SOURCE)
         and audit.get("profileReconcileProducerSha256")
         == _sha256_file(SERVER_PROFILE_RECONCILE_SOURCE)
-        and audit.get("gatewayRuntimeNetwork") == "mte-tool-runtime"
+        and audit.get("gatewayRuntimeNetwork") == values.get("MTE_TOOL_RUNTIME_NETWORK")
         and audit.get("daytonaStepPath") == str(PAPERCLIP_DAYTONA_STEP_SOURCE)
         and audit.get("daytonaStepSha256")
         == _sha256_file(PAPERCLIP_DAYTONA_STEP_SOURCE)
@@ -4648,31 +4622,33 @@ def _toolhive_gateway_audit_findings(audit: dict | None) -> list[dict]:
             "gatewayContainer": "mte-agent-plane-gateway",
             "runnerContainerId": None,
             "gatewayContainerId": None,
-            "runnerNetworkNames": [
-                "mte-agent-plane",
-                "mte-daytona-net",
-                "mte-tool-runtime",
-            ],
+            "runnerNetworkNames": None,
             "gatewaySharesRunnerNamespace": True,
             "publishedPorts": [],
+            "canonicalEnvironmentMounted": False,
+            "mountInventorySha256": None,
         }.keys()
         and runtime_network.get("runnerContainer") == "mte-daytona-runner"
         and runtime_network.get("gatewayContainer") == "mte-agent-plane-gateway"
-        and runtime_network.get("runnerContainerId")
-        == daytona_gateway.get("runnerContainerId")
-        and runtime_network.get("gatewayContainerId")
-        == daytona_gateway.get("gatewayContainerId")
+        and _is_full_sha256(runtime_network.get("runnerContainerId"))
+        and _is_full_sha256(runtime_network.get("gatewayContainerId"))
         and runtime_network.get("runnerNetworkNames")
-        == ["mte-agent-plane", "mte-daytona-net", "mte-tool-runtime"]
+        == [
+            values.get("MTE_AGENT_PLANE_NETWORK"),
+            values.get("MTE_DAYTONA_NETWORK"),
+            values.get("MTE_TOOL_RUNTIME_NETWORK"),
+        ]
         and runtime_network.get("gatewaySharesRunnerNamespace") is True
-        and runtime_network.get("publishedPorts") == [],
+        and runtime_network.get("publishedPorts") == []
+        and runtime_network.get("canonicalEnvironmentMounted") is False
+        and _is_full_sha256(runtime_network.get("mountInventorySha256")),
         "e2e_toolhive_private_runtime_network_invalid",
     )
     _expect(
         findings,
-        len(profiles) == 3
+        len(profiles) == len(R1_E2E_HARNESS_PROFILES)
         and all(isinstance(row, dict) for row in profiles)
-        and [row.get("profileRef") for row in profiles] == list(NATIVE_HARNESS_PROFILES)
+        and [row.get("profileRef") for row in profiles] == list(R1_E2E_HARNESS_PROFILES)
         and all(set(row) == allowed_profile_fields for row in profiles)
         and all(
             row.get("gatewayUpstreamRef") == expected_upstreams[row["profileRef"]][0]
@@ -4720,7 +4696,7 @@ def _e2e_document() -> tuple[dict | None, list[dict]]:
     _expect(
         findings,
         [row.get("profile") for row in runs if isinstance(row, dict)]
-        == list(NATIVE_HARNESS_PROFILES),
+        == list(R1_E2E_HARNESS_PROFILES),
         "e2e_profile_run_set_mismatch",
     )
     audit = (
@@ -4756,25 +4732,30 @@ def _e2e_document() -> tuple[dict | None, list[dict]]:
         )
         _expect(
             findings,
-            len(verified_runs) == 3
+            len(verified_runs) == len(R1_E2E_HARNESS_PROFILES)
             and all(isinstance(row, dict) for row in verified_runs)
             and [row.get("profile") for row in verified_runs]
-            == list(NATIVE_HARNESS_PROFILES)
+            == list(R1_E2E_HARNESS_PROFILES)
             and all(
                 bool(row.get("executionId"))
-                and bool(row.get("normalizedRunId"))
+                and bool(row.get("paperclipIssueId"))
                 and bool(row.get("pullRequestUrl"))
                 and bool(re.fullmatch(r"[0-9a-f]{40}", str(row.get("commitSha") or "")))
                 and bool(row.get("checkConclusions"))
-                and all(
-                    value in {"success", "neutral", "skipped"}
-                    for value in row.get("checkConclusions", [])
-                )
+                and all(value == "success" for value in row.get("checkConclusions", []))
                 and row.get("semanticCheck") == "harness-scoped-router-auth"
                 and row.get("toolhiveSemanticCheck") == "runner-toolhive-profile"
                 and bool(row.get("routerServerRequestIds"))
                 and _nested(row, "resourceCleanup", "daytonaSandboxAbsent") is True
                 for row in verified_runs
+            )
+            and all(
+                row.get("executionId") == _nested(runs[index], "execution", "id")
+                and row.get("paperclipIssueId")
+                == _nested(runs[index], "paperclip", "issueId")
+                and row.get("claimLeaseId")
+                == _nested(runs[index], "paperclip", "claim", "leaseId")
+                for index, row in enumerate(verified_runs)
             ),
             "e2e_live_verification_runs_invalid",
         )
@@ -4795,6 +4776,58 @@ def _e2e_document() -> tuple[dict | None, list[dict]]:
                 if key != "generatedAt"
             },
             "e2e_toolhive_gateway_audit_verification_mismatch",
+        )
+    bundle = _json_object(E2E_PORTABLE_BUNDLE)
+    _expect(
+        findings,
+        isinstance(bundle, dict) and _mode_is_0600(E2E_PORTABLE_BUNDLE),
+        "e2e_portable_bundle_missing_or_invalid",
+    )
+    if isinstance(bundle, dict):
+        bundle_documents = (
+            bundle.get("documents") if isinstance(bundle.get("documents"), dict) else {}
+        )
+        expected_documents = {"apply.json": _portable_e2e_redaction(document)}
+        if verification is not None:
+            expected_documents["verify.json"] = _portable_e2e_redaction(verification)
+        expected_hashes = {
+            name: _canonical_json_sha256(value)
+            for name, value in expected_documents.items()
+        }
+        expected_bundle_hash = _canonical_json_sha256(
+            {
+                "documents": expected_documents,
+                "documentSha256": expected_hashes,
+                "sourceSha256": {
+                    "canonical": _sha256_file(CANONICAL_ENV),
+                    "producer": _sha256_file(SERVER_E2E_SOURCE),
+                },
+            }
+        )
+        _expect(
+            findings,
+            bundle.get("apiVersion") == "micro-task-engine/v1alpha1"
+            and bundle.get("kind") == "PortableKestraPaperclipGitHubE2EEvidenceBundle"
+            and bundle.get("schemaVersion")
+            == "paperclip-agent-platform/e2e-evidence/v2"
+            and bundle.get("status") == "passed"
+            and _fresh_field(bundle, ("generatedAt",))
+            and bundle.get("redaction")
+            == {
+                "status": "passed",
+                "hostPathsReplaced": True,
+                "rawSecretsPresent": False,
+                "canonicalEnvironmentIncluded": False,
+            }
+            and bundle_documents == expected_documents
+            and bundle.get("documentSha256") == expected_hashes
+            and bundle.get("sourceSha256")
+            == {
+                "canonical": _sha256_file(CANONICAL_ENV),
+                "producer": _sha256_file(SERVER_E2E_SOURCE),
+            }
+            and bundle.get("bundleSha256") == expected_bundle_hash,
+            "e2e_portable_bundle_contract_invalid",
         )
     return document, findings
 
@@ -4834,7 +4867,9 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
     results: dict[str, dict] = {}
 
     def all_runs(predicate) -> bool:
-        return len(runs) == 3 and all(predicate(row) for row in runs)
+        return len(runs) == len(R1_E2E_HARNESS_PROFILES) and all(
+            predicate(row) for row in runs
+        )
 
     def full_sha256(value: object) -> bool:
         return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-f]{64}", value))
@@ -4858,7 +4893,6 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
         claimant = (
             claim.get("claimant") if isinstance(claim.get("claimant"), dict) else {}
         )
-        token = claim.get("token") if isinstance(claim.get("token"), dict) else {}
         proof = (
             paperclip.get("heartbeatProof")
             if isinstance(paperclip.get("heartbeatProof"), dict)
@@ -4901,8 +4935,7 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and proof.get("status") == "passed"
             and proof.get("runId") == run_id
             and proof.get("runnerId") == runner_id
-            and full_sha256(proof.get("tokenFingerprintSha256"))
-            and proof.get("tokenFingerprintSha256") == token.get("fingerprintSha256")
+            and claim.get("token") is None
             and sequences == sorted(set(sequences))
             and all(current > previous for previous, current in zip(times, times[1:]))
             and phases[0] == "started"
@@ -4912,6 +4945,25 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and paperclip.get("heartbeatStatus") == "succeeded"
             and final.get("status") == "succeeded"
             and final.get("nativeStatus") == "succeeded"
+            and final.get("source") == "paperclip.heartbeat-run"
+            and final.get("runId") == run_id
+            and final.get("runnerId") == runner_id
+            and parsed_time(final.get("recordedAt")) is not None
+            and parsed_time(final.get("recordedAt")) >= times[-1]
+            and final.get("recordFingerprintSha256")
+            == hashlib.sha256(
+                json.dumps(
+                    {
+                        "recordedAt": final.get("recordedAt"),
+                        "runId": final.get("runId"),
+                        "runnerId": final.get("runnerId"),
+                        "source": final.get("source"),
+                        "status": final.get("status"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
             and parsed_time(claim.get("firstHeartbeatAt")) == times[0]
         )
 
@@ -4945,7 +4997,7 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and semantic.get("check") == "runner-toolhive-profile"
             and semantic.get("status") == "passed"
             and semantic.get("profileRef") == profile
-            and semantic.get("runId") == _nested(row, "paperclip", "normalizedRunId")
+            and semantic.get("runId") == _nested(row, "paperclip", "issueId")
             and semantic.get("bundleId") == access.get("bundleId")
             and semantic.get("workloadId") == access.get("workloadId")
             and semantic.get("endpointRef") == endpoint_ref
@@ -5033,6 +5085,12 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
         request_hashes = (
             proof.get("requestFingerprintsSha256") if isinstance(proof, dict) else None
         )
+        request_binding = (
+            proof.get("requestBinding")
+            if isinstance(proof, dict) and isinstance(proof.get("requestBinding"), dict)
+            else {}
+        )
+        correlation_nonce = f"kestra:{_nested(row, 'execution', 'id')}"
         expected_endpoint = {
             "coding-daytona-codex": "/v1/responses",
             "coding-daytona-claude": "/v1/messages",
@@ -5077,6 +5135,50 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and proof.get("statuses") == ["ok"]
             and parsed_time(proof.get("firstRequestAt")) is not None
             and parsed_time(proof.get("lastRequestAt")) is not None
+            and request_binding.get("status") == "passed"
+            and request_binding.get("source") == "9router.sqlite.requestDetails"
+            and isinstance(request_binding.get("detailCount"), int)
+            and request_binding.get("detailCount") > 0
+            and isinstance(request_binding.get("detailDataSha256"), list)
+            and len(request_binding.get("detailDataSha256"))
+            == request_binding.get("detailCount")
+            and all(
+                full_sha256(value) for value in request_binding.get("detailDataSha256")
+            )
+            and request_binding.get("usageRequestIds") == request_ids
+            and isinstance(request_binding.get("correlatedUsageHistoryIds"), list)
+            and bool(request_binding.get("correlatedUsageHistoryIds"))
+            and set(request_binding.get("correlatedUsageHistoryIds"))
+            <= set(request_ids)
+            and isinstance(request_binding.get("tokenUsages"), list)
+            and bool(request_binding.get("tokenUsages"))
+            and all(
+                isinstance(usage, dict)
+                and isinstance(usage.get("inputTokens"), int)
+                and usage.get("inputTokens") > 0
+                and isinstance(usage.get("outputTokens"), int)
+                and usage.get("outputTokens") > 0
+                and usage.get("totalTokens")
+                == usage.get("inputTokens") + usage.get("outputTokens")
+                for usage in request_binding.get("tokenUsages")
+            )
+            and isinstance(request_binding.get("completionFingerprintsSha256"), list)
+            and bool(request_binding.get("completionFingerprintsSha256"))
+            and all(
+                full_sha256(value)
+                for value in request_binding.get("completionFingerprintsSha256")
+            )
+            and request_binding.get("correlationNonceSha256")
+            == hashlib.sha256(correlation_nonce.encode()).hexdigest()
+            and isinstance(request_binding.get("correlatedDetailCount"), int)
+            and request_binding.get("correlatedDetailCount") > 0
+            and isinstance(request_binding.get("correlatedDetailDataSha256"), list)
+            and len(request_binding.get("correlatedDetailDataSha256"))
+            == request_binding.get("correlatedDetailCount")
+            and all(
+                full_sha256(value)
+                for value in request_binding.get("correlatedDetailDataSha256")
+            )
         )
 
     def harness_artifact(row: dict) -> dict | None:
@@ -5098,10 +5200,79 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             return None
         return value if isinstance(value, dict) else None
 
+    def valid_github_controller_oracle(row: dict) -> bool:
+        proof = _nested(row, "github", "proof")
+        if not isinstance(proof, dict):
+            return False
+        identity = proof.get("controllerArtifactIdentity")
+        files = proof.get("files") if isinstance(proof.get("files"), list) else []
+        checks = proof.get("checks") if isinstance(proof.get("checks"), list) else []
+        required_checks = [
+            item
+            for item in checks
+            if isinstance(item, dict)
+            and item.get("name") == "paperclip-e2e"
+            and item.get("app")
+            == {"id": 15368, "slug": "github-actions", "name": "GitHub Actions"}
+        ]
+        semantic = {
+            "markerFunction": "marker",
+            "markerValueSha256": hashlib.sha256(b"PAPERCLIP_DAYTONA_E2E").hexdigest(),
+            "workflowName": "paperclip-e2e",
+            "jobId": "paperclip-e2e",
+            "jobName": "paperclip-e2e",
+            "testCommand": "cd paperclip-e2e && python -m unittest test_marker.py",
+            "testCallsMarker": True,
+        }
+        semantic["identitySha256"] = _canonical_json_sha256(semantic)
+        return (
+            identity == semantic
+            and len(files) == 3
+            and {item.get("path") for item in files if isinstance(item, dict)}
+            == {
+                ".github/workflows/paperclip-e2e.yml",
+                "paperclip-e2e/marker.py",
+                "paperclip-e2e/test_marker.py",
+            }
+            and all(
+                isinstance(item, dict)
+                and full_sha256(item.get("contentSha256"))
+                and full_sha256(item.get("patchSha256"))
+                for item in files
+            )
+            and checks == _nested(row, "github", "checks")
+            and bool(checks)
+            and len(required_checks) == 1
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("name"), str)
+                and bool(item.get("name"))
+                and item.get("status") == "completed"
+                and item.get("conclusion") == "success"
+                and isinstance(item.get("app"), dict)
+                and isinstance(item["app"].get("id"), int)
+                and item["app"].get("id") > 0
+                and bool(item["app"].get("slug"))
+                and bool(item["app"].get("name"))
+                for item in checks
+            )
+        )
+
     def valid_c073(row: dict) -> bool:
         environment = _nested(row, "paperclip", "environment")
         artifact = harness_artifact(row)
-        if not isinstance(environment, dict) or not isinstance(artifact, dict):
+        operation = _nested(row, "paperclip", "workspaceOperation")
+        projection = (
+            operation.get("credentialProjection")
+            if isinstance(operation, dict)
+            and isinstance(operation.get("credentialProjection"), dict)
+            else {}
+        )
+        if (
+            not isinstance(environment, dict)
+            or not isinstance(artifact, dict)
+            or not isinstance(operation, dict)
+        ):
             return False
         return (
             environment.get("provider") == "daytona"
@@ -5121,6 +5292,57 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             == environment.get("sandboxId")
             and bool(_nested(artifact, "localTest", "command"))
             and _nested(artifact, "localTest", "exitCode") == 0
+            and operation.get("status") == "passed"
+            and operation.get("sandboxId") == environment.get("sandboxId")
+            and operation.get("executionWorkspaceId")
+            == environment.get("executionWorkspaceId")
+            and operation.get("remoteCwd") == environment.get("remoteCwd")
+            and operation.get("commitSha") == _nested(row, "github", "commitSha")
+            and operation.get("directExecution") is True
+            and operation.get("repositoryLauncherAbsent") is True
+            and operation.get("operationFingerprintSha256")
+            == _canonical_json_sha256(
+                {
+                    key: value
+                    for key, value in operation.items()
+                    if key != "operationFingerprintSha256"
+                }
+            )
+            and projection.get("status") == "passed"
+            and projection.get("sourceCanonicalSha256") == _canonical_sha256()
+            and projection.get("allowlistedKeys")
+            == ["DAYTONA_API_KEY", "MTE_DAYTONA_API_URL", "DAYTONA_TARGET"]
+            and projection.get("allowlistedKeyCount") == 3
+            and full_sha256(projection.get("projectionSha256"))
+            and projection.get("projectionMode") == "0600"
+            and projection.get("canonicalEnvironmentMounted") is False
+            and projection.get("temporaryProjectionRemoved") is True
+        )
+
+    def valid_provider_cleanup(value: object) -> bool:
+        if not isinstance(value, dict):
+            return False
+        lease_ids = value.get("leaseIds")
+        successful = value.get("successfulLeaseIds")
+        duplicates = value.get("duplicateTerminalLeaseIds")
+        if not all(isinstance(item, list) for item in (lease_ids, successful, duplicates)):
+            return False
+        return (
+            bool(value.get("providerLeaseId"))
+            and bool(lease_ids)
+            and bool(successful)
+            and value.get("successfulExpiredLeaseObserved") is True
+            and value.get("unexpectedLeaseIds") == []
+            and not (set(successful) & set(duplicates))
+            and (set(successful) | set(duplicates)) == set(lease_ids)
+            and value.get("leaseGroupFingerprintSha256")
+            == _canonical_json_sha256(
+                {
+                    key: item
+                    for key, item in value.items()
+                    if key != "leaseGroupFingerprintSha256"
+                }
+            )
         )
 
     def valid_c080_cleanup(row: dict) -> bool:
@@ -5148,13 +5370,30 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             if isinstance(paperclip.get("filesystemProof"), dict)
             else {}
         )
+        provider_cleanup = (
+            paperclip.get("providerLeaseCleanup")
+            if isinstance(paperclip.get("providerLeaseCleanup"), dict)
+            else {}
+        )
+        provider_cleanups = (
+            paperclip.get("providerLeaseCleanups")
+            if isinstance(paperclip.get("providerLeaseCleanups"), list)
+            else []
+        )
+        provider_resources = (
+            _nested(resources, "daytona", "providerResources")
+            if isinstance(_nested(resources, "daytona", "providerResources"), list)
+            else []
+        )
         attempts = (
             resources.get("cleanupAttempts")
             if isinstance(resources.get("cleanupAttempts"), dict)
             else {}
         )
-        path = resources.get("worktreePath")
-        path_hash = resources.get("worktreePathFingerprintSha256")
+        remote_cwd = resources.get("remoteCwd")
+        remote_cwd_hash = resources.get("remoteCwdFingerprintSha256")
+        worktree_path = resources.get("worktreePath")
+        worktree_path_hash = resources.get("worktreePathFingerprintSha256")
         sandbox_id = resources.get("sandboxId")
         fingerprint_parts = (
             "daytona",
@@ -5162,24 +5401,38 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             resources.get("providerLeaseId"),
             sandbox_id,
             resources.get("executionWorkspaceId"),
-            resources.get("remoteCwd"),
+            remote_cwd,
+            worktree_path,
         )
         return (
             isinstance(run, dict)
             and resources.get("completed") is True
-            and resources.get("normalizedRunId")
-            == _nested(run, "paperclip", "normalizedRunId")
+            and resources.get("paperclipIssueId")
+            == _nested(run, "paperclip", "issueId")
             and all(isinstance(value, str) and value for value in fingerprint_parts)
             and resources.get("resourceFingerprintSha256")
             == hashlib.sha256("|".join(fingerprint_parts).encode()).hexdigest()
-            and isinstance(path, str)
-            and path == resources.get("remoteCwd")
-            and full_sha256(path_hash)
-            and path_hash == hashlib.sha256(path.encode()).hexdigest()
+            and isinstance(remote_cwd, str)
+            and re.fullmatch(
+                r"/home/daytona/paperclip-workspace(?:/[^/]+)*", remote_cwd
+            )
+            and ".." not in Path(remote_cwd).parts
+            and full_sha256(remote_cwd_hash)
+            and remote_cwd_hash == hashlib.sha256(remote_cwd.encode()).hexdigest()
+            and isinstance(worktree_path, str)
+            and re.fullmatch(
+                r"/data/instances/default/projects/[^/]+/[^/]+/_default",
+                worktree_path,
+            )
+            and ".." not in Path(worktree_path).parts
+            and full_sha256(worktree_path_hash)
+            and worktree_path_hash
+            == hashlib.sha256(worktree_path.encode()).hexdigest()
             and resources.get("environmentLeaseId")
             == _nested(run, "paperclip", "environment", "environmentLeaseId")
             and resources.get("providerLeaseId")
             == _nested(run, "paperclip", "environment", "providerLeaseId")
+            and resources.get("providerLeaseId") == sandbox_id
             and sandbox_id == _nested(run, "paperclip", "environment", "sandboxId")
             and resources.get("executionWorkspaceId")
             == _nested(run, "paperclip", "environment", "executionWorkspaceId")
@@ -5188,8 +5441,45 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and paperclip.get("worktreeAbsent") is True
             and paperclip.get("filesystemAbsenceVerified") is True
             and paperclip.get("environmentLeaseReleased") is True
-            and filesystem.get("method") == "exact_path_bound_to_absent_daytona_sandbox"
-            and filesystem.get("worktreePathFingerprintSha256") == path_hash
+            and valid_provider_cleanup(provider_cleanup)
+            and provider_cleanup.get("providerLeaseId")
+            == resources.get("providerLeaseId")
+            and provider_cleanup.get("successfulExpiredLeaseObserved") is True
+            and bool(provider_cleanups)
+            and all(valid_provider_cleanup(group) for group in provider_cleanups)
+            and bool(provider_resources)
+            and len(provider_resources)
+            == len(
+                {
+                    item.get("providerLeaseId")
+                    for item in provider_resources
+                    if isinstance(item, dict)
+                }
+            )
+            and {
+                group.get("providerLeaseId")
+                for group in provider_cleanups
+                if isinstance(group, dict)
+            }
+            == {
+                item.get("providerLeaseId")
+                for item in provider_resources
+                if isinstance(item, dict)
+            }
+            and all(
+                isinstance(item, dict)
+                and item.get("sandboxId") == item.get("providerLeaseId")
+                and item.get("providerGetStatus") == 404
+                and item.get("sandboxAbsent") is True
+                and item.get("providerLeaseCleanup") in provider_cleanups
+                for item in provider_resources
+            )
+            and filesystem.get("method")
+            == "canonical_paths_bound_to_released_workspace_and_absent_sandbox"
+            and filesystem.get("workspaceFilesystemProbe") == "absent"
+            and filesystem.get("remoteCwdFingerprintSha256") == remote_cwd_hash
+            and filesystem.get("worktreePathFingerprintSha256")
+            == worktree_path_hash
             and filesystem.get("sandboxId") == sandbox_id
             and filesystem.get("providerGetStatus") == 404
             and _nested(resources, "daytona", "sandboxAbsent") is True
@@ -5204,6 +5494,32 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and attempts.get("daytonaPoll") > 0
         )
 
+    def cleanup_scope_fingerprint(rows: list[dict]) -> str:
+        provider_resources = [
+            item
+            for row in rows
+            for item in (_nested(row, "resources", "daytona", "providerResources") or [])
+            if isinstance(item, dict)
+        ]
+        return _canonical_json_sha256(
+            {
+                "sandboxIds": sorted(
+                    str(item.get("sandboxId") or "") for item in provider_resources
+                ),
+                "providerLeaseIds": sorted(
+                    str(item.get("providerLeaseId") or "")
+                    for item in provider_resources
+                ),
+                "refs": sorted(str(row.get("branchRef") or "") for row in rows),
+                "pullRequestNumbers": sorted(
+                    int(row.get("pullRequestNumber"))
+                    for row in rows
+                    if isinstance(row.get("pullRequestNumber"), int)
+                    and not isinstance(row.get("pullRequestNumber"), bool)
+                ),
+            }
+        )
+
     for connection_id in ids:
         findings: list[dict] = []
         if connection_id == "C001":
@@ -5212,7 +5528,6 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 all_runs(
                     lambda row: _nested(row, "execution", "state") == "SUCCESS"
                     and _nested(row, "paperclip", "status") == "succeeded"
-                    and bool(_nested(row, "paperclip", "normalizedRunId"))
                     and bool(_nested(row, "paperclip", "issueId"))
                     and bool(_nested(row, "paperclip", "heartbeatRunId"))
                 ),
@@ -5227,10 +5542,23 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     and _nested(row, "paperclip", "claim", "claimant", "type")
                     == "paperclip_agent"
                     and bool(_nested(row, "paperclip", "claim", "claimant", "id"))
-                    and bool(
-                        _nested(row, "paperclip", "claim", "token", "fingerprintSha256")
+                    and _nested(row, "paperclip", "claim", "claimant", "adapterType")
+                    == {
+                        "coding-daytona-codex": "codex_local",
+                        "coding-daytona-claude": "claude_local",
+                        "coding-daytona-pi": "pi_local",
+                    }.get(str(row.get("profile") or ""))
+                    and _nested(row, "paperclip", "claim", "token") is None
+                    and parsed_time(_nested(row, "paperclip", "claim", "claimedAt"))
+                    is not None
+                    and parsed_time(
+                        _nested(row, "paperclip", "claim", "firstHeartbeatAt")
                     )
-                    and bool(_nested(row, "paperclip", "claim", "token", "expiresAt"))
+                    is not None
+                    and parsed_time(_nested(row, "paperclip", "claim", "claimedAt"))
+                    < parsed_time(
+                        _nested(row, "paperclip", "claim", "firstHeartbeatAt")
+                    )
                 ),
                 "runner_claim_contract_incomplete",
             )
@@ -5271,7 +5599,7 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 all_runs(valid_c077)
                 and isinstance(aggregate, dict)
                 and aggregate.get("status") == "passed"
-                and aggregate.get("requiredProfiles") == list(NATIVE_HARNESS_PROFILES)
+                and aggregate.get("requiredProfiles") == list(R1_E2E_HARNESS_PROFILES)
                 and aggregate.get("runs") == proofs
                 and all(
                     not (left & right)
@@ -5288,7 +5616,7 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 all_runs(valid_c010)
                 and isinstance(aggregate, dict)
                 and aggregate.get("status") == "passed"
-                and aggregate.get("requiredProfiles") == list(NATIVE_HARNESS_PROFILES)
+                and aggregate.get("requiredProfiles") == list(R1_E2E_HARNESS_PROFILES)
                 and aggregate.get("runs")
                 == [
                     _nested(row, "semanticChecks", "runner-toolhive-profile")
@@ -5315,21 +5643,54 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 findings,
                 all_runs(
                     lambda row: _nested(
-                        row,
-                        "semanticChecks",
-                        "harness-scoped-router-auth",
-                        "nativeSubscriptionCredentials",
+                        row, "semanticChecks", "harness-scoped-router-auth", "check"
                     )
-                    is False
+                    == "harness-scoped-router-auth"
                     and _nested(
                         row,
                         "semanticChecks",
                         "harness-scoped-router-auth",
-                        "credentialFilesFound",
+                        "status",
                     )
-                    == []
+                    == "passed"
+                    and _nested(
+                        row,
+                        "semanticChecks",
+                        "harness-scoped-router-auth",
+                        "evidenceSource",
+                    )
+                    == "9router-server-side-usage"
+                    and _nested(
+                        row,
+                        "semanticChecks",
+                        "harness-scoped-router-auth",
+                        "profileRef",
+                    )
+                    == row.get("profile")
+                    and _nested(
+                        row,
+                        "semanticChecks",
+                        "harness-scoped-router-auth",
+                        "routerProfileKeyRef",
+                    )
+                    == _profile_key_ref(str(row.get("profile") or ""))
+                    and all(
+                        _positive_counter(
+                            _nested(
+                                row,
+                                "semanticChecks",
+                                "harness-scoped-router-auth",
+                                key,
+                            )
+                        )
+                        for key in (
+                            "profileKeyRequestsDelta",
+                            "modelRequestsDelta",
+                            "totalRequestsDelta",
+                        )
+                    )
                 ),
-                "paperclip_harness_native_credential_isolation_not_proven",
+                "paperclip_harness_profile_routing_not_proven",
             )
         elif connection_id == "C076":
             revisions = [_nested(row, "execution", "flowRevision") for row in runs]
@@ -5345,7 +5706,7 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     == "micro_task_engine.e2e"
                     and _nested(row, "execution", "flowId") == "paperclip-github-e2e"
                 )
-                and len(set(execution_ids)) == 3
+                and len(set(execution_ids)) == len(R1_E2E_HARNESS_PROFILES)
                 and all(
                     revision == _nested(document, "flow", "revision")
                     for revision in revisions
@@ -5381,15 +5742,19 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                         == _nested(row, "github", "commitSha")
                         and _nested(harness_artifact(row), "pullRequest", "number")
                         == _nested(row, "github", "pullRequest", "number")
+                        and valid_github_controller_oracle(row)
                     )
                 ),
-                # Three isolated harness runs must not collapse onto one PR.
-                # `all_runs` proves each row; these sets prove cross-run identity.
+                # The release gate proves every declared R1 run, then verifies
+                # that its GitHub identities are not reused.
                 "github_draft_pr_not_proven",
             )
             _expect(
                 findings,
-                len(set(branches)) == len(set(commits)) == len(set(pull_numbers)) == 3,
+                len(set(branches))
+                == len(set(commits))
+                == len(set(pull_numbers))
+                == len(R1_E2E_HARNESS_PROFILES),
                 "github_e2e_run_identity_not_distinct",
             )
         elif connection_id == "C079":
@@ -5405,9 +5770,12 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     )
                     and all(
                         item.get("status") == "completed"
-                        and item.get("conclusion") in {"success", "neutral", "skipped"}
+                        and item.get("conclusion") == "success"
+                        and bool(item.get("name"))
+                        and isinstance(item.get("app"), dict)
                         for item in _nested(row, "github", "checks")
                     )
+                    and valid_github_controller_oracle(row)
                 ),
                 "github_checks_to_kestra_terminal_not_proven",
             )
@@ -5417,16 +5785,37 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 if isinstance(cleanup.get("globalAbsence"), dict)
                 else {}
             )
+            provider_resource_count = sum(
+                len(_nested(row, "resources", "daytona", "providerResources") or [])
+                for row in cleanup_rows
+            )
             _expect(
                 findings,
                 cleanup.get("completed") is True
                 and global_absence.get("status") == "passed"
+                and global_absence.get("scope") == "exact-run-owned-identities"
+                and global_absence.get("scopeFingerprintSha256")
+                == cleanup_scope_fingerprint(cleanup_rows)
+                and global_absence.get("ownedResourceCount")
+                == provider_resource_count
+                and global_absence.get("unrelatedParallelResourcesIgnored") is True
                 and full_sha256(global_absence.get("daytonaLabelFingerprintSha256"))
                 and global_absence.get("daytonaSandboxIds") == []
+                and global_absence.get("paperclipProviderLeaseIds")
+                == sorted(
+                    str(item.get("providerLeaseId") or "")
+                    for row in cleanup_rows
+                    for item in (
+                        _nested(row, "resources", "daytona", "providerResources")
+                        or []
+                    )
+                    if isinstance(item, dict)
+                )
                 and global_absence.get("githubRefs") == []
+                and global_absence.get("githubOpenPullRequests") == []
                 and global_absence.get("githubRefPrefix")
                 == "refs/heads/agent/paperclip-e2e-"
-                and len(cleanup_rows) == 3
+                and len(cleanup_rows) == len(R1_E2E_HARNESS_PROFILES)
                 and all(
                     row.get("completed") is True
                     and row.get("pullRequestClosed") is True
@@ -5445,13 +5834,9 @@ def _e2e_connection_proofs(requested: set[str]) -> dict[str, dict]:
 def _integration_connection_proofs(requested: set[str]) -> dict[str, dict]:
     ids = requested & {
         "C012",
-        "C013",
-        "C021",
-        "C022",
         "C023",
         "C024",
         "C027",
-        "C028",
         "C029",
         "C030",
     }
@@ -5485,30 +5870,13 @@ def _integration_connection_proofs(requested: set[str]) -> dict[str, dict]:
         findings: list[dict] = []
         row = row_for(connection_id)
         if connection_id == "C012":
-            c013, c023 = row_for("C013"), row_for("C023")
+            c023 = row_for("C023")
             _expect(
                 findings,
-                isinstance(c013, dict)
-                and isinstance(c023, dict)
-                and c013.get("ok") is True
-                and c013.get("bridgeManagedByToolHive") is True
-                and _nested(c013, "cleanup", "workloadRemoved") is True
-                and _nested(c013, "cleanup", "tokenFileRemoved") is True
+                isinstance(c023, dict)
                 and c023.get("ok") is True
                 and _nested(c023, "cleanup", "workloadRemoved") is True,
                 "toolhive_managed_workload_not_proven",
-            )
-        elif connection_id in {"C021", "C022"}:
-            # The conditional gate is handled separately.  If consent is active,
-            # this exact live row must exist and pass; no callback/read shortcut.
-            _expect(
-                findings,
-                isinstance(row, dict)
-                and row.get("ok") is True
-                and row.get("state") == "passed"
-                and row.get("liveGateIncluded") is True
-                and row.get("authorizedConnectionExercised") is True,
-                "authorized_oauth_live_canary_not_proven",
             )
         else:
             _expect(
@@ -5518,24 +5886,7 @@ def _integration_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 and row.get("state") == "passed",
                 "integration_canary_missing_or_failed",
             )
-            if isinstance(row, dict) and connection_id == "C013":
-                _expect(
-                    findings,
-                    row.get("bridgeManagedByToolHive") is True
-                    and row.get("shortLivedToken") is True
-                    and row.get("ephemeral0600TokenMount") is True
-                    and row.get("tokenPersisted") is False
-                    and row.get("action") == "ap_list_flows"
-                    and bool(
-                        re.fullmatch(
-                            r"[0-9a-f]{64}", str(row.get("resultSha256") or "")
-                        )
-                    )
-                    and _nested(row, "cleanup", "workloadRemoved") is True
-                    and _nested(row, "cleanup", "tokenFileRemoved") is True,
-                    "activepieces_curated_tool_semantics_invalid",
-                )
-            elif isinstance(row, dict) and connection_id == "C023":
+            if isinstance(row, dict) and connection_id == "C023":
                 _expect(
                     findings,
                     row.get("controlledMarkerObserved") is True
@@ -5559,24 +5910,13 @@ def _integration_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     "searxng_json_search_semantics_invalid",
                 )
             elif isinstance(row, dict) and connection_id == "C027":
-                postgrest_target = profile in {
-                    "postgres-notion",
-                    "postgres-postgrest-nocodb-nocodocs",
-                }
-                if profile == "postgres-notion":
-                    findings.extend(_data_content_projection_contract_findings(profile))
-                    findings.extend(_postgrest_verify_findings(profile))
+                findings.extend(_data_content_projection_contract_findings(profile))
+                findings.extend(_postgrest_verify_findings(profile))
                 _expect(
                     findings,
-                    profile
-                    in {
-                        "postgres-notion",
-                        "baserow-wikijs",
-                        "postgres-postgrest-nocodb-nocodocs",
-                    }
+                    profile == "postgres-notion"
                     and row.get("dataContentProfile") == profile
-                    and row.get("tablesApiComponent")
-                    == ("postgrest" if postgrest_target else "baserow")
+                    and row.get("tablesApiComponent") == "postgrest"
                     and row.get("source") == "paperclip_process_heartbeat_run"
                     and all(
                         isinstance(row.get(key), str) and bool(row.get(key))
@@ -5592,139 +5932,21 @@ def _integration_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     and row.get("secretIdMatchesManaged") is True
                     and row.get("credentialResolvedBy") == "paperclip_runtime"
                     and row.get("secretAccessEventVerified") is True
-                    and row.get("createStatus") == (201 if postgrest_target else 200)
+                    and row.get("createStatus") == 201
                     and row.get("readStatus") == 200
-                    and row.get("deleteStatus")
-                    in ({200, 204} if postgrest_target else {204})
+                    and row.get("deleteStatus") in {200, 204}
                     and row.get("markerObserved") is True
-                    and (
-                        row.get("postDeleteAbsent") is True
-                        if postgrest_target
-                        else row.get("postDeleteStatus") == 404
-                    )
+                    and row.get("postDeleteAbsent") is True
                     and row.get("cleanup") == "verified_deleted"
                     and row.get("paperclipCleanup")
                     == {"runTerminalOrCancelled": True, "issueDeleted": True}
-                    and (
-                        row.get("dependencyEvidence")
-                        == _dependency_ref(
-                            POSTGREST_VERIFY_EVIDENCE,
-                            "PostgrestVerification",
-                            ROOT / "bin/server-postgrest.py",
-                        )
-                        if profile == "postgres-notion"
-                        else True
+                    and row.get("dependencyEvidence")
+                    == _dependency_ref(
+                        POSTGREST_VERIFY_EVIDENCE,
+                        "PostgrestVerification",
+                        ROOT / "bin/server-postgrest.py",
                     ),
                     "tables_api_paperclip_crud_semantics_invalid",
-                )
-            elif isinstance(row, dict) and connection_id == "C028":
-                postgrest_target = profile in {
-                    "postgres-notion",
-                    "postgres-postgrest-nocodb-nocodocs",
-                }
-                if profile == "postgres-notion":
-                    findings.extend(_data_content_projection_contract_findings(profile))
-                    findings.extend(_postgrest_verify_findings(profile))
-                statuses = (
-                    row.get("stepStatuses")
-                    if isinstance(row.get("stepStatuses"), dict)
-                    else {}
-                )
-                cleanup = (
-                    row.get("cleanup") if isinstance(row.get("cleanup"), dict) else {}
-                )
-                _expect(
-                    findings,
-                    profile
-                    in {
-                        "postgres-notion",
-                        "baserow-wikijs",
-                        "postgres-postgrest-nocodb-nocodocs",
-                    }
-                    and row.get("dataContentProfile") == profile
-                    and row.get("tablesApiComponent")
-                    == ("postgrest" if postgrest_target else "baserow")
-                    and row.get("source") == "activepieces_native_flow"
-                    and bool(row.get("activepiecesProjectId"))
-                    and bool(row.get("activepiecesFlowRunId"))
-                    and row.get("piece")
-                    == (
-                        "@activepieces/piece-http@0.11.10"
-                        if postgrest_target
-                        else "@activepieces/piece-baserow@0.9.5"
-                    )
-                    and row.get("actions")
-                    == (
-                        [
-                            "postgrest_create",
-                            "postgrest_read",
-                            "postgrest_delete",
-                        ]
-                        if postgrest_target
-                        else [
-                            "baserow_create_row",
-                            "baserow_get_row",
-                            "baserow_delete_row",
-                        ]
-                    )
-                    and row.get("credentialProjection")
-                    == str(ROOT / "runtime/integrations/services/activepieces.env")
-                    and row.get("projectionSourceHash") == _canonical_sha256()
-                    and row.get("tokenDistinctFromPaperclip") is True
-                    and (
-                        (
-                            row.get("credentialStorage") == "encrypted_project_variable"
-                            and bool(row.get("credentialVariableId"))
-                            and row.get("credentialVariableName")
-                            == "MTE_POSTGREST_ACTIVEPIECES_TOKEN"
-                            and row.get("credentialReference")
-                            == "{{variables['MTE_POSTGREST_ACTIVEPIECES_TOKEN']}}"
-                            and row.get("credentialValueReadBackVerified") is True
-                        )
-                        if postgrest_target
-                        else row.get("connectionType") == "CUSTOM_AUTH"
-                    )
-                    and row.get("osiLicense", {}).get("component")
-                    == ("postgrest" if postgrest_target else "baserow")
-                    and row.get("osiLicense", {}).get("spdx") == "MIT"
-                    and row.get("osiLicense", {}).get("verified") is True
-                    and row.get("flowRunStatus") == "SUCCEEDED"
-                    and row.get("triggerStatus") == 200
-                    and statuses
-                    == {
-                        "create": "SUCCEEDED",
-                        "read": "SUCCEEDED",
-                        "delete": "SUCCEEDED",
-                    }
-                    and row.get("markerObserved") is True
-                    and (
-                        row.get("postDeleteAbsent") is True
-                        if postgrest_target
-                        else row.get("postDeleteStatus") == 404
-                    )
-                    and all(
-                        cleanup.get(key) is True
-                        for key in (
-                            (
-                                "recordDeleted",
-                                "flowDeleted",
-                                "credentialVariablePreserved",
-                            )
-                            if postgrest_target
-                            else ("recordDeleted", "flowDeleted", "connectionDeleted")
-                        )
-                    )
-                    and (
-                        row.get("dependencyEvidence")
-                        == _dependency_ref(
-                            POSTGREST_VERIFY_EVIDENCE,
-                            "PostgrestVerification",
-                            ROOT / "bin/server-postgrest.py",
-                        )
-                        if profile == "postgres-notion"
-                        else True
-                    ),
-                    "tables_api_activepieces_flow_semantics_invalid",
                 )
             elif isinstance(row, dict) and connection_id == "C029":
                 split, split_findings = _c029_integration_evidence()
@@ -5873,18 +6095,11 @@ def _hermes_connection_proofs(requested: set[str]) -> dict[str, dict]:
             and row.get("nativeHermesIntegration") is True
         )
 
-    def unrestricted_host_operator_ready() -> bool:
+    def host_operator_policy_ready() -> bool:
         try:
             unit = HERMES_UNIT_RUNTIME.read_text(encoding="utf-8")
-            sudoers = HERMES_SUDOERS_RUNTIME.read_text(encoding="utf-8")
-            sudoers_mode = HERMES_SUDOERS_RUNTIME.stat().st_mode & 0o777
         except OSError:
             return False
-        policy = [
-            line.strip()
-            for line in sudoers.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
         config = _json_object(CONFIG) or {}
         components = _nested(config, "spec", "components")
         hermes = (
@@ -5902,6 +6117,35 @@ def _hermes_connection_proofs(requested: set[str]) -> dict[str, dict]:
             else None
         )
         runtime = hermes.get("runtime") if isinstance(hermes, dict) else None
+        if not isinstance(runtime, dict):
+            return False
+        expected_runtime = {
+            "command": "/opt/mte-hermes/current/venv/bin/hermes gateway run --replace",
+            "apiExposure": "private-docker-bridge",
+            "llmRoute": "9router",
+            "messaging": ["telegram", "mattermost"],
+            "operatorMode": runtime.get("operatorMode"),
+        }
+        if runtime != expected_runtime:
+            return False
+        mode = runtime.get("operatorMode")
+        if mode == "unprivileged_service":
+            return (
+                not HERMES_SUDOERS_RUNTIME.exists()
+                and "NoNewPrivileges=true" in unit
+            )
+        if mode != "unrestricted_host_repair":
+            return False
+        try:
+            sudoers = HERMES_SUDOERS_RUNTIME.read_text(encoding="utf-8")
+            sudoers_mode = HERMES_SUDOERS_RUNTIME.stat().st_mode & 0o777
+        except OSError:
+            return False
+        policy = [
+            line.strip()
+            for line in sudoers.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
         return (
             sudoers_mode == 0o440
             and policy
@@ -5910,15 +6154,6 @@ def _hermes_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 "mte-hermes ALL=(ALL:ALL) NOPASSWD: ALL",
             ]
             and "NoNewPrivileges=true" not in unit
-            and isinstance(runtime, dict)
-            and runtime
-            == {
-                "command": "/opt/mte-hermes/current/venv/bin/hermes gateway run --replace",
-                "apiExposure": "loopback",
-                "llmRoute": "9router",
-                "messaging": ["telegram", "mattermost"],
-                "operatorMode": "unrestricted_host_repair",
-            }
         )
 
     for connection_id in ids:
@@ -5978,8 +6213,8 @@ def _hermes_connection_proofs(requested: set[str]) -> dict[str, dict]:
         elif connection_id == "C035":
             _expect(
                 findings,
-                unrestricted_host_operator_ready(),
-                "hermes_unrestricted_host_operator_invalid",
+                host_operator_policy_ready(),
+                "hermes_host_operator_policy_invalid",
             )
         results[connection_id] = _connection_result(
             connection_id, findings, evidence=HERMES_EVIDENCE
@@ -6040,8 +6275,6 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
         "C048",
         "C049",
         "C050",
-        "C061",
-        "C062",
         "C063",
         "C064",
         "C069",
@@ -6086,7 +6319,7 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 else {}
             )
 
-            def valid_emitter(emitter: dict, *, runner_origin: bool) -> bool:
+            def valid_emitter(emitter: dict) -> bool:
                 statuses = (
                     emitter.get("otlpHttpStatus")
                     if isinstance(emitter.get("otlpHttpStatus"), dict)
@@ -6105,12 +6338,11 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     "runId",
                     "traceId",
                     "backendProof",
-                    *({"networkLifecycle"} if runner_origin else set()),
+                    "networkLifecycle",
                 }
                 network = (
                     emitter.get("networkLifecycle")
-                    if runner_origin
-                    and isinstance(emitter.get("networkLifecycle"), dict)
+                    if isinstance(emitter.get("networkLifecycle"), dict)
                     else {}
                 )
                 return (
@@ -6132,21 +6364,15 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
                         "victoriatracesCount",
                     }
                     and all(_positive_counter(value) for value in backend.values())
-                    and (
-                        not runner_origin
-                        or (
-                            set(network)
-                            == {
-                                "network",
-                                "temporaryAttachmentCreated",
-                                "temporaryAttachmentCleanupVerified",
-                            }
-                            and bool(network.get("network"))
-                            and network.get("temporaryAttachmentCreated") is True
-                            and network.get("temporaryAttachmentCleanupVerified")
-                            is True
-                        )
-                    )
+                    and set(network)
+                    == {
+                        "network",
+                        "temporaryAttachmentCreated",
+                        "temporaryAttachmentCleanupVerified",
+                    }
+                    and bool(network.get("network"))
+                    and network.get("temporaryAttachmentCreated") is True
+                    and network.get("temporaryAttachmentCleanupVerified") is True
                 )
 
             _expect(
@@ -6154,8 +6380,8 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 set(row) == {"status", "emitterCoverage", "emitters"}
                 and row.get("emitterCoverage") == {"application": True, "runner": True}
                 and set(emitters) == {"application", "runner"}
-                and valid_emitter(application, runner_origin=False)
-                and valid_emitter(runner, runner_origin=True)
+                and valid_emitter(application)
+                and valid_emitter(runner)
                 and application.get("runId") != runner.get("runId")
                 and application.get("traceId") != runner.get("traceId"),
                 "application_runner_telemetry_not_proven",
@@ -6257,9 +6483,15 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
                         str(row.get("canonicalWebhookFingerprintSha256") or ""),
                     )
                 )
+                and bool(
+                    re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(row.get("deployedWebhookFingerprintSha256") or ""),
+                    )
+                )
                 and row.get("canonicalWebhookFingerprintSha256")
-                == row.get("deployedWebhookFingerprintSha256")
-                and row.get("webhookFingerprintMatch") is True
+                != row.get("deployedWebhookFingerprintSha256")
+                and row.get("webhookPathPreserved") is True
                 and bool(row.get("postAuthor"))
                 and row.get("postChannel") == "mte-alerts"
                 and row.get("postAuthorIdentityCount") == 1
@@ -6295,8 +6527,6 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
             )
             expected_path_counts = {
                 "postgres-notion": 6,
-                "baserow-wikijs": 8,
-                "postgres-postgrest-nocodb-nocodocs": 7,
             }
             canonical_values, canonical_findings = dotenv(CANONICAL_ENV)
             findings.extend(canonical_findings)
@@ -6350,8 +6580,6 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
             )
             expected_path_counts = {
                 "postgres-notion": 4,
-                "baserow-wikijs": 5,
-                "postgres-postgrest-nocodb-nocodocs": 4,
             }
             canonical_values, canonical_findings = dotenv(CANONICAL_ENV)
             findings.extend(canonical_findings)
@@ -6394,16 +6622,18 @@ def _observability_connection_proofs(requested: set[str]) -> dict[str, dict]:
         elif connection_id == "C069":
             _expect(
                 findings,
-                row.get("stableDokployIds") is True
+                row.get("contract") == "direct-docker-compose"
+                and row.get("project") == "mte-platform"
                 and row.get("noDuplicateResources") is True
-                and row.get("secondPassNoChange") is True
                 and _positive_counter(row.get("componentCount"))
+                and row.get("coverage")
+                == ["canonical-aggregate-compose", "live-runtime-labels"]
                 and bool(
                     re.fullmatch(
                         r"[0-9a-f]{64}", str(row.get("inventoryIdentitySha256") or "")
                     )
                 ),
-                "indexed_idempotency_semantics_invalid",
+                "compose_runtime_semantics_invalid",
             )
         results[connection_id] = _connection_result(
             connection_id, findings, evidence=OBSERVABILITY_EVIDENCE
@@ -6429,9 +6659,9 @@ def _indexed_evidence_context() -> tuple[
     gate = _source_gate()
     expected_hashes = {
         "server-observability-canary.py": _sha256_file(SERVER_OBSERVABILITY_SOURCE),
-        "server-dokploy.py": _sha256_file(SERVER_DOKPLOY_SOURCE),
         "server-provision.py": _sha256_file(SERVER_PROVISION_SOURCE),
         "server-toolhive.py": _sha256_file(SERVER_TOOLHIVE_SOURCE),
+        "server-profile-reconcile.py": _sha256_file(SERVER_PROFILE_RECONCILE_SOURCE),
         "server-config.py": _sha256_file(SERVER_CONFIG_SOURCE),
     }
     for path, document, expected_kind in (
@@ -6496,8 +6726,8 @@ def _indexed_evidence_context() -> tuple[
         "indexed_identity_chain_mismatch",
     )
     actions = (
-        second.get("dokployActions")
-        if isinstance(second.get("dokployActions"), dict)
+        second.get("composeActions")
+        if isinstance(second.get("composeActions"), dict)
         else {}
     )
     _expect(
@@ -6507,17 +6737,17 @@ def _indexed_evidence_context() -> tuple[
     )
     _expect(
         findings,
-        final.get("stableDokployIds") is True
+        final.get("stableComposeIdentity") is True
         and final.get("noDuplicateResources") is True
         and final.get("secondPassNoChange") is True
         and final.get("coverage")
         == [
-            "dokploy-all-indexed-components",
+            "direct-compose-all-indexed-components",
             "server-provision-all-adapters",
             "toolhive-provisioning",
             "grafana-provisioning",
-            "dedicated-dokploy-api-key",
-            "dokploy-docker-engine-binding",
+            "canonical-aggregate-compose",
+            "live-runtime-labels",
         ],
         "indexed_final_semantics_invalid",
     )
@@ -6525,7 +6755,7 @@ def _indexed_evidence_context() -> tuple[
 
 
 def _provisioning_connection_proofs(requested: set[str]) -> dict[str, dict]:
-    ids = requested & {"C014", "C015", "C016", "C019", "C037", "C038", "C039"}
+    ids = requested & {"C014", "C015", "C016", "C019", "C037", "C039"}
     if not ids:
         return {}
     _final, _first, second, envelope = _indexed_evidence_context()
@@ -6679,23 +6909,6 @@ def _provisioning_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 and bool(_nested(row, "fingerprints", "botToken"))
                 and bool(_nested(row, "fingerprints", "alertWebhook")),
                 "mattermost_provisioning_semantics_invalid",
-            )
-        elif connection_id == "C038":
-            row = component_map.get("activepieces", {})
-            _expect(
-                findings,
-                set(row.get("managed") or [])
-                >= {
-                    "owner",
-                    "platform",
-                    "default_project",
-                    "mcp_token",
-                    "managed_flows",
-                    "connection_slots",
-                }
-                and _positive_counter(row.get("managedFlowCount"))
-                and _positive_counter(row.get("connectionSlotCount")),
-                "activepieces_declarative_resources_not_proven",
             )
         elif connection_id == "C039":
             row = component_map.get("kestra", {})
@@ -7123,93 +7336,6 @@ def _kestra_reconcile_connection_proofs(requested: set[str]) -> dict[str, dict]:
     }
 
 
-def _activepieces_provision_connection_proofs(requested: set[str]) -> dict[str, dict]:
-    if "C038" not in requested:
-        return {}
-    document, findings = _bound_evidence(
-        ACTIVEPIECES_PROVISION_EVIDENCE,
-        kind="ActivepiecesProvisionEvidence",
-        status="passed",
-        time_fields=("generatedAt",),
-        canonical_field=("canonicalSourceSha256",),
-        producer_field=("producerSha256",),
-        producer_path=SERVER_ACTIVEPIECES_PROVISION_SOURCE,
-    )
-    if document is not None:
-        values, canonical_findings = dotenv(CANONICAL_ENV)
-        findings.extend(canonical_findings)
-        profile = values.get("DATA_CONTENT_PROFILE", "")
-        flows = (
-            document.get("managedFlows")
-            if isinstance(document.get("managedFlows"), list)
-            else []
-        )
-        slots = (
-            document.get("credentialSlots")
-            if isinstance(document.get("credentialSlots"), list)
-            else []
-        )
-        expected_flow_names = {
-            "MTE Curated Slot - Research",
-            "MTE Curated Slot - Content",
-            "MTE Curated Slot - Operations",
-        }
-        postgrest_profile = profile in {
-            "postgres-notion",
-            "postgres-postgrest-nocodb-nocodocs",
-        }
-        _expect(
-            findings,
-            document.get("ok") is True
-            and document.get("dataContentProfile") == profile
-            and document.get("producerPath")
-            == str(SERVER_ACTIVEPIECES_PROVISION_SOURCE)
-            and all(
-                bool(document.get(key))
-                for key in ("ownerId", "platformId", "projectId")
-            )
-            and document.get("identityCount") == 1
-            and document.get("userCount") == 1
-            and len(flows) == 3
-            and {row.get("displayName") for row in flows if isinstance(row, dict)}
-            == expected_flow_names
-            and all(
-                isinstance(row, dict)
-                and row.get("status") == "ready"
-                and row.get("type") == "flow"
-                and bool(row.get("id"))
-                for row in flows
-            )
-            and len(slots) == 1
-            and (
-                isinstance(slots[0], dict)
-                and slots[0].get("status") == "ready"
-                and bool(slots[0].get("id"))
-                and slots[0].get("valueRedacted") is True
-                and (
-                    slots[0].get("type") == "project-variable"
-                    and slots[0].get("name") == "MTE_POSTGREST_ACTIVEPIECES_TOKEN"
-                    and slots[0].get("purpose") == "postgrest-bearer-token"
-                    if postgrest_profile
-                    else slots[0].get("type") == "app-connection"
-                    and slots[0].get("externalId") == "mte-curated-baserow"
-                    and slots[0].get("pieceName") == "@activepieces/piece-baserow"
-                )
-            )
-            and document.get("mcpTokenIssuable") is True
-            and document.get("mcpTokenPersisted") is False
-            and document.get("secondRunNoOp") is True
-            and document.get("mutationCount") == 0
-            and document.get("duplicateCount") == 0,
-            "activepieces_provision_semantics_invalid",
-        )
-    return {
-        "C038": _connection_result(
-            "C038", findings, evidence=ACTIVEPIECES_PROVISION_EVIDENCE
-        )
-    }
-
-
 def _account_provision_connection_proofs(requested: set[str]) -> dict[str, dict]:
     """Bind C075 to both live harness isolation and Paperclip secret scopes."""
     if "C075" not in requested:
@@ -7251,6 +7377,21 @@ def _account_provision_connection_proofs(requested: set[str]) -> dict[str, dict]
             paperclip.get("agentBindings")
             if isinstance(paperclip.get("agentBindings"), list)
             else []
+        )
+        environment_bindings = (
+            paperclip.get("agentEnvironmentBindings")
+            if isinstance(paperclip.get("agentEnvironmentBindings"), list)
+            else []
+        )
+        project_workspace = (
+            paperclip.get("projectWorkspace")
+            if isinstance(paperclip.get("projectWorkspace"), dict)
+            else {}
+        )
+        daytona_environment = (
+            paperclip.get("daytonaEnvironment")
+            if isinstance(paperclip.get("daytonaEnvironment"), dict)
+            else {}
         )
         values, dotenv_findings = dotenv(CANONICAL_ENV)
         findings.extend(dotenv_findings)
@@ -7343,6 +7484,69 @@ def _account_provision_connection_proofs(requested: set[str]) -> dict[str, dict]
             and len(bindings) == 3
             and all(isinstance(row, dict) for row in bindings),
             "paperclip_agent_binding_profile_set_invalid",
+        )
+        workspace_id = str(project_workspace.get("workspaceId") or "")
+        workspace_policy = (
+            project_workspace.get("policy")
+            if isinstance(project_workspace.get("policy"), dict)
+            else {}
+        )
+        expected_repo_url = (
+            "https://github.com/"
+            f"{values.get('E2E_GITHUB_OWNER', '')}/"
+            f"{values.get('E2E_GITHUB_REPOSITORY', '')}.git"
+        )
+        expected_branch = values.get("E2E_GITHUB_BASE_BRANCH", "")
+        _expect(
+            findings,
+            project_workspace.get("status") == "ready"
+            and bool(workspace_id)
+            and project_workspace.get("sourceType") == "git_repo"
+            and project_workspace.get("repoUrl") == expected_repo_url
+            and project_workspace.get("defaultRef") == expected_branch
+            and project_workspace.get("isPrimary") is True
+            and workspace_policy
+            == {
+                "enabled": True,
+                "defaultMode": "isolated_workspace",
+                "allowIssueOverride": True,
+                "defaultProjectWorkspaceId": workspace_id,
+                "workspaceStrategy": {
+                    "type": "cloud_sandbox",
+                    "baseRef": expected_branch,
+                },
+            },
+            "paperclip_project_workspace_policy_invalid",
+        )
+        environment_id = str(daytona_environment.get("environmentId") or "")
+        _expect(
+            findings,
+            daytona_environment.get("status") == "ready"
+            and bool(environment_id)
+            and daytona_environment.get("name")
+            == values.get("MTE_DAYTONA_ENVIRONMENT_NAME")
+            and daytona_environment.get("driver") == "sandbox"
+            and daytona_environment.get("provider") == "daytona",
+            "paperclip_daytona_environment_invalid",
+        )
+        _expect(
+            findings,
+            [
+                row.get("profileRef")
+                for row in environment_bindings
+                if isinstance(row, dict)
+            ]
+            == list(NATIVE_HARNESS_PROFILES)
+            and len(environment_bindings) == len(NATIVE_HARNESS_PROFILES)
+            and all(
+                isinstance(row, dict)
+                and bool(row.get("agentId"))
+                and row.get("status") == "ready"
+                and row.get("environmentId") == environment_id
+                and row.get("defaultEnvironmentId") == environment_id
+                for row in environment_bindings
+            ),
+            "paperclip_agent_environment_binding_invalid",
         )
         bound_ids: list[str] = []
         for row in bindings:
@@ -7628,7 +7832,6 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
     ids = requested & {
         "C004",
         "C005",
-        "C020",
         "C025",
         "C026",
         "C029",
@@ -7710,7 +7913,6 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
     expected_ids = {
         "C004",
         "C005",
-        "C020",
         "C025",
         "C026",
         "C029",
@@ -7726,7 +7928,7 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
     shared: list[dict] = []
     _expect(shared, set(rows) == expected_ids, "cloudflare_connection_set_mismatch")
     results: dict[str, dict] = {}
-    human_ids = {"C004", "C005", "C020", "C025", "C032", "C046"}
+    human_ids = {"C004", "C005", "C025", "C032", "C046"}
     if not external_data_content:
         human_ids.add("C029")
     data_content, data_content_findings = _cloudflare_data_content_edge_contract()
@@ -7873,7 +8075,9 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 row.get("expectedAccessClass") == "service"
                 and row.get("anonymousDenied") is True
                 and row.get("serviceTokenStatus") == 200
-                and row.get("controlledScrapeMarkerObserved") is True
+                and row.get("liveScrapeKnownDocumentObserved") is True
+                and row.get("liveScrapeMetadataStatus") == 200
+                and row.get("liveScrapeCacheBypassed") is True
                 and row.get("edgeGateVerified") is True
                 and row.get("serviceSemanticVerified") is True
                 and _dependency_refs_current(row.get("dependencyEvidence")),
@@ -7909,7 +8113,7 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 and row.get("excludedTargetsRejected") is True
                 and all(
                     blocked.get(str(port)) is True or blocked.get(port) is True
-                    for port in (80, 443, 3000)
+                    for port in (80, 443, 2377, 3000, 7946, 20241)
                 )
                 and all(
                     row.get(key) is True
@@ -7923,6 +8127,8 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 and row.get("firewallPolicyVersion") == "mte-origin-firewall/v2"
                 and row.get("firewallServiceActive") is True
                 and row.get("firewallServiceEnabled") is True
+                and row.get("firewallRecoveryTimerActive") is True
+                and row.get("firewallRecoveryTimerEnabled") is True
                 and bool(row.get("publicInterface"))
                 and all(
                     row.get(key) is True
@@ -7991,135 +8197,6 @@ def _cloudflare_connection_proofs(requested: set[str]) -> dict[str, dict]:
     return results
 
 
-def _host_dokploy_connection_proofs(requested: set[str]) -> dict[str, dict]:
-    ids = requested & {"C061", "C062"}
-    if not ids:
-        return {}
-    document, envelope = _bound_evidence(
-        HOST_DOKPLOY_EVIDENCE,
-        kind="HostDokployAcceptanceEvidence",
-        status="passed",
-        time_fields=("completedAt",),
-        canonical_field=("sourceGate", "sourceSha256"),
-        producer_field=("producerHashes", "server-host-dokploy-acceptance.py"),
-        producer_path=SERVER_HOST_DOKPLOY_SOURCE,
-    )
-    gate = _source_gate()
-    if document is not None:
-        _expect(
-            envelope,
-            gate is not None and document.get("sourceGate") == gate,
-            "host_dokploy_source_gate_mismatch",
-        )
-        _expect(
-            envelope,
-            document.get("producerHashes")
-            == {
-                "server-host-dokploy-acceptance.py": _sha256_file(
-                    SERVER_HOST_DOKPLOY_SOURCE
-                ),
-                "server-dokploy.py": _sha256_file(SERVER_DOKPLOY_SOURCE),
-            },
-            "host_dokploy_producer_hashes_mismatch",
-        )
-    if document is None or envelope:
-        return {
-            connection_id: _connection_result(
-                connection_id, list(envelope), evidence=HOST_DOKPLOY_EVIDENCE
-            )
-            for connection_id in ids
-        }
-    rows = {
-        connection_id: document.get(connection_id)
-        for connection_id in ("C061", "C062")
-        if isinstance(document.get(connection_id), dict)
-    }
-    results: dict[str, dict] = {}
-    for connection_id in ids:
-        findings: list[dict] = []
-        row = (
-            rows.get(connection_id) if isinstance(rows.get(connection_id), dict) else {}
-        )
-        _expect(
-            findings,
-            row.get("status") == "pass",
-            "host_dokploy_connection_row_invalid",
-        )
-        if connection_id == "C061":
-            _expect(
-                findings,
-                row.get("credentialRef") == "DOKPLOY_API_TOKEN"
-                and bool(
-                    re.fullmatch(
-                        r"[0-9a-f]{64}",
-                        str(row.get("credentialFingerprintSha256") or ""),
-                    )
-                )
-                and row.get("apiKeyAuthenticated") is True
-                and row.get("operations")
-                == [
-                    "list",
-                    "create",
-                    "update",
-                    "status",
-                    "update",
-                    "status",
-                    "delete",
-                ]
-                and row.get("resourceCreated") is True
-                and row.get("resourceUpdated") is True
-                and row.get("statusObserved") is True
-                and row.get("resourceDeleted") is True,
-                "dokploy_api_lifecycle_not_proven",
-            )
-        else:
-            first = (
-                row.get("firstRevision")
-                if isinstance(row.get("firstRevision"), dict)
-                else {}
-            )
-            second = (
-                row.get("secondRevision")
-                if isinstance(row.get("secondRevision"), dict)
-                else {}
-            )
-            created = (
-                row.get("engineResourcesCreated")
-                if isinstance(row.get("engineResourcesCreated"), dict)
-                else {}
-            )
-            cleanup = row.get("cleanup") if isinstance(row.get("cleanup"), dict) else {}
-            remaining = (
-                cleanup.get("remaining")
-                if isinstance(cleanup.get("remaining"), dict)
-                else {}
-            )
-            _expect(
-                findings,
-                bool(row.get("composeId"))
-                and first.get("containerStates") == ["running"]
-                and second.get("containerStates") == ["running"]
-                and len(first.get("configHashes") or []) == 1
-                and len(second.get("configHashes") or []) == 1
-                and all(
-                    bool(re.fullmatch(r"[0-9a-f]{64}", str(value)))
-                    for value in [
-                        *(first.get("configHashes") or []),
-                        *(second.get("configHashes") or []),
-                    ]
-                )
-                and row.get("configHashChanged") is True
-                and created == {"containers": 1, "volumes": 1, "networks": 1}
-                and cleanup.get("noResidualResources") is True
-                and remaining == {"containers": 0, "volumes": 0, "networks": 0},
-                "dokploy_docker_compose_lifecycle_not_proven",
-            )
-        results[connection_id] = _connection_result(
-            connection_id, findings, evidence=HOST_DOKPLOY_EVIDENCE
-        )
-    return results
-
-
 def _secret_store_audit() -> dict:
     findings: list[dict] = []
     if not SECRET_ROOT.is_dir() or SECRET_ROOT.is_symlink():
@@ -8127,15 +8204,6 @@ def _secret_store_audit() -> dict:
             "C070", [{"finding": "secret_root_missing_or_symlink"}]
         )
     expected_uid = 0 if str(SECRET_ROOT).startswith("/root/") else os.getuid()
-    for sidecar in BANNED_SECRET_SIDECAR_NAMES:
-        forbidden = SECRET_ROOT / sidecar
-        if forbidden.exists() or forbidden.is_symlink():
-            findings.append(
-                {
-                    "finding": "standalone_secret_sidecar_forbidden",
-                    "path": str(forbidden),
-                }
-            )
     paths: list[Path] = [SECRET_ROOT, CANONICAL_ENV, PROJECTION_MANIFEST]
     for relative in ("services", "cloudflare", "integrations"):
         base = SECRET_ROOT / relative
@@ -8242,6 +8310,167 @@ def _configuration_connection_proofs(requested: set[str]) -> dict[str, dict]:
     return results
 
 
+def _daytona_image_contract_valid(images: object, values: dict[str, str]) -> bool:
+    """Match the complete schema emitted by ``daytona.sh`` without coercion."""
+    if not isinstance(images, dict):
+        return False
+    snapshots = images.get("snapshots")
+    deferred_cleanup = images.get("deferredCleanup")
+    if not isinstance(snapshots, list):
+        return False
+    if not isinstance(deferred_cleanup, list):
+        return False
+    expected_keys = {
+        "apiVersion",
+        "kind",
+        "status",
+        "generatedAt",
+        "producerSha256",
+        "canonicalSourceSha256",
+        "controlPlane",
+        "sandboxVersion",
+        "snapshotContractHash",
+        "generation",
+        "sandboxImage",
+        "source",
+        "snapshots",
+        "deferredCleanup",
+        "pointerSwitch",
+        "resources",
+        "harnessVersions",
+        "credentialsBakedIntoImage",
+    }
+    expected_control_plane = {
+        "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+        "sourceCommit": values.get("MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"),
+    }
+    resources = {
+        "coding": {
+            "cpu": int(values.get("MTE_DAYTONA_CODING_CPU") or 0),
+            "memory": int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB") or 0),
+            "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
+        },
+        "general": {
+            "cpu": int(values.get("MTE_DAYTONA_GENERAL_CPU") or 0),
+            "memory": int(values.get("MTE_DAYTONA_GENERAL_MEMORY_GIB") or 0),
+            "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
+        },
+    }
+    generation = str(images.get("generation") or "")
+    expected_snapshots = (
+        (
+            "coding",
+            values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+            resources["coding"],
+        ),
+        (
+            "general",
+            values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+            resources["general"],
+        ),
+    )
+    snapshots_valid = len(snapshots) == 2
+    if snapshots_valid:
+        for row, (role, name, expected_resources) in zip(snapshots, expected_snapshots):
+            snapshots_valid = snapshots_valid and (
+                isinstance(row, dict)
+                and set(row)
+                == {
+                    "role",
+                    "id",
+                    "name",
+                    "state",
+                    "ref",
+                    "cpu",
+                    "memoryGiB",
+                    "diskGiB",
+                }
+                and row.get("role") == role
+                and row.get("name") == name
+                and row.get("state") == "active"
+                and bool(row.get("id"))
+                and row.get("ref") == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+                and row.get("cpu") == expected_resources["cpu"]
+                and row.get("memoryGiB") == expected_resources["memory"]
+                and row.get("diskGiB") == expected_resources["disk"]
+            )
+    snapshot_contract_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "sandboxImage": images.get("sandboxImage"),
+                "sandboxImageRevision": values.get(
+                    "MTE_DAYTONA_SANDBOX_IMAGE_REVISION"
+                ),
+                "resources": resources,
+                "harnessVersions": images.get("harnessVersions"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    prefixes = (
+        values.get("MTE_DAYTONA_CODING_SNAPSHOT_PREFIX"),
+        values.get("MTE_DAYTONA_GENERAL_SNAPSHOT_PREFIX"),
+    )
+    active_names = {
+        values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+        values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+    }
+    return (
+        set(images) == expected_keys
+        and images.get("apiVersion") == "micro-task-engine/v1alpha1"
+        and images.get("kind") == "DaytonaHarnessSnapshots"
+        and images.get("status") == "ready"
+        and images.get("controlPlane") == expected_control_plane
+        and images.get("sandboxVersion") == values.get("MTE_DAYTONA_SANDBOX_VERSION")
+        and images.get("resources") == resources
+        and images.get("harnessVersions")
+        == {
+            "codex": values.get("MTE_CODEX_VERSION"),
+            "claudeCode": values.get("MTE_CLAUDE_CODE_VERSION"),
+            "pi": values.get("MTE_PI_VERSION"),
+        }
+        and images.get("sandboxImage") == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+        and bool(
+            re.fullmatch(
+                r"[^\s@]+@sha256:[0-9a-f]{64}",
+                str(images.get("sandboxImage") or ""),
+            )
+        )
+        and images.get("source")
+        == {
+            "url": values.get("MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL"),
+            "revision": values.get("MTE_DAYTONA_SANDBOX_IMAGE_REVISION"),
+        }
+        and images.get("snapshotContractHash") == snapshot_contract_hash
+        and generation == snapshot_contract_hash[:12]
+        and prefixes[0] != prefixes[1]
+        and snapshots_valid
+        and len({row.get("id") for row in snapshots}) == 2
+        and len({row.get("name") for row in snapshots}) == 2
+        and snapshots[0].get("name") == f"{prefixes[0]}-{generation}"
+        and snapshots[1].get("name") == f"{prefixes[1]}-{generation}"
+        and images.get("pointerSwitch")
+        == {
+            "coding": values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+            "general": values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+            "completed": True,
+        }
+        and all(
+            isinstance(row, dict)
+            and set(row) == {"id", "name", "state"}
+            and bool(row.get("id"))
+            and row.get("name") not in active_names
+            and any(
+                str(row.get("name") or "").startswith(f"{prefix}-")
+                for prefix in prefixes
+            )
+            for row in deferred_cleanup
+        )
+        and images.get("credentialsBakedIntoImage") is False
+    )
+
+
 def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
     ids = requested & {"C072", "C074"}
     if not ids:
@@ -8323,6 +8552,11 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
     lifecycle = _json_object(DAYTONA_LIFECYCLE_EVIDENCE)
     values, canonical_findings = dotenv(CANONICAL_ENV)
     common.extend(canonical_findings)
+    _expect(
+        common,
+        _daytona_image_contract_valid(images, values),
+        "daytona_snapshot_schema_invalid",
+    )
     for path, nested, kind in (
         (DAYTONA_IMAGES_EVIDENCE, images, "DaytonaHarnessSnapshots"),
         (DAYTONA_LIFECYCLE_EVIDENCE, lifecycle, "DaytonaSandboxLifecycleEvidence"),
@@ -8373,6 +8607,15 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 "daytona_nested_evidence_stale_or_timestamp_missing",
                 path=str(path),
             )
+    if not isinstance(images, dict) or not isinstance(lifecycle, dict):
+        return {
+            connection_id: _connection_result(
+                connection_id,
+                list(common),
+                evidence=PAPERCLIP_DAYTONA_VERIFY_EVIDENCE,
+            )
+            for connection_id in ids
+        }
     results: dict[str, dict] = {}
     for connection_id in ids:
         findings = list(common)
@@ -8396,7 +8639,7 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
             expected_driver = {
                 "provider": "daytona",
                 "apiKeySecretId": details.get("apiKeySecretId"),
-                "apiUrl": values.get("MTE_DAYTONA_API_URL"),
+                "apiUrl": values.get("PAPERCLIP_DAYTONA_UPSTREAM_URL"),
                 "target": values.get("DAYTONA_TARGET"),
                 "snapshot": values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
                 "image": None,
@@ -8435,7 +8678,7 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     and row.get("adapterType") == contract["adapterType"]
                     and row.get("harnessVersion") == values.get(contract["versionKey"])
                     and row.get("routerKeyRef") == contract["routerKeyRef"]
-                    and row.get("cwd") == f"/home/daytona/workspaces/{profile}"
+                    and row.get("cwd") == "/home/daytona/paperclip-workspace"
                     and _exact_string_set(
                         row.get("envKeys"), ACCOUNT_PROFILE_ENV_KEYS[profile]
                     )
@@ -8477,9 +8720,7 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                         isinstance(code, str)
                         for code in row.get("acceptedWarningCodes", [])
                     )
-                    or not isinstance(
-                        row.get("optionalUserSecretBindingCount"), int
-                    )
+                    or not isinstance(row.get("optionalUserSecretBindingCount"), int)
                     or row.get("optionalUserSecretBindingCount") < 0
                 ):
                     return False
@@ -8519,9 +8760,7 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                             and isinstance(check.get("level"), str)
                             for check in attempt.get("checks", [])
                         )
-                        or not isinstance(
-                            attempt.get("probeSandboxesDeleted"), int
-                        )
+                        or not isinstance(attempt.get("probeSandboxesDeleted"), int)
                         or attempt.get("probeSandboxesDeleted") < 0
                     ):
                         return False
@@ -8531,12 +8770,10 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                     and attempts[-1].get("warningCodes")
                     == row.get("acceptedWarningCodes")
                     and all(
-                        attempt.get("accepted") is False
-                        for attempt in attempts[:-1]
+                        attempt.get("accepted") is False for attempt in attempts[:-1]
                     )
                     and sum(
-                        attempt.get("probeSandboxesDeleted", 0)
-                        for attempt in attempts
+                        attempt.get("probeSandboxesDeleted", 0) for attempt in attempts
                     )
                     == row.get("probeSandboxesDeleted")
                 )
@@ -8544,13 +8781,13 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
             _expect(
                 findings,
                 plugin.get("status") == "ready"
-                and plugin.get("package") == values.get("MTE_DAYTONA_PLUGIN_PACKAGE")
+                and plugin.get("package") == "@paperclipai/plugin-daytona"
                 and plugin.get("manifestVersion")
                 == values.get("MTE_DAYTONA_PLUGIN_MANIFEST_VERSION")
                 and plugin.get("packageVersion")
-                == values.get("MTE_DAYTONA_PLUGIN_NPM_VERSION")
+                == values.get("MTE_DAYTONA_PLUGIN_MANIFEST_VERSION")
                 and plugin.get("installedVersion")
-                == values.get("MTE_DAYTONA_PLUGIN_NPM_VERSION")
+                == values.get("MTE_DAYTONA_PLUGIN_MANIFEST_VERSION")
                 and _is_full_sha256(plugin.get("contentSha256"))
                 and isinstance(plugin.get("fileCount"), int)
                 and plugin.get("fileCount") > 0
@@ -8614,46 +8851,16 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 and isinstance(lifecycle.get("states"), list)
                 else []
             )
-            image_contract_keys = (
-                "DAYTONA_TARGET",
-                "MTE_DAYTONA_SANDBOX_BASE_IMAGE",
-                "MTE_CODEX_VERSION",
-                "MTE_CLAUDE_CODE_VERSION",
-                "MTE_PI_VERSION",
-                "MTE_CODEX_NPM_INTEGRITY",
-                "MTE_CLAUDE_CODE_NPM_INTEGRITY",
-                "MTE_PI_NPM_INTEGRITY",
-                "MTE_TOOLHIVE_VERSION",
-                "MTE_TOOLHIVE_ARCHIVE_SHA256",
-                "MTE_GITHUB_CLI_VERSION",
-                "MTE_GITHUB_CLI_ARCHIVE_SHA256",
-                "MTE_AGENT_GATEWAY_NINEROUTER_OPENAI_BASE_URL",
-                "HERMES_LLM_MODEL",
-                "MTE_PI_CODING_AGENT_DIR",
-                "MTE_DAYTONA_CODING_SNAPSHOT",
-                "MTE_DAYTONA_GENERAL_SNAPSHOT",
-                "MTE_DAYTONA_CODING_CPU",
-                "MTE_DAYTONA_CODING_MEMORY_GIB",
-                "MTE_DAYTONA_GENERAL_CPU",
-                "MTE_DAYTONA_GENERAL_MEMORY_GIB",
-                "MTE_DAYTONA_DISK_GIB",
-            )
-            expected_contract = {
-                key: values.get(key, "") for key in sorted(image_contract_keys)
-            }
-            expected_contract_hash = hashlib.sha256(
-                json.dumps(
-                    expected_contract, sort_keys=True, separators=(",", ":")
-                ).encode()
-            ).hexdigest()
             expected_snapshots = [
                 {
+                    "role": "coding",
                     "name": values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
                     "cpu": int(values.get("MTE_DAYTONA_CODING_CPU") or 0),
                     "memoryGiB": int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB") or 0),
                     "diskGiB": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
                 },
                 {
+                    "role": "general",
                     "name": values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
                     "cpu": int(values.get("MTE_DAYTONA_GENERAL_CPU") or 0),
                     "memoryGiB": int(values.get("MTE_DAYTONA_GENERAL_MEMORY_GIB") or 0),
@@ -8661,126 +8868,246 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                 },
             ]
             expected_states = [
-                ("created", "started"),
-                ("file-roundtrip", "started"),
-                ("stopped", "stopped"),
-                ("restarted", "started"),
-                ("stopped-before-archive", "stopped"),
-                ("archive-requested", "archiving"),
-                ("archived", "archived"),
-                ("restored-from-archive", "restored"),
-                ("refreshed", "started"),
-                ("final-stop", "stopped"),
-                ("cleanup", "deleted"),
+                ("create", "started"),
+                ("execute", "passed"),
+                ("delete", "deleted"),
             ]
             expected_resources = {
                 "cpu": int(values.get("MTE_DAYTONA_CODING_CPU") or 0),
                 "memory": int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB") or 0),
                 "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
             }
-            version_output = lifecycle.get("harnessVersionOutput")
-            joined_versions = (
-                "\n".join(str(row) for row in version_output)
-                if isinstance(version_output, list)
-                else ""
+            lifecycle_harnesses = lifecycle.get("harnesses")
+            expected_lifecycle_versions = (
+                ("codex", values.get("MTE_CODEX_VERSION")),
+                ("claude", values.get("MTE_CLAUDE_CODE_VERSION")),
+                ("pi", values.get("MTE_PI_VERSION")),
             )
+            valid_lifecycle_harnesses = (
+                isinstance(lifecycle_harnesses, list)
+                and len(lifecycle_harnesses) == 3
+                and all(
+                    isinstance(row, dict)
+                    and set(row) == {"name", "commandPath", "realpath", "versionOutput"}
+                    and row.get("name") == name
+                    and row.get("commandPath") == f"/usr/local/bin/{name}"
+                    and str(row.get("realpath") or "").startswith(
+                        "/opt/mte-harness/node_modules/"
+                    )
+                    and normalized_harness_version(
+                        name, row.get("versionOutput")
+                    )
+                    == version
+                    for row, (name, version) in zip(
+                        lifecycle_harnesses, expected_lifecycle_versions
+                    )
+                )
+            )
+            expected_lifecycle_keys = {
+                "apiVersion",
+                "kind",
+                "status",
+                "generatedAt",
+                "producerSha256",
+                "canonicalSourceSha256",
+                "controlPlane",
+                "sandboxVersion",
+                "provider",
+                "target",
+                "snapshot",
+                "sandboxId",
+                "workspace",
+                "harnesses",
+                "credentialFileProbe",
+                "credentialEnvProbe",
+                "resources",
+                "credentialsBakedIntoImage",
+                "states",
+                "cleanupDeleted",
+                "delete",
+            }
+            expected_image_keys = {
+                "apiVersion",
+                "kind",
+                "status",
+                "generatedAt",
+                "producerSha256",
+                "canonicalSourceSha256",
+                "controlPlane",
+                "sandboxVersion",
+                "snapshotContractHash",
+                "generation",
+                "sandboxImage",
+                "source",
+                "snapshots",
+                "deferredCleanup",
+                "pointerSwitch",
+                "resources",
+                "harnessVersions",
+                "credentialsBakedIntoImage",
+            }
             _expect(
                 findings,
-                len(snapshots) == 2
+                set(images) == expected_image_keys
+                and len(snapshots) == 2
                 and all(isinstance(row, dict) for row in snapshots)
                 and all(
-                    row.get("name") == expected["name"]
+                    set(row)
+                    == {
+                        "role",
+                        "id",
+                        "name",
+                        "state",
+                        "ref",
+                        "cpu",
+                        "memoryGiB",
+                        "diskGiB",
+                    }
+                    and row.get("ref")
+                    == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+                    and row.get("role") == expected["role"]
+                    and row.get("name") == expected["name"]
                     and row.get("cpu") == expected["cpu"]
                     and row.get("memoryGiB") == expected["memoryGiB"]
                     and row.get("diskGiB") == expected["diskGiB"]
                     and bool(row.get("id"))
                     and row.get("state") == "active"
-                    and bool(
-                        re.fullmatch(
-                            r"sha256:[0-9a-f]{64}", str(row.get("digest") or "")
-                        )
-                    )
                     for row, expected in zip(snapshots, expected_snapshots)
                 )
                 and len({row.get("id") for row in snapshots}) == 2
+                and len({row.get("name") for row in snapshots}) == 2
+                and values.get("MTE_DAYTONA_CODING_SNAPSHOT_PREFIX")
+                != values.get("MTE_DAYTONA_GENERAL_SNAPSHOT_PREFIX")
                 and versions
                 == {
                     "codex": values.get("MTE_CODEX_VERSION"),
                     "claudeCode": values.get("MTE_CLAUDE_CODE_VERSION"),
                     "pi": values.get("MTE_PI_VERSION"),
-                    "toolhive": values.get("MTE_TOOLHIVE_VERSION"),
-                    "githubCli": values.get("MTE_GITHUB_CLI_VERSION"),
                 }
-                and images.get("packageIntegrity")
+                and images.get("resources")
                 == {
-                    "codex": values.get("MTE_CODEX_NPM_INTEGRITY"),
-                    "claudeCode": values.get("MTE_CLAUDE_CODE_NPM_INTEGRITY"),
-                    "pi": values.get("MTE_PI_NPM_INTEGRITY"),
-                    "githubCliSha256": values.get(
-                        "MTE_GITHUB_CLI_ARCHIVE_SHA256"
+                    "coding": {
+                        "cpu": int(values.get("MTE_DAYTONA_CODING_CPU") or 0),
+                        "memory": int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB") or 0),
+                        "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
+                    },
+                    "general": {
+                        "cpu": int(values.get("MTE_DAYTONA_GENERAL_CPU") or 0),
+                        "memory": int(
+                            values.get("MTE_DAYTONA_GENERAL_MEMORY_GIB") or 0
+                        ),
+                        "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
+                    },
+                }
+                and images.get("sandboxImage")
+                == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+                and bool(
+                    re.fullmatch(
+                        r"[^\s@]+@sha256:[0-9a-f]{64}",
+                        str(images.get("sandboxImage") or ""),
+                    )
+                )
+                and images.get("source")
+                == {
+                    "url": values.get("MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL"),
+                    "revision": values.get("MTE_DAYTONA_SANDBOX_IMAGE_REVISION"),
+                }
+                and images.get("snapshotContractHash")
+                == hashlib.sha256(
+                    json.dumps(
+                        {
+                            "sandboxImage": images.get("sandboxImage"),
+                            "sandboxImageRevision": values.get(
+                                "MTE_DAYTONA_SANDBOX_IMAGE_REVISION"
+                            ),
+                            "resources": images.get("resources"),
+                            "harnessVersions": versions,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+                and images.get("generation")
+                == str(images.get("snapshotContractHash") or "")[:12]
+                and snapshots[0].get("name")
+                == f'{values.get("MTE_DAYTONA_CODING_SNAPSHOT_PREFIX")}-{images.get("generation")}'
+                and snapshots[1].get("name")
+                == f'{values.get("MTE_DAYTONA_GENERAL_SNAPSHOT_PREFIX")}-{images.get("generation")}'
+                and images.get("pointerSwitch")
+                == {
+                    "coding": values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+                    "general": values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+                    "completed": True,
+                }
+                and isinstance(images.get("deferredCleanup"), list)
+                and all(
+                    isinstance(row, dict)
+                    and set(row) == {"id", "name", "state"}
+                    and bool(row.get("id"))
+                    and row.get("name")
+                    not in {
+                        values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+                        values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+                    }
+                    and any(
+                        str(row.get("name") or "").startswith(f"{prefix}-")
+                        for prefix in (
+                            values.get("MTE_DAYTONA_CODING_SNAPSHOT_PREFIX"),
+                            values.get("MTE_DAYTONA_GENERAL_SNAPSHOT_PREFIX"),
+                        )
+                    )
+                    for row in images.get("deferredCleanup", [])
+                )
+                and images.get("controlPlane")
+                == {
+                    "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+                    "sourceCommit": values.get(
+                        "MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"
                     ),
                 }
-                and images.get("imageContract") == expected_contract
-                and images.get("imageContractHash") == expected_contract_hash
-                and _nested(images, "canonicalBinding", "imageContractUnchanged")
-                is True
-                and _nested(
-                    images, "canonicalBinding", "fullCanonicalHashAfterReadinessMerge"
-                )
-                == _canonical_sha256()
+                and images.get("sandboxVersion")
+                == values.get("MTE_DAYTONA_SANDBOX_VERSION")
                 and images.get("credentialsBakedIntoImage") is False
+                and set(lifecycle) == expected_lifecycle_keys
+                and lifecycle.get("controlPlane") == images.get("controlPlane")
+                and lifecycle.get("sandboxVersion") == images.get("sandboxVersion")
                 and lifecycle.get("provider") == "daytona"
                 and lifecycle.get("target") == values.get("DAYTONA_TARGET")
                 and lifecycle.get("snapshot")
                 == values.get("MTE_DAYTONA_CODING_SNAPSHOT")
+                and bool(lifecycle.get("sandboxId"))
+                and lifecycle.get("workspace") == "/home/daytona/paperclip-workspace"
+                and valid_lifecycle_harnesses
                 and lifecycle.get("credentialsBakedIntoImage") is False
                 and [(row.get("phase"), row.get("state")) for row in states]
                 == expected_states
-                and _nested(lifecycle, "fileRoundTrip", "verified") is True
-                and _is_full_sha256(_nested(lifecycle, "fileRoundTrip", "markerSha256"))
-                and _nested(lifecycle, "fileRoundTrip", "markerSha256")
-                == lifecycle.get("markerSha256")
-                and _nested(lifecycle, "persistence", "verified") is True
-                and _nested(lifecycle, "persistence", "afterRestart") is True
-                and _nested(lifecycle, "persistence", "afterArchiveRestore") is True
                 and _nested(lifecycle, "resources", "expected") == expected_resources
                 and _nested(lifecycle, "resources", "actual") == expected_resources
                 and _nested(lifecycle, "resources", "equal") is True
-                and _nested(lifecycle, "agentGateway", "expectedHost")
-                == values.get("MTE_AGENT_GATEWAY_HOST")
-                and _nested(lifecycle, "agentGateway", "observedDefaultGateway")
-                == values.get("MTE_AGENT_GATEWAY_HOST")
-                and _nested(lifecycle, "agentGateway", "matchesCanonical") is True
-                and all(
-                    str(values.get(key) or "") in joined_versions
-                    for key in (
-                        "MTE_CODEX_VERSION",
-                        "MTE_CLAUDE_CODE_VERSION",
-                        "MTE_PI_VERSION",
-                        "MTE_TOOLHIVE_VERSION",
-                        "MTE_GITHUB_CLI_VERSION",
-                    )
-                )
-                and _nested(lifecycle, "github", "cliVersion")
-                == values.get("MTE_GITHUB_CLI_VERSION")
-                and _nested(lifecycle, "github", "authentication")
-                == "GH_TOKEN-runtime-env"
-                and _nested(lifecycle, "github", "gitCredentialHelper")
-                == "gh auth git-credential"
-                and _nested(lifecycle, "github", "gitIdentity")
+                and lifecycle.get("credentialFileProbe")
                 == {
-                    "name": "Paperclip Agent",
-                    "email": "paperclip-agent@users.noreply.github.com",
+                    "checkedPaths": [
+                        "/home/daytona/.codex/auth.json",
+                        "/home/daytona/.claude/.credentials.json",
+                        "/home/daytona/.pi/agent/auth.json",
+                        "/home/daytona/.config/gh/hosts.yml",
+                    ],
+                    "foundPaths": [],
+                    "credentialFree": True,
                 }
-                and _nested(lifecycle, "github", "tokenInRemoteUrl") is False
-                and _nested(lifecycle, "github", "credentialFilePersisted") is False
+                and lifecycle.get("credentialEnvProbe")
+                == {
+                    "checkedNames": [
+                        "OPENAI_API_KEY",
+                        "ANTHROPIC_API_KEY",
+                        "GH_TOKEN",
+                        "CONTEXT7_API_KEY",
+                        "MTE_TOOLHIVE_BEARER_TOKEN",
+                    ],
+                    "foundNames": [],
+                    "credentialFree": True,
+                }
                 and lifecycle.get("cleanupDeleted") is True
-                and _nested(lifecycle, "piProbeConfig", "path")
-                == str(values.get("MTE_PI_CODING_AGENT_DIR") or "") + "/models.json"
-                and _nested(lifecycle, "piProbeConfig", "apiKeyReference")
-                == "$OPENAI_API_KEY"
-                and _nested(lifecycle, "piProbeConfig", "secretEmbedded") is False
-                and _is_full_sha256(_nested(lifecycle, "piProbeConfig", "sha256"))
                 and _nested(lifecycle, "delete", "requested") is True
                 and _nested(lifecycle, "delete", "getAfterDeleteStatus") == 404,
                 "daytona_snapshot_lifecycle_semantics_invalid",
@@ -8805,10 +9132,8 @@ def connection_evidence_results(requested: set[str]) -> dict[str, dict]:
         _provisioning_connection_proofs,
         _kestra_reconcile_connection_proofs,
         _profile_reconcile_connection_proofs,
-        _activepieces_provision_connection_proofs,
         _account_provision_connection_proofs,
         _cloudflare_connection_proofs,
-        _host_dokploy_connection_proofs,
         _configuration_connection_proofs,
         _daytona_connection_proofs,
         _ose_provision_connection_proofs,
@@ -8921,6 +9246,16 @@ def verify(selected: list[str], *, persist: bool = True) -> dict:
                 "findings": projection_findings,
             }
         )
+        canary_findings = _notion_projection_canary_findings()
+        checks.append(
+            {
+                "component": "notion-projection",
+                "check": "postgres-outbox-to-notion-live-canary",
+                "ok": not canary_findings,
+                "state": "passed" if not canary_findings else "failed",
+                "findings": canary_findings,
+            }
+        )
     for row in targets:
         component_id = row["id"]
         health = row.get("health")
@@ -8945,13 +9280,14 @@ def verify(selected: list[str], *, persist: bool = True) -> dict:
                 }
             )
         elif health.get("command"):
+            command = str(health["command"])
             try:
                 completed = subprocess.run(
-                    str(health["command"]),
-                    shell=True,
+                    ["/bin/sh", "-c", command],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=30,
+                    check=False,
                 )
                 check = {
                     "ok": completed.returncode == 0,
@@ -9039,11 +9375,7 @@ def status() -> dict:
     except (OSError, subprocess.SubprocessError) as exc:
         lines = []
         docker_error = type(exc).__name__
-    relevant = [
-        line
-        for line in lines
-        if line.startswith("mte-") or "compose-" in line or line.startswith("dokploy")
-    ]
+    relevant = [line for line in lines if line.startswith("mte-")]
     live = verify([], persist=False)
     result = {
         "timestamp": int(time.time()),
@@ -9052,7 +9384,7 @@ def status() -> dict:
         "containers": sorted(relevant),
         "verify": live,
     }
-    return write_evidence("status", result)
+    return result
 
 
 def compose_config() -> dict:
@@ -9136,58 +9468,6 @@ def _evidence_is_fresh(value: object, *, max_age_seconds: int = 600) -> bool:
     return -60 <= age <= max_age_seconds
 
 
-def external_provider_consent_condition(connection_id: str) -> dict:
-    evidence = _json_object(INTEGRATION_EVIDENCE)
-    canonical_hash = _sha256_file(CANONICAL_ENV)
-    if evidence is None or canonical_hash is None:
-        return {"active": True, "valid": False, "state": "condition_evidence_missing"}
-    try:
-        mode = INTEGRATION_EVIDENCE.stat().st_mode & 0o777
-    except OSError:
-        mode = None
-    if (
-        mode != 0o600
-        or evidence.get("canonicalSourceSha256") != canonical_hash
-        or not _evidence_is_fresh(evidence.get("generatedAt"))
-    ):
-        return {"active": True, "valid": False, "state": "condition_evidence_invalid"}
-    rows = evidence.get("externalProviderConsent")
-    rows = rows if isinstance(rows, list) else []
-    matches = [
-        row for row in rows if isinstance(row, dict) and row.get("id") == connection_id
-    ]
-    if len(matches) != 1:
-        return {"active": True, "valid": False, "state": "condition_evidence_invalid"}
-    row = matches[0]
-    authorized = row.get("authorizedGitHubConnectionCount")
-    if (
-        not isinstance(authorized, int)
-        or isinstance(authorized, bool)
-        or authorized < 0
-    ):
-        return {"active": True, "valid": False, "state": "condition_evidence_invalid"}
-    if authorized > 0:
-        return {
-            "active": True,
-            "valid": True,
-            "state": "active_external_provider_consent",
-            "authorizedConnectionCount": authorized,
-        }
-    if not (
-        row.get("ok") is None
-        and row.get("state") == "conditional_external_provider_consent"
-        and row.get("liveGateIncluded") is False
-        and row.get("humanAuthorizationRequired") is True
-    ):
-        return {"active": True, "valid": False, "state": "condition_evidence_invalid"}
-    return {
-        "active": False,
-        "valid": True,
-        "state": "conditional_external_provider_consent",
-        "authorizedConnectionCount": 0,
-    }
-
-
 def telegram_configured_condition() -> dict:
     try:
         values = {
@@ -9218,27 +9498,30 @@ def connection_condition(connection: dict) -> dict:
     name = connection.get("condition")
     if name is None:
         return {"active": True, "valid": True, "state": "unconditional"}
-    if name == "external-provider-consent" and connection.get("id") in {"C021", "C022"}:
-        return external_provider_consent_condition(str(connection["id"]))
     if name == "telegram-configured" and connection.get("id") == "C033":
         return telegram_configured_condition()
     return {"active": True, "valid": False, "state": "unknown_condition"}
 
 
-def registry_rows() -> tuple[list[dict], list[dict]]:
-    document = yaml.safe_load(CONNECTIONS.read_text())
-    connections_value = (
-        document.get("connections") if isinstance(document, dict) else None
-    )
-    if not isinstance(connections_value, list):
-        return [], [{"finding": "connections_not_a_list"}]
-    valid: list[dict] = []
+def acceptance_requirement_rows() -> tuple[list[dict], list[dict]]:
+    document = yaml.safe_load(ACCEPTANCE_REQUIREMENTS.read_text())
+    if not isinstance(document, dict):
+        return [], [{"finding": "acceptance_registry_not_an_object"}]
     findings: list[dict] = []
+    if document.get("apiVersion") != "micro-task-engine/v1alpha1":
+        findings.append({"finding": "acceptance_registry_api_version_invalid"})
+    if document.get("kind") != "ReleaseEvidenceRegistry":
+        findings.append({"finding": "acceptance_registry_kind_invalid"})
+    requirements_value = document.get("requirements")
+    if not isinstance(requirements_value, list):
+        findings.append({"finding": "acceptance_requirements_not_a_list"})
+        return [], findings
+    valid: list[dict] = []
     seen: set[str] = set()
     required_fields = {"id", "from", "to", "required", "auth", "exposure", "check"}
-    for index, row in enumerate(connections_value):
+    for index, row in enumerate(requirements_value):
         if not isinstance(row, dict):
-            findings.append({"index": index, "finding": "connection_not_an_object"})
+            findings.append({"index": index, "finding": "requirement_not_an_object"})
             continue
         missing = sorted(required_fields - set(row))
         connection_id = str(row.get("id", ""))
@@ -9274,8 +9557,8 @@ def registry_rows() -> tuple[list[dict], list[dict]]:
     return valid, findings
 
 
-def connections() -> dict:
-    registry, registry_findings = registry_rows()
+def acceptance() -> dict:
+    registry, registry_findings = acceptance_requirement_rows()
     evidence_results = connection_evidence_results(
         {str(row.get("id")) for row in registry if row.get("id")}
     )
@@ -9371,9 +9654,9 @@ def connections() -> dict:
             "conditionalNotRun": len(conditional_not_run),
             "notImplemented": sum(row["state"] == "not_implemented" for row in rows),
         },
-        "connections": rows,
+        "requirements": rows,
     }
-    return write_evidence("connections", result)
+    return result
 
 
 def main() -> int:
@@ -9382,13 +9665,13 @@ def main() -> int:
         value = verify(sys.argv[2:])
     elif action == "status" and len(sys.argv) == 2:
         value = status()
-    elif action == "connections" and len(sys.argv) == 2:
-        value = connections()
+    elif action == "acceptance" and len(sys.argv) == 2:
+        value = acceptance()
     elif action == "compose-config" and len(sys.argv) == 2:
         value = compose_config()
     else:
         print(
-            "usage: server-verify.py verify [components...]|status|connections|compose-config",
+            "usage: server-verify.py verify [components...]|status|acceptance|compose-config",
             file=sys.stderr,
         )
         return 2

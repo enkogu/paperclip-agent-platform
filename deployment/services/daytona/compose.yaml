@@ -1,0 +1,273 @@
+name: mte-daytona
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${MTE_DOCKER_LOG_MAX_SIZE:?required}
+    max-file: ${MTE_DOCKER_LOG_MAX_FILES:?required}
+
+services:
+  db:
+    image: ${MTE_DAYTONA_POSTGRES_IMAGE:?required}
+    container_name: mte-daytona-db
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${DAYTONA_DB_USER:?required}
+      POSTGRES_PASSWORD: ${DAYTONA_DB_PASSWORD:?required}
+      POSTGRES_DB: daytona
+    volumes: [daytona-db:/var/lib/postgresql/18/docker]
+    networks: [daytona]
+
+  redis:
+    image: ${MTE_DAYTONA_VALKEY_IMAGE:?required}
+    container_name: mte-daytona-redis
+    restart: unless-stopped
+    logging: *logging
+    command: [valkey-server, --save, "60", "1", --appendonly, "yes"]
+    volumes: [daytona-valkey:/data]
+    healthcheck:
+      test: [CMD, valkey-cli, ping]
+      interval: ${MTE_HEALTHCHECK_STANDARD_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_STANDARD_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_STANDARD_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_STANDARD_START_PERIOD:?required}
+    networks: [daytona]
+
+  registry:
+    image: ${MTE_DAYTONA_REGISTRY_IMAGE:?required}
+    container_name: mte-daytona-registry
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REGISTRY_HTTP_ADDR: registry:${MTE_DAYTONA_REGISTRY_INTERNAL_PORT:?required}
+      REGISTRY_STORAGE_DELETE_ENABLED: ${MTE_DAYTONA_REGISTRY_ENV_REGISTRY_STORAGE_DELETE_ENABLED:?required}
+    volumes: [daytona-registry:/var/lib/registry]
+    networks: [daytona]
+
+  minio:
+    image: ${MTE_DAYTONA_MINIO_IMAGE:?required}
+    container_name: mte-daytona-minio
+    restart: unless-stopped
+    logging: *logging
+    command: [server, /data, --console-address, ":${MTE_DAYTONA_MINIO_CONSOLE_INTERNAL_PORT:?required}"]
+    environment:
+      MINIO_ROOT_USER: ${DAYTONA_MINIO_USER:?required}
+      MINIO_ROOT_PASSWORD: ${DAYTONA_MINIO_PASSWORD:?required}
+    volumes: [daytona-minio:/data]
+    networks: [daytona]
+
+  dex:
+    image: ${MTE_DAYTONA_DEX_IMAGE:?required}
+    container_name: mte-daytona-dex
+    restart: unless-stopped
+    logging: *logging
+    command: [dex, serve, /etc/dex/config.yaml]
+    volumes:
+      - ./dex.yaml:/etc/dex/config.yaml:ro
+      - daytona-dex:/var/dex
+    ports:
+      - ${MTE_DAYTONA_DEX_PORT_1_MAPPING:?required}
+    networks: [daytona]
+
+  runner:
+    image: ${MTE_DAYTONA_RUNNER_IMAGE:?required}
+    container_name: mte-daytona-runner
+    restart: unless-stopped
+    privileged: true
+    logging: *logging
+    env_file: [./ssh.env]
+    environment:
+      ENVIRONMENT: production
+      API_PORT: ${MTE_DAYTONA_RUNNER_INTERNAL_PORT:?required}
+      DAYTONA_RUNNER_TOKEN: ${DAYTONA_RUNNER_API_KEY:?required}
+      RESOURCE_LIMITS_DISABLED: "false"
+      AWS_ENDPOINT_URL: ${MTE_DAYTONA_MINIO_ENDPOINT_URL:?required}
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${DAYTONA_MINIO_USER:?required}
+      AWS_SECRET_ACCESS_KEY: ${DAYTONA_MINIO_PASSWORD:?required}
+      AWS_DEFAULT_BUCKET: daytona
+      DAYTONA_API_URL: ${MTE_DAYTONA_INTERNAL_API_URL:?required}
+      RUNNER_DOMAIN: ${MTE_DAYTONA_RUNNER_ENV_RUNNER_DOMAIN:?required}
+      SSH_GATEWAY_ENABLE: "true"
+      INTER_SANDBOX_NETWORK_ENABLED: ${MTE_DAYTONA_RUNNER_ENV_INTER_SANDBOX_NETWORK_ENABLED:?required}
+    volumes:
+      - daytona-runner:/home/daytona/runner
+      - ./runner-daemon.json:/etc/docker/daemon.json:ro
+    networks: [daytona, agent-plane, tool-runtime]
+
+  agent-gateway:
+    image: ${MTE_AGENT_GATEWAY_IMAGE:?required}
+    container_name: mte-agent-plane-gateway
+    restart: unless-stopped
+    logging: *logging
+    network_mode: service:runner
+    command: [python3, /app/agent-plane-gateway.py]
+    environment:
+      MTE_AGENT_GATEWAY_NINEROUTER_PORT: ${MTE_AGENT_GATEWAY_NINEROUTER_PORT:?required}
+      MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_PORT: ${MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_PORT:?required}
+      MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_PORT: ${MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_PORT:?required}
+      MTE_AGENT_GATEWAY_TOOLHIVE_PI_PORT: ${MTE_AGENT_GATEWAY_TOOLHIVE_PI_PORT:?required}
+      MTE_AGENT_GATEWAY_NINEROUTER_UPSTREAM: ${MTE_AGENT_GATEWAY_NINEROUTER_UPSTREAM:?required}
+      MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_UPSTREAM: ${MTE_AGENT_GATEWAY_TOOLHIVE_CODEX_UPSTREAM:?required}
+      MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_UPSTREAM: ${MTE_AGENT_GATEWAY_TOOLHIVE_CLAUDE_UPSTREAM:?required}
+      MTE_AGENT_GATEWAY_TOOLHIVE_PI_UPSTREAM: ${MTE_AGENT_GATEWAY_TOOLHIVE_PI_UPSTREAM:?required}
+      TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN: ${TOOLHIVE_PROFILE_CODING_DAYTONA_CODEX_BEARER_TOKEN:?required}
+      TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN: ${TOOLHIVE_PROFILE_CODING_DAYTONA_CLAUDE_BEARER_TOKEN:?required}
+      TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN: ${TOOLHIVE_PROFILE_CODING_DAYTONA_PI_BEARER_TOKEN:?required}
+    volumes:
+      - /opt/mte-platform/bin/agent-plane-gateway.py:/app/agent-plane-gateway.py:ro
+    depends_on: [runner]
+
+  api:
+    image: ${MTE_DAYTONA_API_IMAGE:?required}
+    container_name: mte-daytona-api
+    restart: unless-stopped
+    privileged: true
+    logging: *logging
+    env_file: [./api-ssh.env]
+    environment:
+      ENVIRONMENT: production
+      NODE_ENV: production
+      PORT: ${MTE_DAYTONA_API_INTERNAL_PORT:?required}
+      RUN_MIGRATIONS: "true"
+      DB_HOST: ${MTE_DAYTONA_API_ENV_DB_HOST:?required}
+      DB_PORT: ${MTE_DAYTONA_POSTGRES_INTERNAL_PORT:?required}
+      DB_USERNAME: ${DAYTONA_DB_USER:?required}
+      DB_PASSWORD: ${DAYTONA_DB_PASSWORD:?required}
+      DB_DATABASE: daytona
+      REDIS_HOST: ${MTE_DAYTONA_API_ENV_REDIS_HOST:?required}
+      REDIS_PORT: ${MTE_DAYTONA_REDIS_INTERNAL_PORT:?required}
+      OIDC_CLIENT_ID: daytona
+      OIDC_ISSUER_BASE_URL: ${MTE_DAYTONA_INTERNAL_OIDC_URL:?required}
+      PUBLIC_OIDC_DOMAIN: ${MTE_DAYTONA_PUBLIC_OIDC_URL:?required}
+      OIDC_AUDIENCE: daytona
+      DASHBOARD_URL: ${MTE_DAYTONA_DASHBOARD_URL:?required}
+      DASHBOARD_BASE_API_URL: ${MTE_DAYTONA_DASHBOARD_BASE_API_URL:?required}
+      DEFAULT_SNAPSHOT: ${MTE_DAYTONA_SANDBOX_IMAGE:?required}
+      ENCRYPTION_KEY: ${DAYTONA_ENCRYPTION_KEY:?required}
+      ENCRYPTION_SALT: ${DAYTONA_ENCRYPTION_SALT:?required}
+      TRANSIENT_REGISTRY_URL: ${MTE_DAYTONA_INTERNAL_REGISTRY_URL:?required}
+      TRANSIENT_REGISTRY_ADMIN: ${DAYTONA_REGISTRY_USER:?required}
+      TRANSIENT_REGISTRY_PASSWORD: ${DAYTONA_REGISTRY_PASSWORD:?required}
+      TRANSIENT_REGISTRY_PROJECT_ID: daytona
+      INTERNAL_REGISTRY_URL: ${MTE_DAYTONA_INTERNAL_REGISTRY_URL:?required}
+      INTERNAL_REGISTRY_ADMIN: ${DAYTONA_REGISTRY_USER:?required}
+      INTERNAL_REGISTRY_PASSWORD: ${DAYTONA_REGISTRY_PASSWORD:?required}
+      INTERNAL_REGISTRY_PROJECT_ID: daytona
+      S3_ENDPOINT: ${MTE_DAYTONA_MINIO_ENDPOINT_URL:?required}
+      S3_STS_ENDPOINT: ${MTE_DAYTONA_MINIO_STS_ENDPOINT_URL:?required}
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY: ${DAYTONA_MINIO_USER:?required}
+      S3_SECRET_KEY: ${DAYTONA_MINIO_PASSWORD:?required}
+      S3_DEFAULT_BUCKET: daytona
+      S3_ACCOUNT_ID: /
+      S3_ROLE_NAME: /
+      PROXY_DOMAIN: ${MTE_DAYTONA_PROXY_DOMAIN:?required}
+      PROXY_PROTOCOL: http
+      PROXY_API_KEY: ${DAYTONA_PROXY_API_KEY:?required}
+      PROXY_TEMPLATE_URL: ${MTE_DAYTONA_PROXY_TEMPLATE_URL:?required}
+      DEFAULT_RUNNER_DOMAIN: ${MTE_DAYTONA_DEFAULT_RUNNER_DOMAIN:?required}
+      DEFAULT_RUNNER_API_URL: ${MTE_DAYTONA_INTERNAL_RUNNER_URL:?required}
+      DEFAULT_RUNNER_PROXY_URL: ${MTE_DAYTONA_INTERNAL_RUNNER_URL:?required}
+      DEFAULT_RUNNER_API_KEY: ${DAYTONA_RUNNER_API_KEY:?required}
+      DEFAULT_RUNNER_CPU: ${MTE_DAYTONA_DEFAULT_RUNNER_CPU:?required}
+      DEFAULT_RUNNER_MEMORY: ${MTE_DAYTONA_DEFAULT_RUNNER_MEMORY_GIB:?required}
+      DEFAULT_RUNNER_DISK: ${MTE_DAYTONA_DEFAULT_RUNNER_DISK_GIB:?required}
+      DEFAULT_RUNNER_NAME: default
+      DEFAULT_REGION_ID: us
+      DEFAULT_REGION_NAME: us
+      DEFAULT_REGION_ENFORCE_QUOTAS: "true"
+      DEFAULT_ORG_QUOTA_TOTAL_CPU_QUOTA: ${MTE_DAYTONA_DEFAULT_ORG_TOTAL_CPU:?required}
+      DEFAULT_ORG_QUOTA_TOTAL_MEMORY_QUOTA: ${MTE_DAYTONA_DEFAULT_ORG_TOTAL_MEMORY_GIB:?required}
+      DEFAULT_ORG_QUOTA_TOTAL_DISK_QUOTA: ${MTE_DAYTONA_DEFAULT_ORG_TOTAL_DISK_GIB:?required}
+      DEFAULT_ORG_QUOTA_MAX_CPU_PER_SANDBOX: ${MTE_DAYTONA_DEFAULT_ORG_MAX_CPU_PER_SANDBOX:?required}
+      DEFAULT_ORG_QUOTA_MAX_MEMORY_PER_SANDBOX: ${MTE_DAYTONA_DEFAULT_ORG_MAX_MEMORY_GIB_PER_SANDBOX:?required}
+      DEFAULT_ORG_QUOTA_MAX_DISK_PER_SANDBOX: ${MTE_DAYTONA_DEFAULT_ORG_MAX_DISK_GIB_PER_SANDBOX:?required}
+      DEFAULT_ORG_QUOTA_SNAPSHOT_QUOTA: ${MTE_DAYTONA_DEFAULT_ORG_SNAPSHOT_QUOTA:?required}
+      DEFAULT_ORG_QUOTA_MAX_SNAPSHOT_SIZE: ${MTE_DAYTONA_DEFAULT_ORG_MAX_SNAPSHOT_SIZE_GIB:?required}
+      DEFAULT_ORG_QUOTA_VOLUME_QUOTA: ${MTE_DAYTONA_DEFAULT_ORG_VOLUME_QUOTA:?required}
+      SSH_GATEWAY_API_KEY: ${DAYTONA_SSH_GATEWAY_API_KEY:?required}
+      SSH_GATEWAY_COMMAND: ssh -p ${MTE_DAYTONA_SSH_PORT:?required} {{TOKEN}}@127.0.0.1
+      SSH_GATEWAY_URL: ${MTE_DAYTONA_SSH_GATEWAY_URL:?required}
+      RUNNER_DECLARATIVE_BUILD_SCORE_THRESHOLD: ${MTE_DAYTONA_RUNNER_DECLARATIVE_BUILD_SCORE_THRESHOLD:?required}
+      RUNNER_AVAILABILITY_SCORE_THRESHOLD: ${MTE_DAYTONA_RUNNER_AVAILABILITY_SCORE_THRESHOLD:?required}
+      RUNNER_START_SCORE_THRESHOLD: ${MTE_DAYTONA_RUNNER_START_SCORE_THRESHOLD:?required}
+      SKIP_USER_EMAIL_VERIFICATION: "true"
+      ADMIN_API_KEY: ${DAYTONA_ADMIN_API_KEY:?required}
+      HEALTH_CHECK_API_KEY: ${DAYTONA_HEALTH_CHECK_API_KEY:?required}
+      OTEL_ENABLED: ${MTE_DAYTONA_API_ENV_OTEL_ENABLED:?required}
+      OTEL_COLLECTOR_API_KEY: ${DAYTONA_OTEL_COLLECTOR_API_KEY:?required}
+      POSTHOG_API_KEY: ""
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch(`http://127.0.0.1:$${process.env.PORT}/api/config`).then(response=>{if(!response.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: ${MTE_HEALTHCHECK_STANDARD_INTERVAL:?required}
+      timeout: ${MTE_HEALTHCHECK_STANDARD_TIMEOUT:?required}
+      retries: ${MTE_HEALTHCHECK_STANDARD_RETRIES:?required}
+      start_period: ${MTE_HEALTHCHECK_STANDARD_START_PERIOD:?required}
+    ports:
+      - ${MTE_DAYTONA_API_PORT_1_MAPPING:?required}
+    networks: [daytona, paperclip-api]
+    depends_on: [db, redis, dex, registry, minio, runner]
+
+  proxy:
+    image: ${MTE_DAYTONA_PROXY_IMAGE:?required}
+    container_name: mte-daytona-proxy
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      DAYTONA_API_URL: ${MTE_DAYTONA_INTERNAL_API_URL:?required}
+      PROXY_PORT: ${MTE_DAYTONA_PROXY_INTERNAL_PORT:?required}
+      PROXY_API_KEY: ${DAYTONA_PROXY_API_KEY:?required}
+      PROXY_PROTOCOL: http
+      OIDC_CLIENT_ID: daytona
+      OIDC_DOMAIN: ${MTE_DAYTONA_INTERNAL_OIDC_URL:?required}
+      OIDC_PUBLIC_DOMAIN: ${MTE_DAYTONA_PUBLIC_OIDC_URL:?required}
+      OIDC_AUDIENCE: daytona
+      REDIS_HOST: ${MTE_DAYTONA_PROXY_ENV_REDIS_HOST:?required}
+      REDIS_PORT: ${MTE_DAYTONA_REDIS_INTERNAL_PORT:?required}
+      TOOLBOX_ONLY_MODE: ${MTE_DAYTONA_PROXY_ENV_TOOLBOX_ONLY_MODE:?required}
+      PREVIEW_WARNING_ENABLED: ${MTE_DAYTONA_PROXY_ENV_PREVIEW_WARNING_ENABLED:?required}
+    ports:
+      - ${MTE_DAYTONA_PROXY_PORT_1_MAPPING:?required}
+    networks: [daytona, paperclip-api]
+
+  ssh-gateway:
+    image: ${MTE_DAYTONA_SSH_IMAGE:?required}
+    container_name: mte-daytona-ssh-gateway
+    restart: unless-stopped
+    logging: *logging
+    env_file: [./ssh.env]
+    environment:
+      API_URL: ${MTE_DAYTONA_INTERNAL_API_URL:?required}
+      API_KEY: ${DAYTONA_SSH_GATEWAY_API_KEY:?required}
+      SSH_GATEWAY_PORT: ${MTE_DAYTONA_SSH_INTERNAL_PORT:?required}
+    ports:
+      - ${MTE_DAYTONA_SSH_GATEWAY_PORT_1_MAPPING:?required}
+    networks: [daytona]
+
+volumes:
+  daytona-db: {}
+  daytona-valkey: {name: mte-daytona-valkey}
+  daytona-registry: {}
+  daytona-minio: {}
+  daytona-dex: {}
+  daytona-runner: {}
+
+networks:
+  daytona:
+    name: ${MTE_DAYTONA_NETWORK:?required}
+    external: true
+  paperclip-api:
+    name: ${MTE_DAYTONA_PAPERCLIP_NETWORK:?required}
+    external: true
+  agent-plane:
+    name: ${MTE_AGENT_PLANE_NETWORK:?required}
+    external: true
+  tool-runtime:
+    name: ${MTE_TOOL_RUNTIME_NETWORK:?required}
+    external: true
