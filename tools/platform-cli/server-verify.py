@@ -174,7 +174,7 @@ CONNECTION_CONTRACT_EXPECTATIONS = {
         "required": True,
         "condition": "telegram-configured",
         "auth": "bot-token+allowed-user",
-        "exposure": "webhook",
+        "exposure": "egress",
         "check": "hermes-telegram-auth",
     },
     "C031": {

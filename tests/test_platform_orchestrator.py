@@ -1400,7 +1400,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertNotIn(generated_secret, json.dumps(result))
 
     def test_renderer_hardens_registered_secret_projections_and_lock_aliases(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             service_root = secret_root / "services"
             service_root.mkdir(parents=True, mode=0o755)
@@ -1434,7 +1434,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertEqual(service_root.stat().st_mode & 0o777, 0o700)
 
     def test_renderer_removes_only_unregistered_legacy_secret_projections(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             secret_root.mkdir()
             canonical = secret_root / "platform.env"
@@ -1474,7 +1474,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertTrue(all(not path.exists() for path in unregistered))
 
     def test_renderer_removes_exact_empty_legacy_secret_directory(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             legacy = secret_root / "services/daytona-runtime.env"
             unrelated = secret_root / "services/keep.env"
@@ -1509,7 +1509,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertTrue(canonical.is_file())
 
     def test_renderer_refuses_nonempty_legacy_secret_directory(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             legacy = secret_root / "services/daytona-runtime.env"
             legacy.mkdir(parents=True)
@@ -1544,7 +1544,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertTrue(canonical.is_file())
 
     def test_renderer_legacy_secret_cleanup_fails_closed_for_symlink(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             secret_root.mkdir()
             canonical = secret_root / "platform.env"
@@ -1580,7 +1580,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertTrue(canonical.is_file())
 
     def test_renderer_legacy_secret_cleanup_rejects_non_root_owner(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             secret_root.mkdir()
             canonical = secret_root / "platform.env"
@@ -1611,7 +1611,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertTrue(canonical.is_file())
 
     def test_renderer_legacy_secret_cleanup_never_removes_canonical_source(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             secret_root = Path(temporary) / "secrets"
             secret_root.mkdir()
             canonical = secret_root / "platform.env"

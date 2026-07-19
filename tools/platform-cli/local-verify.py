@@ -27,10 +27,16 @@ import yaml
 
 TOOL_ROOT = Path(__file__).resolve().parent
 ROOT = TOOL_ROOT.parents[1]
-if str(TOOL_ROOT) not in sys.path:
-    sys.path.insert(0, str(TOOL_ROOT))
-
-from profile_catalog import CatalogError, load_profile_catalog  # noqa: E402
+_PROFILE_CATALOG_SPEC = importlib.util.spec_from_file_location(
+    "_mte_local_verify_profile_catalog", TOOL_ROOT / "profile_catalog.py"
+)
+if _PROFILE_CATALOG_SPEC is None or _PROFILE_CATALOG_SPEC.loader is None:
+    raise RuntimeError("cannot load the canonical profile catalog module")
+_PROFILE_CATALOG = importlib.util.module_from_spec(_PROFILE_CATALOG_SPEC)
+sys.modules[_PROFILE_CATALOG_SPEC.name] = _PROFILE_CATALOG
+_PROFILE_CATALOG_SPEC.loader.exec_module(_PROFILE_CATALOG)
+CatalogError = _PROFILE_CATALOG.CatalogError
+load_profile_catalog = _PROFILE_CATALOG.load_profile_catalog
 
 
 EVIDENCE_ROOT = ROOT / ".runtime" / "evidence"
@@ -498,7 +504,7 @@ def normalize_configuration_source_findings(
     """
     allowed_seed_omissions = set(server_config.DERIVED_VALUE_KEYS) | set(
         server_config.CANONICAL_DERIVED_URL_SPECS
-    )
+    ) | set(server_config.REQUIRED_OPERATOR_ENV_KEYS)
     retained: list[dict[str, Any]] = []
     recognized: list[dict[str, Any]] = []
     for finding in findings:
@@ -750,6 +756,9 @@ def fresh_install_render() -> dict[str, Any]:
     projection_count = 0
     canonical_mode: int | None = None
     post_provisioned_notion_ids_absent: list[str] = []
+    generated_ready: set[str] = set()
+    required: set[str] = set()
+    categories: dict[str, set[str]] = {}
     # These values exist only inside the temporary fresh-install root.  They
     # classify inputs which production bootstrap must receive from an operator;
     # neither server-config nor server-secrets is allowed to fabricate them.
@@ -1067,7 +1076,7 @@ def fresh_install_render() -> dict[str, Any]:
                             "keys": first["missingKeys"],
                         }
                     )
-    except BaseException as exc:
+    except Exception as exc:
         findings.append(
             {"finding": "fresh_install_exception", "errorType": type(exc).__name__}
         )
@@ -1084,9 +1093,7 @@ def fresh_install_render() -> dict[str, Any]:
         canonicalEnvMode=oct(canonical_mode) if canonical_mode is not None else None,
         classificationCounts={
             category: len(keys & required) for category, keys in categories.items()
-        }
-        if "categories" in locals()
-        else {},
+        },
         composeFilesRendered=rendered_compose,
         projectionCount=projection_count,
         findings=findings,

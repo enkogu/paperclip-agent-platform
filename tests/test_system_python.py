@@ -26,11 +26,35 @@ class SystemPythonTests(unittest.TestCase):
         self.assertNotIn(".runtime/python", combined)
         self.assertFalse((ROOT / "tools/platform-cli/runtime.sh").exists())
 
-    def test_clean_preserves_user_managed_environments_and_runtime_evidence(self) -> None:
-        clean_target = (ROOT / "Makefile").read_text().split("clean:", 1)[1]
+    def test_clean_prunes_environment_directories_without_deleting_contents(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mte-system-python-") as temporary:
+            root = Path(temporary) / "clean-fixture"
+            root.mkdir()
+            shutil.copy2(ROOT / "Makefile", root / "Makefile")
 
-        self.assertNotIn(".venv", clean_target)
-        self.assertNotIn(".runtime", clean_target)
+            owned = []
+            protected = []
+            for directory in ("deployment", "tools", "tests"):
+                artifact_root = root / directory / "owned"
+                cache = artifact_root / "__pycache__"
+                cache.mkdir(parents=True)
+                (cache / "module.pyc").write_bytes(b"cache")
+                owned.append(cache)
+                for environment in (".venv", ".runtime"):
+                    preserved = artifact_root / environment / "state.pyc"
+                    preserved.parent.mkdir(parents=True)
+                    preserved.write_bytes(b"preserve")
+                    protected.append(preserved)
+
+            subprocess.run(
+                ["make", "--no-print-directory", "clean"],
+                cwd=root,
+                check=True,
+                timeout=10,
+            )
+
+            self.assertTrue(all(not path.exists() for path in owned))
+            self.assertTrue(all(path.read_bytes() == b"preserve" for path in protected))
 
     def test_documentation_preserves_runtime_state_after_venv_lifecycle_removal(self) -> None:
         readme = (ROOT / "README.md").read_text()

@@ -130,7 +130,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "final_hash_not_stable")
 
     def test_runtime_values_load_hash_governed_service_projections(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             root = Path(temporary)
             service_root = root / "services"
             service_root.mkdir()
@@ -492,7 +492,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
             item("search", "search-project", "searxng", 18088),
             item("postgrest", "postgrest-project", "postgrest", 18087),
         ]
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             plane = Path(temporary) / "data-content-plane.json"
             plane.write_text(
                 json.dumps(
@@ -512,7 +512,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
         self.assertEqual(len(paths), 5)
 
     def test_runtime_profile_accepts_only_exact_reviewed_component_sets(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             plane_path = Path(temporary) / "data-content-plane.json"
             with mock.patch.object(self.module, "DATA_CONTENT_PLANE", plane_path):
                 for profile, contract in self.module.PROFILE_RUNTIME_CONTRACTS.items():
@@ -764,7 +764,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
     def test_alert_runtime_config_requires_receiver_and_otel_label(self):
         webhook = "http://127.0.0.1:18065/hooks/not-a-real-secret"
         deployed_webhook = "http://mattermost:8065/hooks/not-a-real-secret"
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             root = Path(temporary)
             (root / "alertmanager.yml").write_text(
                 "route:\n  receiver: mattermost\nreceivers:\n"
@@ -880,7 +880,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "command_failed")
 
     def test_c070_requires_root_only_secret_store_and_legacy_lock_modes(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             root = Path(temporary) / "secrets"
             root.mkdir(mode=0o700)
             integrations = root / "integrations"
@@ -1008,7 +1008,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
             "OBSERVABILITY_HEALTH_URL": "http://127.0.0.1:13000/api/health",
             "MATTERMOST_ALERT_WEBHOOK_URL": "https://chat.test/hooks/test-only",
         }
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             config_dir = Path(temporary) / "config"
             # Compose converts $$ to a literal $ before the container shell runs.
             rendered = command.replace("$${", "${").replace("/config", str(config_dir))
@@ -1218,7 +1218,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
         self.assertIn("server-profile-reconcile.py", installed.call_args.args[0])
 
     def test_atomic_evidence_is_mode_0600(self):
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             path = Path(temporary) / "evidence" / "canary.json"
             names = []
             original = self.module.tempfile.NamedTemporaryFile
@@ -1340,7 +1340,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
             "incomplete": [],
             "canonicalMutationGuard": {"changedKeys": []},
         }
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             evidence = Path(temporary) / "indexed-pass-2.json"
             with (
                 mock.patch.object(
@@ -1477,7 +1477,7 @@ class ServerObservabilityCanaryTests(unittest.TestCase):
             "toolhiveIdentitySha256": "2" * 64,
             "grafanaFingerprint": "3" * 64,
         }
-        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+        with tempfile.TemporaryDirectory(prefix="mte-observability-canary-") as temporary:
             first_path = Path(temporary) / "pass-1.json"
             second_path = Path(temporary) / "pass-2.json"
             final_path = Path(temporary) / "final.json"

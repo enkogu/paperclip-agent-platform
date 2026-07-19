@@ -398,6 +398,26 @@ class RepositoryLayoutTests(unittest.TestCase):
         self.assertIn("Outbox", diagram)
         self.assertIn("leased connector", diagram)
 
+    def test_public_docs_match_shipped_harness_profile_and_telegram_contracts(self) -> None:
+        readme = (ROOT / "README.md").read_text()
+        interactive = (SYSTEM_SKILL / "assets/architecture.html").read_text()
+        requirements = yaml.safe_load(
+            (ROOT / "config/acceptance-requirements.yaml").read_text()
+        )["requirements"]
+
+        self.assertIn("Mandatory release consent", readme)
+        self.assertIn("MTE_ENABLE_OPERATOR_PROVIDED_PROPRIETARY_HARNESSES=true", readme)
+        self.assertIn("not an\noptional integration", readme)
+        self.assertIn("Research,\ncontent-publishing, and operations profiles are future catalog extensions", readme)
+        self.assertIn("native bot + allowlist", interactive)
+        self.assertIn("Telegram bot integration", interactive)
+        self.assertNotIn("webhook + allowlist", interactive)
+        self.assertNotIn("signature, replay", interactive)
+        self.assertNotIn("scoped Paperclip task bridge", interactive)
+
+        c033 = next(row for row in requirements if row["id"] == "C033")
+        self.assertEqual(c033["exposure"], "egress")
+
     def test_public_operational_contracts_bound_recovery_and_edge_scope(self) -> None:
         readme = (ROOT / "README.md").read_text()
         backup = (SYSTEM_SKILL_REFERENCES / "backup-upgrade.md").read_text()

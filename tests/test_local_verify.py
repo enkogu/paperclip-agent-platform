@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -129,6 +131,72 @@ class LocalVerifyRegressionTests(unittest.TestCase):
         self.assertGreater(result["projectionCount"], 0)
         self.assertGreater(result["composeFilesRendered"], 0)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux import shadow probe")
+    def test_fresh_install_does_not_shadow_stdlib_platform_with_sibling_module(self):
+        script = """
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+tool_root = root / "tools/platform-cli"
+source = tool_root / "local-verify.py"
+spec = importlib.util.spec_from_file_location("linux_local_verify_probe", source)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+sys.modules.pop("platform", None)
+sys.modules.pop("uuid", None)
+result = module.fresh_install_render()
+import platform as platform_module
+print(json.dumps({
+    "findings": result["findings"],
+    "ok": result["ok"],
+    "platformPath": str(Path(platform_module.__file__).resolve()),
+    "toolRootOnPath": str(tool_root) in sys.path,
+}))
+"""
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(ROOT)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["ok"], result["findings"])
+        self.assertFalse(result["toolRootOnPath"])
+        self.assertNotEqual(
+            Path(result["platformPath"]), ROOT / "tools/platform-cli/platform.py"
+        )
+
+    def test_fresh_install_reports_setup_exception_without_masking_it(self):
+        with mock.patch.object(
+            local_verify.tempfile,
+            "TemporaryDirectory",
+            side_effect=RuntimeError("test-only setup failure"),
+        ):
+            result = local_verify.fresh_install_render()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["generatedSecretInputs"], [])
+        self.assertEqual(result["classificationCounts"], {})
+        self.assertEqual(
+            result["findings"],
+            [{"finding": "fresh_install_exception", "errorType": "RuntimeError"}],
+        )
+
+        with (
+            mock.patch.object(
+                local_verify.tempfile,
+                "TemporaryDirectory",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            local_verify.fresh_install_render()
+
     def test_postgres_notion_external_inputs_are_typed_and_fail_closed(self):
         result = local_verify.fresh_install_render()
         self.assert_fresh_render_is_ready(result)
@@ -246,6 +314,67 @@ class LocalVerifyRegressionTests(unittest.TestCase):
             unknown, server_config
         )
         self.assertEqual(retained, unknown)
+        self.assertEqual(recognized, [])
+
+    def test_required_operator_inputs_are_not_compose_seed_obligations(self):
+        path = ROOT / "tools/platform-cli/server-config.py"
+        spec = importlib.util.spec_from_file_location(
+            "test_local_verify_operator_seed_contract", path
+        )
+        assert spec is not None and spec.loader is not None
+        server_config = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(server_config)
+
+        operator_inputs = sorted(server_config.REQUIRED_OPERATOR_ENV_KEYS)
+        retained, recognized = local_verify.normalize_configuration_source_findings(
+            [
+                {
+                    "finding": "compose_seed_catalog_coverage_mismatch",
+                    "path": "config/compose-seeds.lock.json",
+                    "missing": operator_inputs,
+                    "extra": [],
+                }
+            ],
+            server_config,
+        )
+        self.assertEqual(retained, [])
+        self.assertEqual(recognized[0]["missing"], operator_inputs)
+        self.assertTrue(
+            {
+                "MTE_DAYTONA_SANDBOX_IMAGE",
+                "MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL",
+                "MTE_DAYTONA_SANDBOX_IMAGE_REVISION",
+            }
+            <= set(server_config.REQUIRED_OPERATOR_BOOTSTRAP_KEYS)
+        )
+
+        real_seed = "MTE_DAYTONA_API_PORT_1_MAPPING"
+        catalog = json.loads(
+            (ROOT / "config/compose-seeds.lock.json").read_text()
+        )["seeds"]
+        self.assertIn(real_seed, catalog)
+        retained, recognized = local_verify.normalize_configuration_source_findings(
+            [
+                {
+                    "finding": "compose_seed_catalog_coverage_mismatch",
+                    "path": "config/compose-seeds.lock.json",
+                    "missing": ["MTE_DAYTONA_SANDBOX_IMAGE", real_seed],
+                    "extra": [],
+                }
+            ],
+            server_config,
+        )
+        self.assertEqual(
+            retained,
+            [
+                {
+                    "finding": "compose_seed_catalog_coverage_mismatch",
+                    "path": "config/compose-seeds.lock.json",
+                    "missing": [real_seed],
+                    "extra": [],
+                }
+            ],
+        )
         self.assertEqual(recognized, [])
 
     def test_optional_compose_normalizer_rejects_unreviewed_and_weakened_refs(self):

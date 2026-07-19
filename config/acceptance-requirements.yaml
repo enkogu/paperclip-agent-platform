@@ -28,7 +28,7 @@ requirements:
   - {id: C030, from: paperclip-kestra, to: mattermost, required: true, auth: bot-or-webhook, exposure: internal, check: mattermost-notification}
   - {id: C031, from: mattermost, to: hermes, required: true, auth: bot-token+allowed-user, exposure: internal, check: hermes-mattermost-auth}
   - {id: C032, from: operator, to: mattermost, required: true, auth: cloudflare-human+app, exposure: human, check: cloudflare-mattermost}
-  - {id: C033, from: telegram, to: hermes, required: true, condition: telegram-configured, auth: bot-token+allowed-user, exposure: webhook, check: hermes-telegram-auth}
+  - {id: C033, from: telegram, to: hermes, required: true, condition: telegram-configured, auth: bot-token+allowed-user, exposure: egress, check: hermes-telegram-auth}
   - {id: C034, from: hermes-native-terminal, to: platform-cli, required: true, auth: native-approval, exposure: none, check: hermes-platform-status}
   - {id: C035, from: hermes, to: platform-host, required: true, auth: declared-operator-mode, exposure: none, check: hermes-host-operator-policy}
   - {id: C036, from: provisioner, to: data-content/connectors, required: true, auth: scoped-provider-secret, exposure: egress, check: provision-data-content, connectorIdentity: mte.notion.connector}

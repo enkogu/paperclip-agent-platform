@@ -375,6 +375,7 @@ class ServerE2ECanaryTests(unittest.TestCase):
                 patches[4],
                 patches[5],
                 patches[6],
+                patches[7],
             ):
                 binding = self.module.direct_sync_binding()
                 self.assertEqual(binding["kind"], "DirectSyncCanonicalContract")

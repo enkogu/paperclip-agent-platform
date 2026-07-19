@@ -616,6 +616,7 @@ class DaytonaSandboxBuildTests(unittest.TestCase):
             NPM_LOCK_ROOT=$5
             PI_TOOLHIVE_EXTENSION_ASSET=$6
             PROFILE_SKILL_ROOT=$7
+            PAPERCLIP_STEP=true
             export TRACE RUN_ID DAYTONA_ENV_FILE
 
             mkdir -p "$ROOT" "$EVIDENCE_ROOT" "$RELEASE_ROOT/bin"

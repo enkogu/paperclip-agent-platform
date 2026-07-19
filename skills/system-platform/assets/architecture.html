@@ -270,7 +270,7 @@
             <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Оператор</text><text class="node-sub" x="18" y="54">Web UI · Cloudflare Access</text><text class="node-sub" x="18" y="70">human identity</text>
           </g>
           <g class="node" data-node="telegram" data-flows="task" tabindex="0" role="button" transform="translate(50 255)">
-            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Telegram</text><text class="node-sub" x="18" y="54">сообщение пользователю</text><text class="node-sub" x="18" y="70">webhook + allowlist</text>
+            <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Telegram</text><text class="node-sub" x="18" y="54">сообщение пользователю</text><text class="node-sub" x="18" y="70">native bot + allowlist</text>
           </g>
           <g class="node" data-node="schedules" data-flows="task" tabindex="0" role="button" transform="translate(50 375)">
             <rect class="main" width="160" height="90" rx="14"/><text class="node-title" x="18" y="34">Schedules / events</text><text class="node-sub" x="18" y="54">основная точка входа</text><text class="node-sub" x="18" y="70">cron · webhook · API</text>
@@ -367,7 +367,7 @@
     </section>
 
     <section class="notes" aria-label="Ключевые архитектурные решения">
-      <article class="note"><strong>Нет overfit под coding</strong><p>Paperclip и Kestra управляют общими задачами и workflow. Codex, Claude Code и Pi — только три runtime-профиля; через тот же control plane можно запускать research, content и operational jobs.</p></article>
+      <article class="note"><strong>Нет overfit под coding</strong><p>Paperclip и Kestra управляют общими задачами и workflow. В shipped catalog сейчас есть только три coding runtime-профиля: Codex, Claude Code и Pi. Research, content и operational profiles — будущие расширения каталога.</p></article>
       <article class="note"><strong>Данные переживут любой UI</strong><p>Канонические записи и документы живут в PostgreSQL. Notion получает проекции через outbox-коннектор и может быть заменён без миграции source-of-truth.</p></article>
       <article class="note"><strong>Секреты не идут напрямую агентам</strong><p>Профили получают scoped runtime keys. Notion write identity и credentials будущих connector packages остаются вне harness; ToolHive ограничивает доступный MCP toolset.</p></article>
     </section>
@@ -376,9 +376,9 @@
   <script>
     const details = {
       operator: ['Точка входа', 'Человек открывает UI через Cloudflare Access.', ['Paperclip, Kestra, Grafana и Mattermost', 'Прямые origin-порты не публикуются']],
-      telegram: ['Точка входа', 'Telegram сообщения попадают в Hermes только через явно объявленный webhook и allowlist.', ['Telegram → Hermes → scoped Paperclip task bridge', 'Точное path, signature, replay и payload controls принадлежат integration owner', 'Публикация webhook не следует из одной декларации']],
+      telegram: ['Точка входа', 'Hermes использует нативную Telegram bot integration с bot token и allowlist пользователей.', ['Bot token хранится только в runtime secret projection', 'Allowlist ограничивает, кто может обратиться к боту', 'Дополнительный platform transport contract не заявляется']],
       schedules: ['Точка входа', 'Kestra хранит внешнее workflow state и создаёт нативные Paperclip Issues для задач.', ['Декларативные workflow YAML', 'Schedules, branching, retries и approval stages', 'Issue → Daytona → GitHub требует source-bound E2E evidence']],
-      hermes: ['Операторский gateway', 'Hermes остаётся официальным upstream gateway/runtime для сообщений, диагностики и ремонта, без platform-specific proxy или command API.', ['Маршрут к LLM только через 9router', 'Scoped Paperclip task bridge', 'Доступ к хосту является явным решением профиля']],
+      hermes: ['Операторский gateway', 'Hermes остаётся официальным upstream gateway/runtime для сообщений, диагностики и ремонта, без platform-specific proxy или command API.', ['Маршрут к LLM только через 9router', 'Native Telegram и Mattermost messaging integrations', 'Доступ к хосту является явным решением профиля']],
       kestra: ['Workflow orchestration', 'Kestra владеет schedules, branching, retries, approvals и внешним workflow state; Paperclip владеет агентской задачей.', ['Native Paperclip Issue API', 'Terminal gates и cleanup принадлежат workflow', 'Не заменяет agent control plane']],
       paperclip: ['Agent control plane', 'Paperclip владеет Issues, assignment, heartbeats, messages и run status. Его MTE runtime задаётся только immutable digest-pinned image.', ['Profiles, environments и secret scopes рендерятся из декларативного каталога', 'Не является business workflow engine', 'Mutable tags и ручная подмена runtime image запрещены']],
       daytona: ['Execution environment', 'Daytona создаёт изолированный workspace и environment, выбранные профилем Paperclip.', ['Outer isolation boundary для native harness', 'Codex, Claude Code и Pi выполняются внутри workspace', 'Профиль задаёт limits и workspace contract']],

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -1694,7 +1694,17 @@ class HermesInstallerTests(unittest.TestCase):
                 if mode is not None:
                     env_file.chmod(mode)
 
-                self.assertTrue(self.installer.public_mode_requested(env_file))
+                def env_read_failure():
+                    if mode is None:
+                        return nullcontext()
+                    return mock.patch.object(
+                        self.installer,
+                        "parse_dotenv",
+                        side_effect=PermissionError("test-only unreadable env"),
+                    )
+
+                with env_read_failure():
+                    self.assertTrue(self.installer.public_mode_requested(env_file))
                 args = mock.Mock(env_file=env_file, no_restart=True)
                 ordering = []
 
@@ -1704,6 +1714,7 @@ class HermesInstallerTests(unittest.TestCase):
                     raise self.installer.HermesInstallError("validation sentinel")
 
                 with (
+                    env_read_failure(),
                     mock.patch.object(self.installer, "require_root"),
                     mock.patch.object(self.installer, "DEFAULT_ENV_FILE", env_file),
                     mock.patch.object(self.installer, "SUDOERS_PATH", sudoers),

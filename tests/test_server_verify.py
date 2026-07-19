@@ -15,9 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 # SHA-256 of the normalized predecessor `config/connections.yaml` contracts.
-# C035 is deliberately excluded: it is the reviewed hardening migration below,
-# not an accidental survivor drift. Keeping this compact baseline means every
-# other surviving requirement still needs an explicit review to change.
+# C033 and C035 are deliberately excluded: their reviewed exposure and
+# mode-aware hardening migrations below are not accidental survivor drift.
+# Keeping this compact baseline means every other surviving requirement still
+# needs an explicit review to change.
 PREDECESSOR_SURVIVING_REQUIREMENT_SHA256 = {
     "C001": "682bd75197789b5e4aa541e44d50fc4e8d87f43675f6e24e6f4fdc6935b83a1f",
     "C002": "fd43ad30fe2f1f4e5dd2d9ad50b184bfca8e0a100d02bd8cef528a084a62975a",
@@ -46,7 +47,6 @@ PREDECESSOR_SURVIVING_REQUIREMENT_SHA256 = {
     "C030": "591d68be0c035bd121796ebb269113f2461adb01337b9c08467e9920a6950087",
     "C031": "0080669796c439dcba642a4f88545d2f3dd75b57bcf6fecbbd5ab8dfb9e5ea2c",
     "C032": "3d3ecafbce12da4a6cbac94d1ffc379fd35891e202cefeef9ebe44611ce02ee6",
-    "C033": "8f2798e794c66b825fd92ed0597f52793af9257959f1b3299294d11e7e6146b8",
     "C034": "dfb9c646a911592da4f463d433496c8bfbd53bfef6387c4b57a63670cde1443d",
     "C036": "4616fb4a7982fb96cd3f760c3c1fbbacb51d74efc5bfede831c2ad7fca2969d8",
     "C037": "f8f2f6acf7eeaab2a34a90ade1b5b7c4ebffaad0264f79aa057e1b260e3ddc47",
@@ -95,6 +95,26 @@ RETIRED_CONNECTION_IDS = {
 }
 
 REVIEWED_SEMANTIC_MIGRATIONS = {
+    "C033": {
+        "predecessor": {
+            "from": "telegram",
+            "to": "hermes",
+            "required": True,
+            "condition": "telegram-configured",
+            "auth": "bot-token+allowed-user",
+            "exposure": "webhook",
+            "check": "hermes-telegram-auth",
+        },
+        "current": {
+            "from": "telegram",
+            "to": "hermes",
+            "required": True,
+            "condition": "telegram-configured",
+            "auth": "bot-token+allowed-user",
+            "exposure": "egress",
+            "check": "hermes-telegram-auth",
+        },
+    },
     "C035": {
         "predecessor": {
             "from": "hermes",
@@ -1907,10 +1927,10 @@ class FailClosedVerifierTests(unittest.TestCase):
         ):
             self.assertNotIn("C028", (ROOT / relative_path).read_text())
 
-    def test_acceptance_registry_migration_preserves_survivors_and_reviews_c035(
+    def test_acceptance_registry_migration_preserves_survivors_and_reviews_c033_and_c035(
         self,
     ):
-        """Only C035 changes semantics in the reviewed registry migration."""
+        """C033 exposure and C035 mode-aware changes are explicitly reviewed."""
         rows = yaml.safe_load(
             (ROOT / "config/acceptance-requirements.yaml").read_text()
         )["requirements"]
@@ -1937,16 +1957,21 @@ class FailClosedVerifierTests(unittest.TestCase):
                 connection_id,
             )
 
-        c035 = REVIEWED_SEMANTIC_MIGRATIONS["C035"]
-        self.assertEqual(current["C035"], c035["current"])
-        self.assertEqual(
-            {
-                field
-                for field in c035["current"]
-                if c035["current"][field] != c035["predecessor"][field]
-            },
-            {"auth", "check"},
-        )
+        expected_changed_fields = {
+            "C033": {"exposure"},
+            "C035": {"auth", "check"},
+        }
+        for connection_id, migration in REVIEWED_SEMANTIC_MIGRATIONS.items():
+            self.assertEqual(current[connection_id], migration["current"])
+            self.assertEqual(
+                {
+                    field
+                    for field in migration["current"]
+                    if migration["current"][field]
+                    != migration["predecessor"][field]
+                },
+                expected_changed_fields[connection_id],
+            )
 
         connections_reference = (
             ROOT / "skills/system-platform/references/connections.md"
