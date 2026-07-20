@@ -1191,6 +1191,63 @@ class ConfigError(RuntimeError):
     pass
 
 
+HERMES_APT_PACKAGES_KEY = "HERMES_APT_PACKAGES"
+LEGACY_HERMES_APT_PACKAGE_NAMES = frozenset(
+    {
+        "ca-certificates",
+        "curl",
+        "ffmpeg",
+        "git",
+        "python3",
+        "python3-venv",
+        "ripgrep",
+        "sudo",
+        "xz-utils",
+    }
+)
+
+
+def hermes_apt_package_names(raw: str) -> frozenset[str]:
+    """Parse the source-owned Hermes apt closure without retaining versions."""
+    names: set[str] = set()
+    for item in raw.split(",") if raw else ():
+        if item.count("=") != 1:
+            raise ConfigError("HERMES_APT_PACKAGES has invalid reviewed pins")
+        name, version = (part.strip() for part in item.split("=", 1))
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", name)
+            or not re.fullmatch(r"[A-Za-z0-9.+:~_-]+", version)
+            or name in names
+        ):
+            raise ConfigError("HERMES_APT_PACKAGES has invalid reviewed pins")
+        names.add(name)
+    return frozenset(names)
+
+
+def reconcile_governed_hermes_apt_packages(values: dict[str, str]) -> set[str]:
+    """Migrate only the former unpinned Hermes host-tool closure.
+
+    Hermes OS packages are a source-owned supply-chain contract, not an
+    operator customization.  The old installer selected nine packages at
+    runtime; the locked installer owns the current seven-package closure.
+    Unknown canonical sets remain fail-closed rather than being overwritten.
+    """
+    raw = values.get(HERMES_APT_PACKAGES_KEY, "").strip()
+    if not raw:
+        return set()
+    names = hermes_apt_package_names(raw)
+    current = ONE_TIME_MIGRATION_SEEDS[HERMES_APT_PACKAGES_KEY]
+    if names == hermes_apt_package_names(current):
+        return set()
+    if names == LEGACY_HERMES_APT_PACKAGE_NAMES:
+        values[HERMES_APT_PACKAGES_KEY] = current
+        return {HERMES_APT_PACKAGES_KEY}
+    raise ConfigError(
+        "refusing automatic HERMES_APT_PACKAGES migration from an unreviewed "
+        "package set; apply a reviewed platform release"
+    )
+
+
 def _canonical_url(values: dict[str, str], target: str) -> str:
     host_ref, port_ref, path = CANONICAL_DERIVED_URL_SPECS[target]
     raw_host = str(values.get(host_ref, ""))
@@ -2259,6 +2316,7 @@ def init_source(imported: dict[str, str]) -> dict[str, Any]:
             values[key] = new_value
             migrated_keys.add(key)
     migrated_keys.update(reconcile_governed_canonical_value_migrations(values))
+    migrated_keys.update(reconcile_governed_hermes_apt_packages(values))
     imported = dict(imported)
     aliases = {
         **DOMAIN_INPUT_ALIASES,
@@ -2431,6 +2489,7 @@ def init_source(imported: dict[str, str]) -> dict[str, Any]:
             values[key] = new_value
             migrated_keys.add(key)
     migrated_keys.update(reconcile_governed_canonical_value_migrations(values))
+    migrated_keys.update(reconcile_governed_hermes_apt_packages(values))
     prior_daytona_proxy_domain = values.get("MTE_DAYTONA_PROXY_DOMAIN", "").strip()
     for derived in DERIVED_VALUE_KEYS:
         values.pop(derived, None)

@@ -48,6 +48,13 @@ def init_existing(canonical: Path):
         return server_config.init_source({})
 
 
+def legacy_hermes_apt_pins() -> str:
+    return ",".join(
+        f"{name}=0"
+        for name in sorted(server_config.LEGACY_HERMES_APT_PACKAGE_NAMES)
+    )
+
+
 def test_legacy_sdk_seed_migrates_once_and_replay_is_idempotent() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         canonical = Path(temporary) / "platform.env"
@@ -97,6 +104,55 @@ def test_custom_sdk_seed_fails_closed_without_mutating_canonical_source() -> Non
         canonical.chmod(0o600)
 
         with pytest.raises(server_config.ConfigError, match="refusing automatic"):
+            init_existing(canonical)
+
+        assert canonical.read_text() == original
+
+
+def test_legacy_hermes_apt_closure_migrates_once_and_replay_is_idempotent() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        canonical = Path(temporary) / "platform.env"
+        canonical.write_text(
+            "DATA_CONTENT_PROFILE=none\n"
+            f"HERMES_APT_PACKAGES={legacy_hermes_apt_pins()}\n"
+        )
+        canonical.chmod(0o600)
+
+        migrated = init_existing(canonical)
+        replayed = init_existing(canonical)
+
+        assert (
+            server_config.parse_env(canonical)["HERMES_APT_PACKAGES"]
+            == server_config.ONE_TIME_MIGRATION_SEEDS["HERMES_APT_PACKAGES"]
+        )
+        assert "HERMES_APT_PACKAGES" in migrated["migratedKeys"]
+        assert "HERMES_APT_PACKAGES" not in replayed["migratedKeys"]
+
+
+def test_current_hermes_apt_closure_is_preserved_without_migration() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        canonical = Path(temporary) / "platform.env"
+        current = server_config.ONE_TIME_MIGRATION_SEEDS["HERMES_APT_PACKAGES"]
+        canonical.write_text("DATA_CONTENT_PROFILE=none\n" f"HERMES_APT_PACKAGES={current}\n")
+        canonical.chmod(0o600)
+
+        result = init_existing(canonical)
+
+        assert server_config.parse_env(canonical)["HERMES_APT_PACKAGES"] == current
+        assert "HERMES_APT_PACKAGES" not in result["migratedKeys"]
+
+
+def test_unknown_hermes_apt_closure_fails_closed_without_mutation() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        canonical = Path(temporary) / "platform.env"
+        original = (
+            "DATA_CONTENT_PROFILE=none\n"
+            f"HERMES_APT_PACKAGES={legacy_hermes_apt_pins()},unreviewed=0\n"
+        )
+        canonical.write_text(original)
+        canonical.chmod(0o600)
+
+        with pytest.raises(server_config.ConfigError, match="unreviewed package set"):
             init_existing(canonical)
 
         assert canonical.read_text() == original
