@@ -2744,9 +2744,14 @@ class PlatformOrchestratorTests(unittest.TestCase):
             def root_owned_stat(path, *args, **kwargs):
                 value = original_stat(path, *args, **kwargs)
                 fields = list(value)
-                fields[4] = 0
+                if (
+                    value.st_mode & 0o170000 == 0o100000
+                    and path != server_config.LOCK
+                ):
+                    fields[4] = 0
                 return os.stat_result(fields)
 
+            fixture_owner = temporary.lstat()
             with ExitStack() as stack:
                 for name, value in replacements.items():
                     stack.enter_context(mock.patch.object(server_config, name, value))
@@ -2755,6 +2760,20 @@ class PlatformOrchestratorTests(unittest.TestCase):
                         stack.enter_context(
                             mock.patch.object(server_secrets, name, value)
                         )
+                stack.enter_context(
+                    mock.patch.object(
+                        server_config.os,
+                        "geteuid",
+                        return_value=fixture_owner.st_uid,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        server_config.os,
+                        "getegid",
+                        return_value=fixture_owner.st_gid,
+                    )
+                )
                 stack.enter_context(mock.patch.object(Path, "stat", root_owned_stat))
 
                 server_config.init_source(operator_values)
