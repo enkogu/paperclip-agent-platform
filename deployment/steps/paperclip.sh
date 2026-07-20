@@ -163,8 +163,8 @@ expected_source, expected_revision = sys.argv[2:]
 entrypoint = config.get("Entrypoint") or []
 command = config.get("Cmd") or []
 labels = config.get("Labels") or {}
-if entrypoint:
-    raise SystemExit("paperclip-runtime: immutable image must not wrap its native entrypoint")
+if entrypoint != ["docker-entrypoint.sh"]:
+    raise SystemExit("paperclip-runtime: immutable image native entrypoint ABI drifted")
 if command != ["node", "dist/index.js"]:
     raise SystemExit("paperclip-runtime: immutable image native command ABI drifted")
 if labels.get("org.opencontainers.image.source") != expected_source:

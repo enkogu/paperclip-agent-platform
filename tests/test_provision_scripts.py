@@ -227,6 +227,7 @@ def test_paperclip_runtime_uses_the_immutable_image_native_entrypoint():
 def test_paperclip_install_rejects_an_incomplete_image_abi():
     source = PAPERCLIP.read_text()
     assert "verify_image_abi" in source
+    assert 'entrypoint != ["docker-entrypoint.sh"]' in source
     assert 'command != ["node", "dist/index.js"]' in source
     assert '["@paperclipai/plugin-daytona", process.argv[1]]' in source
     assert '["@daytonaio/sdk", process.argv[2]]' in source
@@ -277,7 +278,7 @@ def test_paperclip_auth_dotenv_converges_to_one_real_newline(tmp_path: Path) -> 
     )
 
 
-def test_config_migrate_fails_abi_before_data_or_evidence_mutation(
+def test_config_migrate_accepts_native_entrypoint_then_rejects_wrong_provenance(
     tmp_path: Path,
 ) -> None:
     source = PAPERCLIP.read_text()
@@ -321,7 +322,7 @@ def test_config_migrate_fails_abi_before_data_or_evidence_mutation(
         f"printf '%s\\n' \"$*\" >> {str(docker_log)!r}\n"
         "if [[ $1 == pull ]]; then exit 0; fi\n"
         "if [[ $1 == image && $2 == inspect ]]; then\n"
-        '  printf \'%s\\n\' \'{"Entrypoint":[],"Cmd":["node","dist/index.js"],"Labels":{}}\'\n'
+        '  printf \'%s\\n\' \'{"Entrypoint":["docker-entrypoint.sh"],"Cmd":["node","dist/index.js"],"Labels":{}}\'\n'
         "  exit 0\n"
         "fi\n"
         "exit 97\n"
@@ -430,7 +431,7 @@ def test_paperclip_install_pulls_then_rejects_wrong_image_provenance(
         "if [[ $1 == pull ]]; then exit 0; fi\n"
         "if [[ $1 == image && $2 == inspect ]]; then\n"
         "  printf '%s\\n' "
-        "'{\"Entrypoint\":[],\"Cmd\":[\"node\",\"dist/index.js\"],\"Labels\":{}}'\n"
+        "'{\"Entrypoint\":[\"docker-entrypoint.sh\"],\"Cmd\":[\"node\",\"dist/index.js\"],\"Labels\":{}}'\n"
         "  exit 0\n"
         "fi\n"
         "exit 97\n"
@@ -447,6 +448,45 @@ def test_paperclip_install_pulls_then_rejects_wrong_image_provenance(
 
     assert result.returncode != 0
     assert "immutable image source label drifted" in result.stderr
+    assert evidence.read_text() == "sentinel evidence\n"
+    assert docker_log.read_text().splitlines() == [
+        f"pull {values['MTE_PAPERCLIP_IMAGE']}",
+        f"image inspect --format {{{{json .Config}}}} {values['MTE_PAPERCLIP_IMAGE']}",
+    ]
+
+
+def test_paperclip_install_rejects_non_native_entrypoint_wrapper(
+    tmp_path: Path,
+) -> None:
+    script, values, evidence = _paperclip_verify_fixture(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        f"printf '%s\\n' \"$*\" >> {str(docker_log)!r}\n"
+        "if [[ $1 == pull ]]; then exit 0; fi\n"
+        "if [[ $1 == image && $2 == inspect ]]; then\n"
+        "  printf '%s\\n' "
+        f"'{{\"Entrypoint\":[\"/bin/sh\",\"-c\"],\"Cmd\":[\"node\",\"dist/index.js\"],\"Labels\":{{\"org.opencontainers.image.source\":\"{values['MTE_PAPERCLIP_FORK_SOURCE_URL']}\",\"org.opencontainers.image.revision\":\"{values['MTE_PAPERCLIP_FORK_REVISION']}\"}}}}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n"
+    )
+    docker.chmod(0o700)
+
+    result = subprocess.run(
+        [script, "install"],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "immutable image native entrypoint ABI drifted" in result.stderr
     assert evidence.read_text() == "sentinel evidence\n"
     assert docker_log.read_text().splitlines() == [
         f"pull {values['MTE_PAPERCLIP_IMAGE']}",
@@ -496,7 +536,7 @@ def test_verify_fails_abi_before_evidence_mutation(tmp_path: Path) -> None:
         "set -eu\n"
         f"printf '%s\\n' \"$*\" >> {str(docker_log)!r}\n"
         "if [[ $1 == image && $2 == inspect ]]; then\n"
-        "  printf '%s\\n' '{\"Entrypoint\":[],\"Cmd\":[\"node\",\"wrong.js\"],\"Labels\":{}}'\n"
+        "  printf '%s\\n' '{\"Entrypoint\":[\"docker-entrypoint.sh\"],\"Cmd\":[\"node\",\"wrong.js\"],\"Labels\":{}}'\n"
         "  exit 0\n"
         "fi\n"
         "exit 97\n"
@@ -532,7 +572,7 @@ def test_verify_rejects_wrong_running_image_before_evidence_mutation(
         "  if [[ $4 == '{{json .Config}}' ]]; then\n"
         f"    printf '%s\\n' abi-inspect >> {str(docker_log)!r}\n"
         "    printf '%s\\n' "
-        f"'{{\"Entrypoint\":[],\"Cmd\":[\"node\",\"dist/index.js\"],\"Labels\":{{\"org.opencontainers.image.source\":\"{values['MTE_PAPERCLIP_FORK_SOURCE_URL']}\",\"org.opencontainers.image.revision\":\"{values['MTE_PAPERCLIP_FORK_REVISION']}\"}}}}'\n"
+        f"'{{\"Entrypoint\":[\"docker-entrypoint.sh\"],\"Cmd\":[\"node\",\"dist/index.js\"],\"Labels\":{{\"org.opencontainers.image.source\":\"{values['MTE_PAPERCLIP_FORK_SOURCE_URL']}\",\"org.opencontainers.image.revision\":\"{values['MTE_PAPERCLIP_FORK_REVISION']}\"}}}}'\n"
         "  else\n"
         f"    printf '%s\\n' image-id-inspect >> {str(docker_log)!r}\n"
         f"    printf '%s\\n' '{canonical_id}'\n"
