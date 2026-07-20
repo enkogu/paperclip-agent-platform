@@ -124,6 +124,10 @@ class CiSupplyChainTests(unittest.TestCase):
             "image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.manifest_digest }}",
             sbom_generation,
         )
+        self.assertIn("registry-username: ${{ github.actor }}", sbom_generation)
+        self.assertIn(
+            "registry-password: ${{ secrets.GITHUB_TOKEN }}", sbom_generation
+        )
         self.assertIn("syft_platform_image_identity", workflow)
         self.assertIn("PLATFORM_CONFIG_DIGEST", workflow)
         self.assertIn("PLATFORM_MANIFEST_DIGEST", workflow)
@@ -492,24 +496,24 @@ class CiSupplyChainTests(unittest.TestCase):
     def test_syft_platform_image_identity_binds_the_index_to_its_manifest(self) -> None:
         targets = load_module(SBOM_TARGETS)
         index_digest = "sha256:" + "a" * 64
-        config_digest = "sha256:" + "b" * 64
+        manifest_digest = "sha256:" + "b" * 64
 
         identity = targets.syft_platform_image_identity(
             "ghcr.io/example/harness@" + index_digest,
-            config_digest=config_digest,
+            manifest_digest=manifest_digest,
             architecture="amd64",
         )
 
         self.assertEqual(identity["root_name"], "harness")
         self.assertEqual(identity["root_version"], index_digest)
-        self.assertEqual(identity["digest"], config_digest)
+        self.assertEqual(identity["digest"], manifest_digest)
         self.assertEqual(
             identity["purl"], f"pkg:oci/harness@sha256%3A{'b' * 64}?arch=amd64"
         )
-        with self.assertRaisesRegex(ValueError, "platform config"):
+        with self.assertRaisesRegex(ValueError, "platform manifest"):
             targets.syft_platform_image_identity(
                 "ghcr.io/example/harness@" + index_digest,
-                config_digest="not-a-digest",
+                manifest_digest="not-a-digest",
                 architecture="amd64",
             )
 

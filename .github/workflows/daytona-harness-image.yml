@@ -202,6 +202,8 @@ jobs:
           SYFT_SOURCE_VERSION: ${{ steps.build.outputs.digest }}
         with:
           image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.manifest_digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
           format: spdx-json
           syft-version: v1.38.0
           output-file: daytona-harness-${{ github.sha }}.spdx.json
@@ -228,7 +230,7 @@ jobs:
           spec.loader.exec_module(module)
           identity = module.syft_platform_image_identity(
               f'{os.environ["IMAGE_NAME"]}@{os.environ["IMAGE_DIGEST"]}',
-              config_digest=os.environ["PLATFORM_CONFIG_DIGEST"],
+              manifest_digest=os.environ["PLATFORM_MANIFEST_DIGEST"],
               architecture="amd64",
           )
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
