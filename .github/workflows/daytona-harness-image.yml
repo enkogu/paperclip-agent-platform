@@ -377,7 +377,30 @@ jobs:
               exit 1
             }
           }
+          ensure_release_tag() {
+            local tag_target status
+            set +e
+            tag_target="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type + ":" + .object.sha' 2>"$error_log")"
+            status=$?
+            set -e
+            if (( status == 0 )); then
+              [[ "$tag_target" == "commit:$SOURCE_REVISION" ]] || {
+                echo "release tag is not immutably bound to the requested source revision" >&2
+                exit 1
+              }
+              return
+            fi
+            if ! grep -qi 'not found' "$error_log"; then
+              cat "$error_log" >&2
+              exit "$status"
+            fi
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" \
+              -f "sha=$SOURCE_REVISION" >/dev/null
+            verify_release_tag
+          }
 
+          ensure_release_tag
           set +e
           fetch_release
           status=$?
@@ -389,7 +412,7 @@ jobs:
             fi
             gh release create "$RELEASE_TAG" \
               --draft \
-              --target "$SOURCE_REVISION" \
+              --verify-tag \
               --title "$RELEASE_TAG" \
               --notes-file daytona-harness-release.md
             fetch_release

@@ -156,7 +156,13 @@ class CiSupplyChainTests(unittest.TestCase):
         self.assertIn('"manifestDigest": platform_manifest,', workflow)
         self.assertIn('"configDigest": platform_config,', workflow)
         self.assertIn("IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}", workflow)
+        self.assertIn('ensure_release_tag', workflow)
+        self.assertIn('gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"', workflow)
+        self.assertIn('"ref=refs/tags/$RELEASE_TAG"', workflow)
+        self.assertIn('"sha=$SOURCE_REVISION"', workflow)
         self.assertIn('gh release create "$RELEASE_TAG"', workflow)
+        self.assertIn('--verify-tag', workflow)
+        self.assertNotIn('--target "$SOURCE_REVISION"', workflow)
         self.assertIn("--draft", workflow)
         self.assertIn('gh release edit "$RELEASE_TAG" --draft=false', workflow)
         publish = workflow.split(
