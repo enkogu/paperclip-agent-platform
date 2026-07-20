@@ -205,14 +205,7 @@ run_bounded 60 "$PYTHON" -m pytest \
   tests/test_server_e2e_canary.py::ServerE2ECanaryTests::test_portable_bundle_embeds_redacted_documents_and_hashes
 
 section "Python tests"
-PYTEST_PATH="$PATH"
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  # Homebrew Bash 5.3 can deadlock while preparing here-documents on macOS.
-  # Keep the caller's PATH intact, but prefer Apple's system shell for test
-  # subprocesses that resolve `bash` through /usr/bin/env.
-  PYTEST_PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PYTEST_PATH"
-fi
-run_bounded "$CHECK_TIMEOUT" env PATH="$PYTEST_PATH" "$PYTHON" -m pytest \
+run_bounded "$CHECK_TIMEOUT" "$PYTHON" -m pytest \
   -c "$TOOL_ROOT/pyproject.toml" -q tests
 
 section "Python lint"

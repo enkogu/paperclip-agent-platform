@@ -10,6 +10,9 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST_STEP = ROOT / "deployment/steps/host.sh"
+BACKUP_SCRIPT = ROOT / "deployment/scripts/backup.sh"
+RESTORE_SCRIPT = ROOT / "deployment/scripts/restore.sh"
+RELEASE_CHECK = ROOT / "tools/platform-cli/release-check.sh"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 SERVER_VERIFY = ROOT / "tools/platform-cli/server-verify.py"
 
@@ -42,6 +45,21 @@ class StaticGatePortabilityTests(unittest.TestCase):
         self.assertIn("${VERSION_ID+x}", source)
         self.assertIn("${VERSION_CODENAME+x}", source)
         subprocess.run(["/bin/bash", "-n", str(HOST_STEP)], check=True)
+
+    def test_recovery_scripts_remain_bash_3_compatible(self) -> None:
+        for script in (BACKUP_SCRIPT, RESTORE_SCRIPT):
+            source = script.read_text()
+            self.assertNotIn("declare -A", source)
+            self.assertNotIn("mapfile", source)
+            subprocess.run(["/bin/bash", "-n", str(script)], check=True)
+
+    def test_release_check_does_not_replace_the_test_process_path(self) -> None:
+        source = RELEASE_CHECK.read_text()
+        self.assertNotIn("PYTEST_PATH", source)
+        self.assertIn(
+            'run_bounded "$CHECK_TIMEOUT" "$PYTHON" -m pytest',
+            source,
+        )
 
     def test_ci_workflow_parses_the_hash_locked_install_command(self) -> None:
         workflow = yaml.safe_load(CI_WORKFLOW.read_text())

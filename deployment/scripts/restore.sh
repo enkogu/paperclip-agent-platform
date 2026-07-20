@@ -150,12 +150,11 @@ expected_daytona_config_sha=$(metadata_value daytona_config_sha256) \
 [[ $(daytona_compose config | sha256sum | awk '{print $1}') == "$expected_daytona_config_sha" ]] \
   || fail "Daytona rendered config differs from the backup"
 
-declare -A current_sizes=()
 estimated_rollback_bytes=0
 for service in postgres kestra-postgres mattermost-postgres nuq-postgres; do
   aggregate_compose ps --status running --services | grep -Fx "$service" >/dev/null \
     || fail "restore preflight requires running database service: $service"
-  read -r current_sizes[$service] server_major restore_major \
+  read -r current_size server_major restore_major \
     < <(preflight_database aggregate "$service")
   expected_server_major=$(metadata_value "${service}_server_major") \
     || fail "backup lacks server-major identity for $service"
@@ -166,11 +165,11 @@ for service in postgres kestra-postgres mattermost-postgres nuq-postgres; do
     || fail "PostgreSQL major compatibility check failed for $service"
   validate_archive aggregate "$service" "$backup/$service.dump" \
     || fail "PostgreSQL archive validation failed: $service.dump"
-  ((estimated_rollback_bytes += current_sizes[$service]))
+  ((estimated_rollback_bytes += current_size))
 done
 daytona_compose ps --status running --services | grep -Fx db >/dev/null \
   || fail "restore preflight requires running database service: daytona-db"
-read -r current_sizes[daytona-db] server_major restore_major \
+read -r current_size server_major restore_major \
   < <(preflight_database daytona db)
 expected_server_major=$(metadata_value daytona-db_server_major) \
   || fail "backup lacks server-major identity for daytona-db"
@@ -181,15 +180,19 @@ expected_dump_major=$(metadata_value daytona-db_pg_dump_major) \
   || fail "PostgreSQL major compatibility check failed for daytona-db"
 validate_archive daytona db "$backup/daytona-db.dump" \
   || fail "PostgreSQL archive validation failed: daytona-db.dump"
-((estimated_rollback_bytes += current_sizes[daytona-db]))
+((estimated_rollback_bytes += current_size))
 available_bytes=$(df --output=avail -B1 "$backup_root" | awk 'NR == 2 {print $1}')
 required_bytes=$((estimated_rollback_bytes * 2 + minimum_free_reserve_bytes))
 [[ $available_bytes =~ ^[0-9]+$ && $available_bytes -ge $required_bytes ]] \
   || fail "insufficient rollback disk: require ${required_bytes} bytes, have ${available_bytes}; existing backups are never pruned automatically"
 
 declare -a aggregate_running=() daytona_running=() aggregate_clients=() daytona_clients=()
-mapfile -t aggregate_running < <(aggregate_compose ps --status running --services)
-mapfile -t daytona_running < <(daytona_compose ps --status running --services)
+while IFS= read -r service; do
+  [[ -z $service ]] || aggregate_running+=("$service")
+done < <(aggregate_compose ps --status running --services)
+while IFS= read -r service; do
+  [[ -z $service ]] || daytona_running+=("$service")
+done < <(daytona_compose ps --status running --services)
 for service in "${aggregate_running[@]}"; do
   case $service in postgres|kestra-postgres|mattermost-postgres|nuq-postgres) ;; *) aggregate_clients+=("$service");; esac
 done

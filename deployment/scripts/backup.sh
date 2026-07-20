@@ -139,28 +139,32 @@ aggregate_compose_sha=$(sha256sum "$compose" | awk '{print $1}')
 daytona_compose_sha=$(sha256sum "$daytona_compose_file" | awk '{print $1}')
 aggregate_config_sha=$(aggregate_compose config | sha256sum | awk '{print $1}')
 daytona_config_sha=$(daytona_compose config | sha256sum | awk '{print $1}')
-declare -A sizes=() server_majors=() dump_majors=()
+database_services=(postgres kestra-postgres mattermost-postgres nuq-postgres daytona-db)
+server_majors=()
+dump_majors=()
 estimated_bytes=0
-for service in postgres kestra-postgres mattermost-postgres nuq-postgres; do
+for service in "${database_services[@]:0:4}"; do
   aggregate_compose ps --status running --services | grep -Fx "$service" >/dev/null \
     || fail "required PostgreSQL service is not running: $service"
-  read -r sizes[$service] server_majors[$service] dump_majors[$service] \
-    < <(database_info aggregate "$service")
-  [[ ${sizes[$service]} =~ ^[0-9]+$ && ${server_majors[$service]} =~ ^[0-9]+$ \
-    && ${dump_majors[$service]} =~ ^[0-9]+$ ]] || fail "invalid PostgreSQL preflight result: $service"
-  [[ ${server_majors[$service]} == "${dump_majors[$service]}" ]] \
+  read -r size server_major dump_major < <(database_info aggregate "$service")
+  [[ $size =~ ^[0-9]+$ && $server_major =~ ^[0-9]+$ \
+    && $dump_major =~ ^[0-9]+$ ]] || fail "invalid PostgreSQL preflight result: $service"
+  [[ $server_major == "$dump_major" ]] \
     || fail "pg_dump/server major compatibility check failed: $service"
-  ((estimated_bytes += sizes[$service]))
+  server_majors+=("$server_major")
+  dump_majors+=("$dump_major")
+  ((estimated_bytes += size))
 done
 daytona_compose ps --status running --services | grep -Fx db >/dev/null \
   || fail "required PostgreSQL service is not running: daytona-db"
-read -r sizes[daytona-db] server_majors[daytona-db] dump_majors[daytona-db] \
-  < <(database_info daytona db)
-[[ ${sizes[daytona-db]} =~ ^[0-9]+$ && ${server_majors[daytona-db]} =~ ^[0-9]+$ \
-  && ${dump_majors[daytona-db]} =~ ^[0-9]+$ ]] || fail "invalid PostgreSQL preflight result: daytona-db"
-[[ ${server_majors[daytona-db]} == "${dump_majors[daytona-db]}" ]] \
+read -r size server_major dump_major < <(database_info daytona db)
+[[ $size =~ ^[0-9]+$ && $server_major =~ ^[0-9]+$ \
+  && $dump_major =~ ^[0-9]+$ ]] || fail "invalid PostgreSQL preflight result: daytona-db"
+[[ $server_major == "$dump_major" ]] \
   || fail "pg_dump/server major compatibility check failed: daytona-db"
-((estimated_bytes += sizes[daytona-db]))
+server_majors+=("$server_major")
+dump_majors+=("$dump_major")
+((estimated_bytes += size))
 available_bytes=$(df --output=avail -B1 "$backup_root" | awk 'NR == 2 {print $1}')
 required_bytes=$((estimated_bytes * 2 + minimum_free_reserve_bytes))
 [[ $available_bytes =~ ^[0-9]+$ && $available_bytes -ge $required_bytes ]] \
@@ -169,8 +173,12 @@ required_bytes=$((estimated_bytes * 2 + minimum_free_reserve_bytes))
 # Keep one bounded recovery cut: every client that was running is stopped before
 # the first dump and remains stopped until the last dump is durable. The EXIT
 # trap restores precisely that captured running set on success and failure.
-mapfile -t aggregate_running < <(aggregate_compose ps --status running --services)
-mapfile -t daytona_running < <(daytona_compose ps --status running --services)
+while IFS= read -r service; do
+  [[ -z $service ]] || aggregate_running+=("$service")
+done < <(aggregate_compose ps --status running --services)
+while IFS= read -r service; do
+  [[ -z $service ]] || daytona_running+=("$service")
+done < <(daytona_compose ps --status running --services)
 for service in "${aggregate_running[@]}"; do
   case $service in postgres|kestra-postgres|mattermost-postgres|nuq-postgres) ;; *) aggregate_clients+=("$service");; esac
 done
@@ -200,9 +208,10 @@ created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf 'daytona_compose_sha256=%s\n' "$daytona_compose_sha"
   printf 'aggregate_config_sha256=%s\n' "$aggregate_config_sha"
   printf 'daytona_config_sha256=%s\n' "$daytona_config_sha"
-  for service in postgres kestra-postgres mattermost-postgres nuq-postgres daytona-db; do
-    printf '%s_server_major=%s\n' "$service" "${server_majors[$service]}"
-    printf '%s_pg_dump_major=%s\n' "$service" "${dump_majors[$service]}"
+  for index in "${!database_services[@]}"; do
+    service=${database_services[$index]}
+    printf '%s_server_major=%s\n' "$service" "${server_majors[$index]}"
+    printf '%s_pg_dump_major=%s\n' "$service" "${dump_majors[$index]}"
   done
   printf 'database_dumps=postgres,kestra-postgres,mattermost-postgres,nuq-postgres,daytona-db\n'
   printf 'volume_payloads=not_captured\n'

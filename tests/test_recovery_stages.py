@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import textwrap
 
 import pytest
@@ -25,7 +26,14 @@ class RecoveryHarness:
         self.log = root / "docker.log"
         self.scenario = root / "scenario"
         self.env_file = root / "operator.env"
-        self.bash = shutil.which("bash") or "/bin/bash"
+        # Homebrew Bash 5.3 can deadlock while parsing these nested remote
+        # here-documents on macOS. Apple's Bash is stable and is also the
+        # oldest supported shell, so use it as the Darwin portability target.
+        self.bash = (
+            "/bin/bash"
+            if sys.platform == "darwin"
+            else shutil.which("bash") or "/bin/bash"
+        )
         self.bin.mkdir()
         self.backups.mkdir()
         (self.remote / "deployment" / "services" / "daytona").mkdir(parents=True)
@@ -161,7 +169,7 @@ class RecoveryHarness:
 
     def run(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [SCRIPTS / script, *args],
+            [self.bash, SCRIPTS / script, *args],
             env={
                 **os.environ,
                 "PATH": f"{self.bin}:{os.environ['PATH']}",
