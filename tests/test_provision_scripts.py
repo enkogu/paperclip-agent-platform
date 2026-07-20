@@ -95,7 +95,7 @@ def test_all_runs_once_in_order_and_uses_daytona_lifecycle(tmp_path: Path) -> No
     ]
 
 
-def test_daytona_snapshot_apply_is_pull_only_without_build_admission() -> None:
+def test_daytona_snapshot_apply_uses_sdk_digest_build_without_local_context() -> None:
     source = DAYTONA.read_text()
     transaction = source.split("build_images_while_locked() {", 1)[1].split(
         "\nbuild_images() {", 1
@@ -104,6 +104,10 @@ def test_daytona_snapshot_apply_is_pull_only_without_build_admission() -> None:
     assert "prepare_sandbox_context" not in transaction
     assert "Image.fromDockerfile" not in transaction
     assert 'safe("MTE_DAYTONA_SANDBOX_IMAGE"' in transaction
+    assert "Image.base(sandboxImage)" in transaction
+    assert "const snapshotBuildDockerfile=`FROM ${sandboxImage}\\n`" in transaction
+    assert "snapshotBuildImage.contextList.length!==0" in transaction
+    assert "{name,image:buildImage,resources}" in transaction
     assert "docker run --rm -i" in transaction
     assert str(RESOURCE_PREFLIGHT.name) not in source
     assert "less than 3 GiB RAM available" not in source

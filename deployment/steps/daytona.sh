@@ -962,7 +962,7 @@ const canonicalJson = (value) => {
   if (value && typeof value==="object") return `{${Object.keys(value).sort().map((key)=>`${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
 };
-const { Daytona } = await import("@daytonaio/sdk");
+const { Daytona, Image } = await import("@daytonaio/sdk");
 const daytona = new Daytona({
   apiKey: values.DAYTONA_API_KEY,
   apiUrl: safe("MTE_DAYTONA_INTERNAL_API_URL"),
@@ -973,6 +973,16 @@ if (codingPrefix===generalPrefix) throw new Error("coding and general snapshot p
 const sandboxImage=safe("MTE_DAYTONA_SANDBOX_IMAGE",/^[^\s@]+@sha256:[0-9a-f]{64}$/);
 const sandboxImageSourceUrl=safe("MTE_DAYTONA_SANDBOX_IMAGE_SOURCE_URL",/^https:\/\/[^\s]+$/);
 const sandboxImageRevision=safe("MTE_DAYTONA_SANDBOX_IMAGE_REVISION",/^[0-9a-f]{40}$/);
+// The self-hosted control plane cannot reliably pull an OCI digest supplied in
+// imageName.  Use the SDK's documented Image path instead: it sends buildInfo
+// with this exact, context-free Dockerfile, and BuildKit resolves the immutable
+// carrier reference itself.  The canonical environment remains the sole source
+// of that reference; no digest is converted to a tag.
+const snapshotBuildDockerfile=`FROM ${sandboxImage}\n`;
+const snapshotBuildImage=Image.base(sandboxImage);
+if (snapshotBuildImage.dockerfile!==snapshotBuildDockerfile || snapshotBuildImage.contextList.length!==0) {
+  throw new Error("Daytona SDK did not create the expected context-free digest build request");
+}
 const codingResources={
   cpu:Number(safe("MTE_DAYTONA_CODING_CPU",/^\d+$/)),
   memory:Number(safe("MTE_DAYTONA_CODING_MEMORY_GIB",/^\d+$/)),
@@ -1008,25 +1018,20 @@ async function deleteSnapshot(snapshot) {
   }
   throw new Error(`timed out deleting terminal snapshot ${snapshot.name}`);
 }
-const snapshotImageRef=(snapshot)=>{
-  const refs=[snapshot.imageName,snapshot.image,snapshot.imageRef,snapshot.ref]
-    .filter((value)=>typeof value==="string" && /^[^\s@]+@sha256:[0-9a-f]{64}$/.test(value));
-  const unique=[...new Set(refs)];
-  return unique.length===1 ? unique[0] : undefined;
-};
-const snapshotMatchesContract=(snapshot,image,expectedResources)=>
-  snapshotImageRef(snapshot)===image &&
+const snapshotBuildProvenance=(snapshot)=>snapshot.buildInfo?.dockerfileContent;
+const snapshotMatchesContract=(snapshot,expectedDockerfile,expectedResources)=>
+  snapshotBuildProvenance(snapshot)===expectedDockerfile &&
   Number(snapshot.cpu)===expectedResources.cpu &&
   Number(snapshot.mem ?? snapshot.memory)===expectedResources.memory &&
   Number(snapshot.disk)===expectedResources.disk;
-async function ensureSnapshot(name,image,resources) {
+async function ensureSnapshot(name,buildImage,expectedDockerfile,resources) {
   for (let cycle=0; cycle<2; cycle+=1) {
     let snapshot=(await daytona.snapshot.list(1,100)).items.find((row)=>row.name===name);
     if (snapshot && terminalStates.has(snapshot.state)) {
       await deleteSnapshot(snapshot);
       snapshot=undefined;
     }
-    if (snapshot && !snapshotMatchesContract(snapshot,image,resources)) {
+    if (snapshot && !snapshotMatchesContract(snapshot,expectedDockerfile,resources)) {
       // The exact generation name is owned by this deployment contract. A
       // reused row whose image or resources cannot be inspected exactly is
       // unsafe, so delete only that owned row and recreate it.
@@ -1034,7 +1039,7 @@ async function ensureSnapshot(name,image,resources) {
       snapshot=undefined;
     }
     if (!snapshot) snapshot=await daytona.snapshot.create(
-      {name,image,resources},
+      {name,image:buildImage,resources},
       {timeout:1800},
     );
     if (terminalStates.has(snapshot.state)) {
@@ -1054,7 +1059,7 @@ async function ensureSnapshot(name,image,resources) {
       continue;
     }
     if (snapshot.state!=="active") throw new Error(`timed out waiting for active snapshot ${name}`);
-    if (!snapshotMatchesContract(snapshot,image,resources)) {
+    if (!snapshotMatchesContract(snapshot,expectedDockerfile,resources)) {
       await deleteSnapshot(snapshot);
       continue;
     }
@@ -1062,8 +1067,8 @@ async function ensureSnapshot(name,image,resources) {
   }
   throw new Error(`snapshot ${name} entered a terminal build state twice`);
 }
-const codingSnapshot=await ensureSnapshot(codingName,sandboxImage,codingResources);
-const generalSnapshot=await ensureSnapshot(generalName,sandboxImage,generalResources);
+const codingSnapshot=await ensureSnapshot(codingName,snapshotBuildImage,snapshotBuildDockerfile,codingResources);
+const generalSnapshot=await ensureSnapshot(generalName,snapshotBuildImage,snapshotBuildDockerfile,generalResources);
 list=await daytona.snapshot.list(1,100);
 const deferredCleanup=list.items
   .filter((snapshot)=>
@@ -1073,7 +1078,10 @@ const deferredCleanup=list.items
   .map((snapshot)=>({id:snapshot.id,name:snapshot.name,state:snapshot.state}));
 const snapshotRows=[["coding",codingSnapshot],["general",generalSnapshot]].map(([role,snapshot])=>({
   role,
-  id:snapshot.id,name:snapshot.name,state:snapshot.state,ref:snapshotImageRef(snapshot),
+  id:snapshot.id,name:snapshot.name,state:snapshot.state,
+  // ref is the immutable source-carrier provenance. Daytona assigns a separate
+  // internal registry ref to the build artifact.
+  ref:sandboxImage,buildDockerfile:snapshotBuildProvenance(snapshot),
   cpu:snapshot.cpu,memoryGiB:snapshot.mem,diskGiB:snapshot.disk,
 }));
 const evidence={

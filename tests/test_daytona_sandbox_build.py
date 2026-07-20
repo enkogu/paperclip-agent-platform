@@ -231,7 +231,12 @@ class DaytonaSandboxBuildTests(unittest.TestCase):
         self.assertNotIn("Image.fromDockerfile", step)
         self.assertNotIn("sandbox-context", step)
         self.assertIn('safe("MTE_DAYTONA_SANDBOX_IMAGE"', step)
-        self.assertIn("ensureSnapshot(codingName,sandboxImage", step)
+        self.assertIn("Image.base(sandboxImage)", step)
+        self.assertIn("const snapshotBuildDockerfile=`FROM ${sandboxImage}\\n`", step)
+        self.assertIn(
+            "ensureSnapshot(codingName,snapshotBuildImage,snapshotBuildDockerfile",
+            step,
+        )
         self.assertIn("/home/daytona/paperclip-workspace", step)
         self.assertNotIn("rollback-images", step)
         self.assertNotIn("build.py", step)
@@ -354,13 +359,17 @@ class DaytonaSandboxBuildTests(unittest.TestCase):
             image_block,
         )
         self.assertIn(
-            "ensureSnapshot(codingName,sandboxImage,codingResources)", image_block
+            "ensureSnapshot(codingName,snapshotBuildImage,snapshotBuildDockerfile,codingResources)",
+            image_block,
         )
         self.assertIn(
-            "ensureSnapshot(generalName,sandboxImage,generalResources)", image_block
+            "ensureSnapshot(generalName,snapshotBuildImage,snapshotBuildDockerfile,generalResources)",
+            image_block,
         )
-        self.assertIn("ref:snapshotImageRef(snapshot)", image_block)
-        self.assertIn("snapshotImageRef(snapshot)===image", image_block)
+        self.assertIn("snapshotBuildProvenance(snapshot)===expectedDockerfile", image_block)
+        self.assertIn("Image.base(sandboxImage)", image_block)
+        self.assertIn("snapshotBuildImage.contextList.length!==0", image_block)
+        self.assertIn("ref:sandboxImage,buildDockerfile:snapshotBuildProvenance(snapshot)", image_block)
         self.assertIn("Number(snapshot.cpu)===expectedResources.cpu", image_block)
         self.assertIn(
             "Number(snapshot.mem ?? snapshot.memory)===expectedResources.memory",
@@ -368,7 +377,7 @@ class DaytonaSandboxBuildTests(unittest.TestCase):
         )
         self.assertIn("Number(snapshot.disk)===expectedResources.disk", image_block)
         self.assertIn(
-            "snapshot && !snapshotMatchesContract(snapshot,image,resources)",
+            "snapshot && !snapshotMatchesContract(snapshot,expectedDockerfile,resources)",
             image_block,
         )
         self.assertIn("await deleteSnapshot(snapshot);", image_block)
@@ -435,14 +444,15 @@ class DaytonaSandboxBuildTests(unittest.TestCase):
             "const codingSnapshot", 1
         )[0]
         mismatch = ensure.index(
-            "snapshot && !snapshotMatchesContract(snapshot,image,resources)"
+            "snapshot && !snapshotMatchesContract(snapshot,expectedDockerfile,resources)"
         )
         delete = ensure.index("await deleteSnapshot(snapshot);", mismatch)
         recreate = ensure.index("snapshot=await daytona.snapshot.create", delete)
         self.assertLess(mismatch, delete)
         self.assertLess(delete, recreate)
-        self.assertIn("snapshotImageRef(snapshot)===image", source)
-        self.assertIn("return unique.length===1 ? unique[0] : undefined", source)
+        self.assertIn("snapshotBuildProvenance(snapshot)===expectedDockerfile", source)
+        self.assertIn("const snapshotBuildImage=Image.base(sandboxImage);", source)
+        self.assertIn("snapshotBuildImage.contextList.length!==0", source)
         self.assertIn("harnessVersions", source.split("snapshotContractHash", 1)[0])
         self.assertIn("if (!ownedNames.has(snapshot.name))", source)
 

@@ -428,7 +428,7 @@ REVIEWED_CANONICAL_VALUE_MIGRATIONS = {
         "aab1e9417213083be73d2d0328e862319a09ef77571643bf4be07446edaf7322",
         "6ff0ca9938d7fc9a63e976656884de172fa9c6baf20654b3ddb86212dfa3d611",
         "2a89ffbd67866ad542ba801f7a31c1228780315cc133cf85eb59d8b860d5ad0a",
-        "088ca38cbebf40d4b3c6471ff0b2693fa411bb3532a828de5f54c2d85f8f724b",
+        "3c26ec6b08874d25afef724fba930ebeb983924eaa9a031353a6cd6349d3256c",
     ),
     # The runtime verifies its own release-script digest before it starts.
     # Upgrade only reviewed historical script digests; unknown overrides fail
@@ -991,7 +991,7 @@ ONE_TIME_MIGRATION_SEEDS = {
     "MTE_DAYTONA_RUNNER_AVAILABILITY_SCORE_THRESHOLD": "10",
     "MTE_DAYTONA_RUNNER_START_SCORE_THRESHOLD": "3",
     "MTE_DAYTONA_INSTALLER_SHA256": (
-        "088ca38cbebf40d4b3c6471ff0b2693fa411bb3532a828de5f54c2d85f8f724b"
+        "3c26ec6b08874d25afef724fba930ebeb983924eaa9a031353a6cd6349d3256c"
     ),
     "MTE_JQ_VERSION": "1.8.1",
     "MTE_JQ_LINUX_AMD64_SHA256": (
