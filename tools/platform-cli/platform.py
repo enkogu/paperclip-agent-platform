@@ -1286,7 +1286,7 @@ def _sync_unlocked(cfg: dict[str, Any], *, render_projections: bool = True) -> N
             + 'test -z "$(find "$root/templates" "$root/manifests" '
             + '"$root/runtime/paperclip" "$root/deployment" '
             + '"$root/config/services" '
-            + '! -perm 0644 -print -quit)"; '
+            + '-type f ! -perm 0644 -print -quit)"; '
             + 'test -z "$(find "$root/steps" -type f ! -name "*.sh" -print -quit)"; '
             + "test \"$(stat -c '%u:%g:%a:%F' "
             + '"$root/config/acceptance-requirements.yaml")" '

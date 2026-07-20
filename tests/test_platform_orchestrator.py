@@ -2249,6 +2249,67 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(copied, "portable\n")
 
+    def test_sync_live_permission_audit_checks_files_not_directories(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/mte-platform",
+                    "excluded": [],
+                }
+            }
+        }
+        remote_commands = []
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            mock.patch.object(
+                platform, "local_evidence_root", return_value=Path(temp) / "evidence"
+            ),
+            mock.patch.object(
+                platform,
+                "ssh",
+                side_effect=lambda _cfg, command, **_kwargs: remote_commands.append(
+                    command
+                ),
+            ),
+            mock.patch.object(platform, "run"),
+        ):
+            platform.sync(cfg)
+
+        publish = remote_commands[-1]
+        self.assertIn(
+            '"$root/config/services" -type f ! -perm 0644 -print -quit',
+            publish,
+        )
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nested = root / "nested"
+            nested.mkdir(mode=0o755)
+            safe = nested / "safe.txt"
+            safe.write_text("safe\n")
+            safe.chmod(0o644)
+            unsafe = nested / "unsafe.txt"
+            unsafe.write_text("unsafe\n")
+            unsafe.chmod(0o600)
+            result = subprocess.run(
+                [
+                    "find",
+                    str(root),
+                    "-type",
+                    "f",
+                    "!",
+                    "-perm",
+                    "0644",
+                    "-print",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.stdout.splitlines(), [str(unsafe)])
+
     def test_secret_mutation_renders_and_audits_without_deployment(self):
         cfg = {
             "spec": {
