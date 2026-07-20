@@ -60,8 +60,19 @@ ssh_options=(
   -o TCPKeepAlive=yes
 )
 
-ssh "${ssh_options[@]}" "$target" bash -s -- \
-  "$platform_root" "$secrets_root" "$post_up_action" "$component" "${services[@]}" <<'REMOTE'
+temp_root=${TMPDIR:-/tmp}
+remote_script=$(umask 077; mktemp "$temp_root/paperclip-compose.XXXXXX")
+cleanup_remote_script() {
+  rm -f -- "$remote_script"
+}
+trap cleanup_remote_script EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Feed SSH from a regular file. macOS/Homebrew Bash can block while preparing a
+# sufficiently large heredoc pipe before ssh starts reading it.
+cat >"$remote_script" <<'REMOTE'
 set -euo pipefail
 platform_root=$1
 secrets_root=$2
@@ -126,3 +137,7 @@ if [[ $post_up_action == restart-alertmanager ]]; then
 fi
 
 REMOTE
+
+ssh "${ssh_options[@]}" "$target" bash -s -- \
+  "$platform_root" "$secrets_root" "$post_up_action" "$component" "${services[@]}" \
+  <"$remote_script"

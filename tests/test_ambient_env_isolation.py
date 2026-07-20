@@ -29,6 +29,21 @@ def remote_compose_script() -> str:
     return source.split(marker, 1)[1].rsplit("\nREMOTE", 1)[0]
 
 
+def test_compose_ssh_transport_uses_a_cleaned_regular_file_for_stdin():
+    source = COMPOSE_SCRIPT.read_text()
+    transport = source.rsplit('\nssh "${ssh_options[@]}"', 1)[1]
+
+    assert 'remote_script=$(umask 077; mktemp ' in source
+    assert 'cat >"$remote_script" <<\'REMOTE\'' in source
+    assert '<"$remote_script"' in transport
+    assert source.index('cat >"$remote_script"') < source.rindex(
+        '\nssh "${ssh_options[@]}"'
+    )
+    assert 'rm -f -- "$remote_script"' in source
+    assert "trap cleanup_remote_script EXIT" in source
+    assert '"${services[@]}" <<\'REMOTE\'' not in source
+
+
 def test_cloudflare_canonical_environment_wins_over_ambient_and_is_not_backfilled():
     renderer = load_renderer()
     with tempfile.TemporaryDirectory() as directory:
