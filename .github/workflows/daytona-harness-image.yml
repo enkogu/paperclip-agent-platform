@@ -214,6 +214,7 @@ jobs:
         name: Derive the exact expected SPDX root identity
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM_MANIFEST_DIGEST: ${{ steps.platform-image.outputs.manifest_digest }}
           PLATFORM_CONFIG_DIGEST: ${{ steps.platform-image.outputs.config_digest }}
         run: |
           set -euo pipefail
