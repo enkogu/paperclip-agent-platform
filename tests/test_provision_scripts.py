@@ -77,7 +77,6 @@ def test_all_runs_once_in_order_and_uses_daytona_lifecycle(tmp_path: Path) -> No
         "config render",
         "config audit",
         "runtime paperclip preflight",
-        "runtime paperclip config-migrate",
         "runtime paperclip install",
         "profiles apply",
         "paperclip-environments apply",
@@ -225,7 +224,7 @@ def test_paperclip_runtime_uses_the_immutable_image_native_entrypoint():
     assert "node_modules" not in source
 
 
-def test_paperclip_preflight_rejects_an_incomplete_image_abi():
+def test_paperclip_install_rejects_an_incomplete_image_abi():
     source = PAPERCLIP.read_text()
     assert "verify_image_abi" in source
     assert 'command != ["node", "dist/index.js"]' in source
@@ -244,6 +243,10 @@ def test_paperclip_preflight_rejects_an_incomplete_image_abi():
     assert 'labels.get("org.opencontainers.image.source") != expected_source' in source
     assert (
         'labels.get("org.opencontainers.image.revision") != expected_revision' in source
+    )
+    install = source.split("install_runtime() {", 1)[1].split("\n}\n\nstatus_runtime()", 1)[0]
+    assert install.index("pull_and_verify_image") < install.index(
+        "reconcile_auth_secret_projection"
     )
 
 
@@ -316,6 +319,7 @@ def test_config_migrate_fails_abi_before_data_or_evidence_mutation(
         "#!/usr/bin/env bash\n"
         "set -eu\n"
         f"printf '%s\\n' \"$*\" >> {str(docker_log)!r}\n"
+        "if [[ $1 == pull ]]; then exit 0; fi\n"
         "if [[ $1 == image && $2 == inspect ]]; then\n"
         '  printf \'%s\\n\' \'{"Entrypoint":[],"Cmd":["node","dist/index.js"],"Labels":{}}\'\n'
         "  exit 0\n"
@@ -331,6 +335,7 @@ def test_config_migrate_fails_abi_before_data_or_evidence_mutation(
     assert "immutable image source label drifted" in result.stderr
     assert not (tmp_path / "evidence").exists()
     assert docker_log.read_text().splitlines() == [
+        f"pull {values['MTE_PAPERCLIP_IMAGE']}",
         f"image inspect --format {{{{json .Config}}}} {values['MTE_PAPERCLIP_IMAGE']}"
     ]
 
@@ -376,6 +381,77 @@ def _paperclip_verify_fixture(
     )
     script.chmod(0o700)
     return script, values, evidence
+
+
+def test_paperclip_preflight_accepts_registry_image_that_is_not_local(
+    tmp_path: Path,
+) -> None:
+    script, values, evidence = _paperclip_verify_fixture(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        f"printf '%s\\n' \"$*\" >> {str(docker_log)!r}\n"
+        "if [[ $1 == manifest && $2 == inspect ]]; then exit 0; fi\n"
+        "exit 97\n"
+    )
+    docker.chmod(0o700)
+
+    result = subprocess.run(
+        [script, "preflight"],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert evidence.read_text() == "sentinel evidence\n"
+    assert docker_log.read_text().splitlines() == [
+        f"manifest inspect {values['MTE_PAPERCLIP_IMAGE']}"
+    ]
+
+
+def test_paperclip_install_pulls_then_rejects_wrong_image_provenance(
+    tmp_path: Path,
+) -> None:
+    script, values, evidence = _paperclip_verify_fixture(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -eu\n"
+        f"printf '%s\\n' \"$*\" >> {str(docker_log)!r}\n"
+        "if [[ $1 == pull ]]; then exit 0; fi\n"
+        "if [[ $1 == image && $2 == inspect ]]; then\n"
+        "  printf '%s\\n' "
+        "'{\"Entrypoint\":[],\"Cmd\":[\"node\",\"dist/index.js\"],\"Labels\":{}}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 97\n"
+    )
+    docker.chmod(0o700)
+
+    result = subprocess.run(
+        [script, "install"],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "immutable image source label drifted" in result.stderr
+    assert evidence.read_text() == "sentinel evidence\n"
+    assert docker_log.read_text().splitlines() == [
+        f"pull {values['MTE_PAPERCLIP_IMAGE']}",
+        f"image inspect --format {{{{json .Config}}}} {values['MTE_PAPERCLIP_IMAGE']}",
+    ]
 
 
 def test_paperclip_runtime_rejects_invalid_fork_evidence_before_docker_mutation(

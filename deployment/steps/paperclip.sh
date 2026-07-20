@@ -141,6 +141,13 @@ validate_deployment_contract() {
   esac
 }
 
+verify_registry_image_available() {
+  docker manifest inspect "$PAPERCLIP_IMAGE" >/dev/null || {
+    echo "paperclip-runtime: immutable MTE_PAPERCLIP_IMAGE is unavailable from the registry" >&2
+    return 2
+  }
+}
+
 verify_image_abi() {
   local config
   config=$(docker image inspect --format '{{json .Config}}' "$PAPERCLIP_IMAGE") || {
@@ -200,6 +207,14 @@ PY
     echo "paperclip-runtime: immutable image is missing the required Paperclip/Daytona ABI" >&2
     return 2
   }
+}
+
+pull_and_verify_image() {
+  docker pull "$PAPERCLIP_IMAGE" >/dev/null || {
+    echo "paperclip-runtime: failed to pull immutable MTE_PAPERCLIP_IMAGE" >&2
+    return 2
+  }
+  verify_image_abi
 }
 
 verify_running_image_binding() {
@@ -777,7 +792,7 @@ start_paperclip_container() {
 
 install_runtime() {
   validate_deployment_contract
-  verify_image_abi
+  pull_and_verify_image
   reconcile_auth_secret_projection
   ensure_sources
   for volume in mte-paperclip-native-data mte-paperclip-native-workspaces; do
@@ -845,8 +860,8 @@ verify_runtime() {
 }
 
 case "$ACTION" in
-  preflight) validate_deployment_contract; verify_image_abi ;;
-  config-migrate) validate_deployment_contract; verify_image_abi; reconcile_paperclip_config ;;
+  preflight) validate_deployment_contract; verify_registry_image_available ;;
+  config-migrate) validate_deployment_contract; pull_and_verify_image; reconcile_paperclip_config ;;
   install) install_runtime ;;
   status) status_runtime ;;
   verify) verify_runtime ;;

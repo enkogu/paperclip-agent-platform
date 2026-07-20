@@ -82,7 +82,6 @@ run_group() {
   case "${group}" in
     paperclip)
       platform runtime paperclip preflight
-      platform runtime paperclip config-migrate
       platform runtime paperclip install
       platform profiles apply
       platform paperclip-environments apply
