@@ -463,6 +463,38 @@ REVIEWED_CANONICAL_VALUE_MIGRATIONS = {
         "http://toolhive:19013",
     ),
 }
+# These version contracts are owned by immutable runtime artifacts. Unlike the
+# compatibility migrations above, an unknown existing value cannot safely be
+# preserved: doing so would defer the mismatch until the runtime ABI gate after
+# deployment has already started.
+GOVERNED_CANONICAL_VALUE_MIGRATIONS = {
+    "PAPERCLIP_DAYTONA_SDK_VERSION": ("0.171.0", "0.175.0"),
+}
+
+
+def reconcile_governed_canonical_value_migrations(
+    values: dict[str, str],
+) -> set[str]:
+    migrated: set[str] = set()
+    for key, (
+        legacy_value,
+        current_value,
+    ) in GOVERNED_CANONICAL_VALUE_MIGRATIONS.items():
+        existing = values.get(key, "").strip()
+        if not existing or existing == current_value:
+            continue
+        if existing == legacy_value:
+            values[key] = current_value
+            migrated.add(key)
+            continue
+        raise ConfigError(
+            f"refusing automatic {key} migration from an unreviewed value; "
+            f"after verifying the immutable Paperclip image, set {key}={current_value} "
+            "in the canonical environment and rerun the one-command install"
+        )
+    return migrated
+
+
 REVIEWED_CANONICAL_KEY_MIGRATIONS = {
     # The original collector mapping used a generic name. Compose now owns
     # every published port through its deterministic ``PORT_1`` key. Migrate
@@ -2272,6 +2304,7 @@ def init_source(imported: dict[str, str]) -> dict[str, Any]:
         if values.get(key) in old_values:
             values[key] = new_value
             migrated_keys.add(key)
+    migrated_keys.update(reconcile_governed_canonical_value_migrations(values))
     imported = dict(imported)
     aliases = {
         **DOMAIN_INPUT_ALIASES,
@@ -2443,6 +2476,7 @@ def init_source(imported: dict[str, str]) -> dict[str, Any]:
         if values.get(key) in old_values:
             values[key] = new_value
             migrated_keys.add(key)
+    migrated_keys.update(reconcile_governed_canonical_value_migrations(values))
     prior_daytona_proxy_domain = values.get("MTE_DAYTONA_PROXY_DOMAIN", "").strip()
     for derived in DERIVED_VALUE_KEYS:
         values.pop(derived, None)
