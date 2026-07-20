@@ -2119,6 +2119,97 @@ class PlatformOrchestratorTests(unittest.TestCase):
             self.assertNotEqual(omitted_result.returncode, 0)
             self.assertEqual(live.read_text(), "live\n")
 
+    def test_sync_upload_failure_removes_only_its_uuid_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "platform"
+            other_stage = root / ".sync-staging-other"
+            other_stage.mkdir(parents=True)
+            cfg = {
+                "spec": {
+                    "host": {
+                        "ssh": "root@example.test",
+                        "root": str(root),
+                        "excluded": [],
+                    }
+                }
+            }
+
+            def local_ssh(_cfg, command, **kwargs):
+                return subprocess.run(
+                    ["bash", "-c", command],
+                    check=kwargs.get("check", True),
+                    capture_output=True,
+                    text=True,
+                )
+
+            with (
+                mock.patch.object(
+                    platform,
+                    "local_evidence_root",
+                    return_value=Path(temp) / "evidence",
+                ),
+                mock.patch.object(
+                    platform.uuid, "uuid4", return_value=mock.Mock(hex="upload-fail")
+                ),
+                mock.patch.object(platform, "ssh", side_effect=local_ssh),
+                mock.patch.object(
+                    platform,
+                    "run",
+                    side_effect=subprocess.CalledProcessError(23, ["rsync"]),
+                ),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    platform.sync(cfg)
+
+            self.assertFalse((root / ".sync-staging-upload-fail").exists())
+            self.assertTrue(other_stage.is_dir())
+
+    def test_sync_publish_failure_removes_only_its_uuid_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "platform"
+            current_stage = root / ".sync-staging-publish-fail"
+            other_stage = root / ".sync-staging-other"
+            other_stage.mkdir(parents=True)
+            cfg = {
+                "spec": {
+                    "host": {
+                        "ssh": "root@example.test",
+                        "root": str(root),
+                        "excluded": [],
+                    }
+                }
+            }
+
+            def failing_publish(_cfg, command, **kwargs):
+                if 'lock="$root/.sync.lock"' in command:
+                    raise subprocess.CalledProcessError(1, ["ssh"])
+                return subprocess.run(
+                    ["bash", "-c", command],
+                    check=kwargs.get("check", True),
+                    capture_output=True,
+                    text=True,
+                )
+
+            with (
+                mock.patch.object(
+                    platform,
+                    "local_evidence_root",
+                    return_value=Path(temp) / "evidence",
+                ),
+                mock.patch.object(
+                    platform.uuid,
+                    "uuid4",
+                    return_value=mock.Mock(hex="publish-fail"),
+                ),
+                mock.patch.object(platform, "ssh", side_effect=failing_publish),
+                mock.patch.object(platform, "run"),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    platform.sync(cfg)
+
+            self.assertFalse(current_stage.exists())
+            self.assertTrue(other_stage.is_dir())
+
     def test_sync_bundle_rejects_symlinks_and_special_files(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

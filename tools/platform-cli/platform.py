@@ -1216,81 +1216,92 @@ def _sync_unlocked(cfg: dict[str, Any], *, render_projections: bool = True) -> N
     # the earlier bundle removes only its own stage, never an in-flight rsync.
     staging_root = f"{remote_root}/.sync-staging-{uuid.uuid4().hex}"
     rendered = render_config(cfg)
-    ssh(
-        cfg,
-        "set -eu; umask 077; mkdir -p " + shlex.quote(staging_root),
-    )
-    with tempfile.TemporaryDirectory() as temp:
-        bundle = Path(temp) / "bundle"
-        bundle.mkdir()
-        _materialize_sync_bundle(cfg, bundle, rendered)
-        run(
-            remote_rsync_command(
-                "-rtz",
-                "--delete",
-                str(bundle) + "/",
-                f"{target}:{staging_root}/",
-            )
+    try:
+        ssh(
+            cfg,
+            "set -eu; umask 077; mkdir -p " + shlex.quote(staging_root),
         )
-    ssh(
-        cfg,
-        "set -eu; umask 077; stage="
-        + shlex.quote(staging_root)
-        + "; root="
-        + shlex.quote(remote_root)
-        + '; lock="$root/.sync.lock"; : > "$lock"; chown root:root "$lock"; '
-        + 'chmod 0600 "$lock"; exec 9>"$lock"; flock -x 9; '
-        + 'cd "$stage"; actual="$(find . -type f ! -path '
-        + shlex.quote(f"./{SYNC_MANIFEST_NAME}")
-        + " -printf '%P\\n' | LC_ALL=C sort)\"; expected=\"$(sed -n "
-        + shlex.quote(r"s/^[0-9a-f]\{64\}  //p")
-        + " "
-        + shlex.quote(SYNC_MANIFEST_NAME)
-        + ')"; test "$actual" = "$expected"; sha256sum -c '
-        + shlex.quote(SYNC_MANIFEST_NAME)
-        + "; rm -f "
-        + shlex.quote(SYNC_MANIFEST_NAME)
-        + "; "
-        + 'chown -R root:root "$stage"; '
-        + 'find "$stage" -type d -exec chmod 0755 {} +; '
-        + 'find "$stage" -type f -exec chmod 0644 {} +; '
-        + 'find "$stage/bin" -type f -exec chmod 0700 {} +; '
-        + 'find "$stage/steps" -type f -name "*.sh" -exec chmod 0700 {} +; '
-        + 'test -z "$(find "$stage" -type l -print -quit)"; '
-        + 'test -z "$(find "$stage" \\( ! -user root -o ! -group root \\) -print -quit)"; '
-        + 'test -z "$(find "$stage/bin" -type f ! -perm 0700 -print -quit)"; '
-        + 'test -z "$(find "$stage/steps" -type f -name "*.sh" ! -perm 0700 -print -quit)"; '
-        + 'test -z "$(find "$stage" -type f ! -path "$stage/bin/*" '
-        + '! -path "$stage/steps/*.sh" '
-        + '! -perm 0644 -print -quit)"; '
-        + 'mkdir -p "$root/config" "$root/runtime"; '
-        + "for rel in bin templates manifests runtime/paperclip deployment steps config/services; do "
-        + 'mkdir -p "$root/$rel"; '
-        + 'test -z "$(find "$root/$rel" -type l -print -quit)"; '
-        + 'find "$root/$rel" -type d -exec chown root:root {} + '
-        + "-exec chmod 0755 {} +; "
-        + 'rsync -rtp --delete --ignore-times "$stage/$rel/" "$root/$rel/"; '
-        + "done; "
-        + 'install -o root -g root -m 0644 "$stage/config/acceptance-requirements.yaml" '
-        + '"$root/config/.acceptance-requirements.yaml.tmp"; '
-        + 'mv -f "$root/config/.acceptance-requirements.yaml.tmp" '
-        + '"$root/config/acceptance-requirements.yaml"; '
-        + 'set -- "$root/bin" "$root/templates" "$root/manifests" '
-        + '"$root/runtime/paperclip" "$root/deployment" '
-        + '"$root/steps" "$root/config/services"; '
-        + 'test -z "$(find "$@" -type l -print -quit)"; '
-        + 'test -z "$(find "$@" \\( ! -user root -o ! -group root \\) -print -quit)"; '
-        + 'test -z "$(find "$root/bin" -type f ! -perm 0700 -print -quit)"; '
-        + 'test -z "$(find "$root/steps" -type f -name "*.sh" ! -perm 0700 -print -quit)"; '
-        + 'test -z "$(find "$root/templates" "$root/manifests" '
-        + '"$root/runtime/paperclip" "$root/deployment" '
-        + '"$root/config/services" '
-        + '! -perm 0644 -print -quit)"; '
-        + 'test -z "$(find "$root/steps" -type f ! -name "*.sh" -print -quit)"; '
-        + "test \"$(stat -c '%u:%g:%a:%F' "
-        + '"$root/config/acceptance-requirements.yaml")" '
-        + "= '0:0:644:regular file'; rm -rf \"$stage\"",
-    )
+        with tempfile.TemporaryDirectory() as temp:
+            bundle = Path(temp) / "bundle"
+            bundle.mkdir()
+            _materialize_sync_bundle(cfg, bundle, rendered)
+            run(
+                remote_rsync_command(
+                    "-rtz",
+                    "--delete",
+                    str(bundle) + "/",
+                    f"{target}:{staging_root}/",
+                )
+            )
+        ssh(
+            cfg,
+            "set -eu; umask 077; stage="
+            + shlex.quote(staging_root)
+            + "; root="
+            + shlex.quote(remote_root)
+            + '; lock="$root/.sync.lock"; : > "$lock"; chown root:root "$lock"; '
+            + 'chmod 0600 "$lock"; exec 9>"$lock"; flock -x 9; '
+            + 'cd "$stage"; actual="$(find . -type f ! -path '
+            + shlex.quote(f"./{SYNC_MANIFEST_NAME}")
+            + " -printf '%P\\n' | LC_ALL=C sort)\"; expected=\"$(sed -n "
+            + shlex.quote(r"s/^[0-9a-f]\{64\}  //p")
+            + " "
+            + shlex.quote(SYNC_MANIFEST_NAME)
+            + ')"; test "$actual" = "$expected"; sha256sum -c '
+            + shlex.quote(SYNC_MANIFEST_NAME)
+            + "; rm -f "
+            + shlex.quote(SYNC_MANIFEST_NAME)
+            + "; "
+            + 'chown -R root:root "$stage"; '
+            + 'find "$stage" -type d -exec chmod 0755 {} +; '
+            + 'find "$stage" -type f -exec chmod 0644 {} +; '
+            + 'find "$stage/bin" -type f -exec chmod 0700 {} +; '
+            + 'find "$stage/steps" -type f -name "*.sh" -exec chmod 0700 {} +; '
+            + 'test -z "$(find "$stage" -type l -print -quit)"; '
+            + 'test -z "$(find "$stage" \\( ! -user root -o ! -group root \\) -print -quit)"; '
+            + 'test -z "$(find "$stage/bin" -type f ! -perm 0700 -print -quit)"; '
+            + 'test -z "$(find "$stage/steps" -type f -name "*.sh" ! -perm 0700 -print -quit)"; '
+            + 'test -z "$(find "$stage" -type f ! -path "$stage/bin/*" '
+            + '! -path "$stage/steps/*.sh" '
+            + '! -perm 0644 -print -quit)"; '
+            + 'mkdir -p "$root/config" "$root/runtime"; '
+            + "for rel in bin templates manifests runtime/paperclip deployment steps config/services; do "
+            + 'mkdir -p "$root/$rel"; '
+            + 'test -z "$(find "$root/$rel" -type l -print -quit)"; '
+            + 'find "$root/$rel" -type d -exec chown root:root {} + '
+            + "-exec chmod 0755 {} +; "
+            + 'rsync -rtp --delete --ignore-times "$stage/$rel/" "$root/$rel/"; '
+            + "done; "
+            + 'install -o root -g root -m 0644 "$stage/config/acceptance-requirements.yaml" '
+            + '"$root/config/.acceptance-requirements.yaml.tmp"; '
+            + 'mv -f "$root/config/.acceptance-requirements.yaml.tmp" '
+            + '"$root/config/acceptance-requirements.yaml"; '
+            + 'set -- "$root/bin" "$root/templates" "$root/manifests" '
+            + '"$root/runtime/paperclip" "$root/deployment" '
+            + '"$root/steps" "$root/config/services"; '
+            + 'test -z "$(find "$@" -type l -print -quit)"; '
+            + 'test -z "$(find "$@" \\( ! -user root -o ! -group root \\) -print -quit)"; '
+            + 'test -z "$(find "$root/bin" -type f ! -perm 0700 -print -quit)"; '
+            + 'test -z "$(find "$root/steps" -type f -name "*.sh" ! -perm 0700 -print -quit)"; '
+            + 'test -z "$(find "$root/templates" "$root/manifests" '
+            + '"$root/runtime/paperclip" "$root/deployment" '
+            + '"$root/config/services" '
+            + '! -perm 0644 -print -quit)"; '
+            + 'test -z "$(find "$root/steps" -type f ! -name "*.sh" -print -quit)"; '
+            + "test \"$(stat -c '%u:%g:%a:%F' "
+            + '"$root/config/acceptance-requirements.yaml")" '
+            + "= '0:0:644:regular file'; rm -rf \"$stage\"",
+        )
+    except BaseException:
+        try:
+            ssh(
+                cfg,
+                "set -eu; stage=" + shlex.quote(staging_root) + '; rm -rf -- "$stage"',
+                check=False,
+            )
+        except BaseException:
+            pass
+        raise
     # Source synchronization is deliberately projection-blind.  Only the
     # explicit config-render stage may write runtime/ or the projection
     # manifest; this makes a repeat sync safe after an audited render.
