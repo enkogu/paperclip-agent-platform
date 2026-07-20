@@ -1163,7 +1163,11 @@ class PlatformOrchestratorTests(unittest.TestCase):
             def root_owned_stat(path, *args, **kwargs):
                 value = original_stat(path, *args, **kwargs)
                 fields = list(value)
-                fields[4] = 0
+                if (
+                    value.st_mode & 0o170000 == 0o100000
+                    and path != server_config.LOCK
+                ):
+                    fields[4] = 0
                 return os.stat_result(fields)
 
             def active(_cfg, values, *_args):

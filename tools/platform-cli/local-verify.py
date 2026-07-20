@@ -871,7 +871,11 @@ def fresh_install_render() -> dict[str, Any]:
             def root_owned_stat(path: Path, *args: Any, **kwargs: Any):
                 value = original_stat(path, *args, **kwargs)
                 fields = list(value)
-                fields[4] = 0
+                if (
+                    value.st_mode & 0o170000 == 0o100000
+                    and path != server_config.LOCK
+                ):
+                    fields[4] = 0
                 return os.stat_result(fields)
 
             with ExitStack() as stack:
