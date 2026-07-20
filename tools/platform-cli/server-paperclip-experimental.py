@@ -1954,10 +1954,10 @@ const dependencyDirectory = path.join(current, 'node_modules');
 function walk(directory) {
   for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
     const absolute = path.join(directory, entry.name);
-    // pnpm wires dependencies through symlinks below the package's own
-    // node_modules. They are not part of the immutable plugin payload; never
-    // traverse them. Symlinks anywhere else remain a fail-closed condition.
-    if (absolute === dependencyDirectory && entry.isDirectory()) continue;
+    // pnpm may make the package's own node_modules a symlink. Its dependency
+    // forest is not part of the immutable plugin payload; never traverse it.
+    // Symlinks anywhere else remain a fail-closed condition.
+    if (absolute === dependencyDirectory) continue;
     if (entry.isDirectory()) walk(absolute);
     else if (entry.isFile()) files.push(path.relative(current, absolute));
     else throw new Error(`unsupported Daytona plugin file type: ${absolute}`);

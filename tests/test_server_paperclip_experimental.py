@@ -801,9 +801,13 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
         self.assertNotIn("MTE_DAYTONA_PLUGIN_NPM_", source)
         self.assertNotIn("/tools/node_modules", source)
         self.assertIn("fs.realpathSync('/app')", source)
-        self.assertIn("absolute === dependencyDirectory && entry.isDirectory()", source)
+        self.assertIn("if (absolute === dependencyDirectory) continue;", source)
         self.assertIn("unsupported Daytona plugin file type", source)
         self.assertIn("package-files-excluding-node_modules", source)
+        self.assertLess(
+            source.index("if (absolute === dependencyDirectory) continue;"),
+            source.index("unsupported Daytona plugin file type"),
+        )
 
     def test_plugin_purges_then_reinstalls_when_image_package_path_drifted(self):
         plugin = {
