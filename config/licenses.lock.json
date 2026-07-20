@@ -108,8 +108,8 @@
     "daytona-sdk": {
       "decision": "approved-oss",
       "licenseExpression": "Apache-2.0",
-      "sourceRef": "v0.171.0",
-      "sourceUrl": "https://github.com/daytonaio/sdk/tree/v0.171.0"
+      "sourceRef": "v0.175.0",
+      "sourceUrl": "https://github.com/daytonaio/sdk/tree/v0.175.0"
     },
     "daytona-sandbox-image": {
       "decision": "approved-oss",
@@ -379,7 +379,7 @@
 
     {"scope": "embeddedImagePackages", "pattern": "^HERMES_SIGSTORE_VERIFIER_IMAGE/sigstore@3\\.0\\.0$", "component": "sigstore-js"},
     {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@paperclipai/plugin-daytona@0\\.1\\.0$", "component": "paperclip-daytona-plugin"},
-    {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@daytonaio/sdk@0\\.171\\.0$", "component": "daytona-sdk"},
+    {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@daytonaio/sdk@0\\.175\\.0$", "component": "daytona-sdk"},
     {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@aws-sdk/client-s3@3\\.1075\\.0$", "component": "aws-sdk-js-v3"},
     {"scope": "npmPackages", "pattern": "^@openai/codex(-linux-x64)?$", "component": "codex-cli", "delivery": "operator-provided-proprietary-tool"},
     {"scope": "npmPackages", "pattern": "^@anthropic-ai/claude-code(-linux-x64)?$", "component": "claude-code", "delivery": "operator-provided-proprietary-tool"},

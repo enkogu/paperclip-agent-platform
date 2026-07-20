@@ -288,7 +288,7 @@
     "paperclip-daytona-sdk": {
       "imageKey": "MTE_PAPERCLIP_IMAGE",
       "packageName": "@daytonaio/sdk",
-      "version": "0.171.0",
+      "version": "0.175.0",
       "versionKey": "PAPERCLIP_DAYTONA_SDK_VERSION",
       "consumer": "deployment/steps/paperclip.sh"
     },

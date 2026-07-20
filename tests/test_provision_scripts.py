@@ -293,7 +293,7 @@ def test_config_migrate_accepts_native_entrypoint_then_rejects_wrong_provenance(
             "PAPERCLIP_DEPLOYMENT_MODE": "local_trusted",
             "PAPERCLIP_DEPLOYMENT_EXPOSURE": "private",
             "DAYTONA_PLUGIN_VERSION": "0.1.0",
-            "PAPERCLIP_DAYTONA_SDK_VERSION": "0.171.0",
+            "PAPERCLIP_DAYTONA_SDK_VERSION": "0.175.0",
             "PAPERCLIP_AWS_S3_CLIENT_VERSION": "3.1075.0",
         }
     )
@@ -359,7 +359,7 @@ def _paperclip_verify_fixture(
             "PAPERCLIP_DEPLOYMENT_MODE": "local_trusted",
             "PAPERCLIP_DEPLOYMENT_EXPOSURE": "private",
             "DAYTONA_PLUGIN_VERSION": "0.1.0",
-            "PAPERCLIP_DAYTONA_SDK_VERSION": "0.171.0",
+            "PAPERCLIP_DAYTONA_SDK_VERSION": "0.175.0",
             "PAPERCLIP_AWS_S3_CLIENT_VERSION": "3.1075.0",
         }
     )
