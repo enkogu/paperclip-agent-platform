@@ -2517,6 +2517,33 @@ def cloudflare_access_command(
     )
 
 
+def cloudflare_access_policy_bootstrap_command(iac_root: str, api_env: str) -> str:
+    """Create current Access policies before an app can lose its legacy policy.
+
+    The initial per-route migration may have an existing shared policy in
+    OpenTofu state that is still attached to remote Access applications.  A
+    full apply would otherwise attempt that deletion before the REST
+    application reconciler can bind the current named policies.  Target only
+    the replacement policy/token graph, reconcile applications, then perform
+    a fresh full plan and apply.  Re-running this is a no-op after the first
+    successful migration.
+    """
+    targets = (
+        "-target=cloudflare_zero_trust_access_policy.human",
+        "-target=cloudflare_zero_trust_access_service_token.service",
+        "-target=cloudflare_zero_trust_access_policy.service",
+    )
+    return tofu_command(
+        iac_root,
+        api_env,
+        "apply",
+        "-input=false",
+        "-no-color",
+        "-auto-approve",
+        *targets,
+    )
+
+
 def cloudflare_edge_command(
     cfg: dict[str, Any], iac_root: str, api_env: str, action: str
 ) -> str:
@@ -2628,6 +2655,28 @@ def run_cloudflare(cfg: dict[str, Any], action: str) -> None:
     cloudflare_preflight(cfg, require_ready=True)
     cloudflare_root, iac_root, api_env = prepare_cloudflare_remote(cfg)
     init = tofu_command(iac_root, api_env, "init", "-input=false", "-no-color")
+    ssh(
+        cfg,
+        f"set -eu; umask 077; {init}; chmod -R go-rwx {shlex.quote(iac_root)}",
+    )
+    if action == "plan":
+        plan = tofu_command(
+            iac_root,
+            api_env,
+            "plan",
+            "-input=false",
+            "-no-color",
+            "-out=/workspace/platform.tfplan",
+        )
+        ssh(cfg, f"set -eu; umask 077; {plan}; chmod -R go-rwx {shlex.quote(iac_root)}")
+        return
+    if action != "apply":
+        raise PlatformError(f"unsupported Cloudflare action: {action}")
+
+    access_bootstrap = cloudflare_access_policy_bootstrap_command(iac_root, api_env)
+    access_reconcile = cloudflare_access_command(cfg, iac_root, api_env, "apply")
+    ssh(cfg, f"set -eu; umask 077; {access_bootstrap}; {access_reconcile}")
+
     plan = tofu_command(
         iac_root,
         api_env,
@@ -2636,14 +2685,7 @@ def run_cloudflare(cfg: dict[str, Any], action: str) -> None:
         "-no-color",
         "-out=/workspace/platform.tfplan",
     )
-    ssh(
-        cfg,
-        f"set -eu; umask 077; {init}; {plan}; chmod -R go-rwx {shlex.quote(iac_root)}",
-    )
-    if action == "plan":
-        return
-    if action != "apply":
-        raise PlatformError(f"unsupported Cloudflare action: {action}")
+    ssh(cfg, f"set -eu; umask 077; {plan}; chmod -R go-rwx {shlex.quote(iac_root)}")
 
     apply = tofu_command(
         iac_root,

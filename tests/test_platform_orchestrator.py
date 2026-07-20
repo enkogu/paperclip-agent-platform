@@ -2493,7 +2493,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             command,
         )
 
-    def test_cloudflare_apply_runs_the_edge_reconciler_after_iac(self):
+    def test_cloudflare_apply_rebinds_access_before_legacy_resources_can_delete(self):
         cfg = {
             "spec": {
                 "host": {
@@ -2532,13 +2532,119 @@ class PlatformOrchestratorTests(unittest.TestCase):
         ):
             platform.run_cloudflare(cfg, "apply")
 
-        self.assertEqual(len(commands), 2)
-        apply_call = next(call for call in tofu_calls if "apply" in call)
-        self.assertIn("-auto-approve", apply_call)
-        self.assertIn("server-cloudflare-access.py", commands[-1])
+        self.assertEqual(len(commands), 4)
+        bootstrap_call = next(
+            call
+            for call in tofu_calls
+            if "-target=cloudflare_zero_trust_access_policy.human" in call
+        )
+        self.assertEqual(
+            set(
+                value
+                for value in bootstrap_call
+                if value.startswith("-target=cloudflare_zero_trust_access_")
+            ),
+            {
+                "-target=cloudflare_zero_trust_access_policy.human",
+                "-target=cloudflare_zero_trust_access_service_token.service",
+                "-target=cloudflare_zero_trust_access_policy.service",
+            },
+        )
+        self.assertIn("server-cloudflare-access.py", commands[1])
+        bootstrap_index = tofu_calls.index(bootstrap_call)
+        first_access_output_index = next(
+            index
+            for index, call in enumerate(tofu_calls)
+            if "output" in call and index > bootstrap_index
+        )
+        first_full_plan_index = next(
+            index for index, call in enumerate(tofu_calls) if "plan" in call
+        )
+        full_apply_index = next(
+            index
+            for index, call in enumerate(tofu_calls)
+            if "apply" in call and not any(value.startswith("-target=") for value in call)
+        )
+        self.assertLess(bootstrap_index, first_access_output_index)
+        self.assertLess(first_access_output_index, first_full_plan_index)
+        self.assertLess(first_full_plan_index, full_apply_index)
+        self.assertIn("server-cloudflare-access.py", commands[3])
         self.assertLess(
-            commands[-1].index("server-cloudflare-access.py"),
-            commands[-1].index("dns"),
+            commands[3].index("server-cloudflare-access.py"),
+            commands[3].index("dns"),
+        )
+
+    def test_cloudflare_access_bootstrap_targets_only_replacement_graph(self):
+        with mock.patch.object(platform, "tofu_command", return_value="tofu") as tofu:
+            command = platform.cloudflare_access_policy_bootstrap_command("/iac", "/api.env")
+
+        self.assertEqual(command, "tofu")
+        self.assertEqual(
+            tofu.call_args.args,
+            (
+                "/iac",
+                "/api.env",
+                "apply",
+                "-input=false",
+                "-no-color",
+                "-auto-approve",
+                "-target=cloudflare_zero_trust_access_policy.human",
+                "-target=cloudflare_zero_trust_access_service_token.service",
+                "-target=cloudflare_zero_trust_access_policy.service",
+            ),
+        )
+
+    def test_cloudflare_access_rebind_failure_prevents_full_legacy_cleanup_apply(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "root": "/opt/mte-platform",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                    "excluded": [],
+                }
+            }
+        }
+        tofu_calls = []
+
+        def record_tofu(*arguments):
+            tofu_calls.append(arguments)
+            return "tofu"
+
+        with (
+            mock.patch.object(platform, "cloudflare_preflight"),
+            mock.patch.object(
+                platform,
+                "prepare_cloudflare_remote",
+                return_value=(
+                    "/root/.config/mte-secrets/cloudflare",
+                    "/root/.config/mte-secrets/cloudflare/iac",
+                    "/root/.config/mte-secrets/cloudflare/api.env",
+                ),
+            ),
+            mock.patch.object(platform, "tofu_command", side_effect=record_tofu),
+            mock.patch.object(platform, "cloudflare_access_command", return_value="false"),
+            mock.patch.object(
+                platform,
+                "ssh",
+                side_effect=(None, platform.PlatformError("access rebind failed")),
+            ),
+            self.assertRaisesRegex(platform.PlatformError, "access rebind failed"),
+        ):
+            platform.run_cloudflare(cfg, "apply")
+
+        self.assertTrue(
+            any(
+                "-target=cloudflare_zero_trust_access_policy.human" in call
+                for call in tofu_calls
+            )
+        )
+        self.assertFalse(any("plan" in call for call in tofu_calls))
+        self.assertFalse(
+            any(
+                "apply" in call and not any(value.startswith("-target=") for value in call)
+                for call in tofu_calls
+            )
         )
 
     def test_cloudflare_access_failure_never_publishes_dns(self):
