@@ -4098,9 +4098,52 @@ class PlatformOrchestratorTests(unittest.TestCase):
             platform,
             "run_kestra_canary",
             side_effect=lambda _cfg, action: actions.append(action),
+        ), mock.patch.object(
+            platform,
+            "refresh_daytona_e2e_runtime",
         ):
             platform.run_kestra_canary_acceptance({})
         self.assertEqual(actions, ["apply", "verify"])
+
+    def test_e2e_acceptance_refreshes_daytona_before_canary(self):
+        observed = []
+        with (
+            mock.patch.object(
+                platform,
+                "run_paperclip_experimental",
+                side_effect=lambda _cfg, feature, action: observed.append(
+                    (feature, action)
+                ),
+            ),
+            mock.patch.object(
+                platform,
+                "run_kestra_canary",
+                side_effect=lambda _cfg, action: observed.append(("kestra", action)),
+            ),
+        ):
+            platform.run_kestra_canary_acceptance({})
+        self.assertEqual(
+            observed,
+            [
+                ("daytona", "apply"),
+                ("daytona", "verify"),
+                ("kestra", "apply"),
+                ("kestra", "verify"),
+            ],
+        )
+
+    def test_e2e_acceptance_does_not_start_canary_when_daytona_refresh_fails(self):
+        with (
+            mock.patch.object(
+                platform,
+                "run_paperclip_experimental",
+                side_effect=platform.PlatformError("daytona evidence unavailable"),
+            ),
+            mock.patch.object(platform, "run_kestra_canary") as canary,
+        ):
+            with self.assertRaisesRegex(platform.PlatformError, "daytona evidence"):
+                platform.run_kestra_canary_acceptance({})
+        canary.assert_not_called()
 
     def test_observability_acceptance_runs_indexed_passes_before_live_canary(self):
         expected = "a" * 64
@@ -4172,6 +4215,13 @@ class PlatformOrchestratorTests(unittest.TestCase):
             ),
             mock.patch.object(
                 platform,
+                "run_paperclip_experimental",
+                side_effect=lambda _cfg, feature, action: observed.append(
+                    (feature, action)
+                ),
+            ),
+            mock.patch.object(
+                platform,
                 "run_kestra_canary",
                 side_effect=lambda _cfg, action: observed.append(("kestra", action)),
             ),
@@ -4208,6 +4258,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 ("config", "audit"),
                 ("provision", "verify"),
                 ("tools", "verify"),
+                ("daytona", "apply"),
+                ("daytona", "verify"),
                 ("kestra", "apply"),
                 ("kestra", "verify"),
                 ("profiles", "verify"),

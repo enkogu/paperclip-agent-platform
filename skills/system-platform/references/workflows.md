@@ -17,3 +17,9 @@ Kestra -> GET /api/issues/{issue_id} and /runs -> gates -> cleanup
 ```
 
 The E2E producer must create a uniquely marked Issue, retain the native Issue ID, wait for a terminal and verified harness result, prove the expected commit/PR/check, and clean the branch, PR, workspace, and sandbox. The consumer must verify the same source hash, current claim semantics, runtime-only secret refs, 9Router evidence, and cleanup. A missing Issue ID is a secondary symptom; retain the failing Kestra task and HTTP error as the primary cause.
+
+Run the managed path with `./test.sh e2e`. It first reconciles and verifies the
+Daytona runtime (`platform daytona apply` then `platform daytona verify`) and
+only then applies and verifies the Kestra canary. The canary's stale-runtime
+evidence rejection is a safety boundary, not an operator prompt to edit or
+reuse evidence.

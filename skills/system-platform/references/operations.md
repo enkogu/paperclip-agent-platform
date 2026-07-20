@@ -40,6 +40,11 @@ From the operator checkout:
 ./test.sh e2e
 ```
 
+`./test.sh e2e` is self-contained for the managed runtime: it first runs
+`platform daytona apply`, then `platform daytona verify`, before producing and
+verifying the Kestra canary evidence. Do not invoke `kestra-canary` directly
+to work around stale Daytona evidence; the canary rejects it intentionally.
+
 From Hermes on the managed host:
 
 ```bash
@@ -259,7 +264,7 @@ verify/acceptance evidence is bound to the active canonical source hash.
 | PostgreSQL/PostgREST | `sudo -n python3 /opt/mte-platform/bin/server-verify.py verify postgres postgrest`; `sudo -n python3 /opt/mte-platform/bin/server-provision.py status` | `./install.sh compose postgres`; never initialize or drop data during repair |
 | Notion projection | `sudo -n python3 /opt/mte-platform/bin/server-notion.py status`; `sudo -n python3 /opt/mte-platform/bin/server-notion-sync.py status`; then `verify` | `sudo -n python3 /opt/mte-platform/bin/server-notion.py provision`; then `sudo -n python3 /opt/mte-platform/bin/server-notion-sync.py provision`; `drain`; `verify` |
 | ToolHive | `sudo -n python3 /opt/mte-platform/bin/server-toolhive.py status`; then `verify`; `sudo -n python3 /opt/mte-platform/bin/server-profile-reconcile.py status` | `./install.sh compose toolhive`; `./install.sh provision toolhive-profiles` |
-| Daytona | `sudo -n /opt/mte-platform/steps/daytona.sh status`; `sudo -n python3 /opt/mte-platform/bin/server-paperclip-experimental.py daytona status` | operator-side `./platform daytona apply`, then `./platform daytona verify`; do not hand-edit the provider or snapshots |
+| Daytona | `sudo -n /opt/mte-platform/steps/daytona.sh status`; `sudo -n python3 /opt/mte-platform/bin/server-paperclip-experimental.py daytona status` | operator-side `./platform daytona apply`, then `./platform daytona verify`; `./test.sh e2e` runs that same sequence automatically before its canary; do not hand-edit the provider, snapshots, or evidence |
 | Victoria*/Grafana | `sudo -n python3 /opt/mte-platform/bin/server-verify.py verify observability`; inspect current acceptance evidence | `./install.sh compose observability`; rerun full acceptance before claiming telemetry recovery |
 | Cloudflare | `sudo -n /opt/mte-platform/steps/cloudflare-tunnel.sh status`; `sudo -n /opt/mte-platform/steps/origin-firewall.sh status`; `sudo -n python3 /opt/mte-platform/bin/server-verify.py verify cloudflare-edge` | operator-side `./platform cloudflare plan`, `apply`, `origin-firewall`, `verify`, and `acceptance` |
 | Paperclip | `sudo -n /opt/mte-platform/steps/paperclip.sh status`; then `verify`; read Issue plus latest heartbeat | `sudo -n /opt/mte-platform/steps/paperclip.sh install`; then operator-side environments, secrets, profiles, and provision verification |

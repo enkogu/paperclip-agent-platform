@@ -151,6 +151,10 @@ acceptance. Healthy containers or local unit tests alone are not completion.
 ./test.sh e2e
 ```
 
+The E2E command refreshes and verifies the managed Daytona runtime before it
+creates the real Kestra/Paperclip canary. It deliberately fails closed on stale
+runtime evidence rather than reusing or editing proof from an earlier run.
+
 ## What owns what
 
 | Plane | Owner |

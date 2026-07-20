@@ -140,6 +140,12 @@ run_e2e() {
   (( $# <= 1 )) || fail "e2e accepts at most one harness"
   validate_e2e_harness "$harness"
   cd "$ROOT"
+  # The canary deliberately rejects stale Daytona proof. Refresh the managed
+  # runtime through its idempotent lifecycle before producing new E2E evidence;
+  # do not bypass that guard or hand-edit its evidence.
+  section "Refresh Daytona runtime evidence"
+  "$ROOT/platform" daytona apply
+  "$ROOT/platform" daytona verify
   section "Live Kestra E2E canary producer"
   "$ROOT/platform" kestra-canary apply
   section "Live Kestra E2E evidence verification"

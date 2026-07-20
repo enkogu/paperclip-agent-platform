@@ -58,6 +58,19 @@ class TestModeEntrypointTests(unittest.TestCase):
         self.assertIn('"$ROOT/platform" cloudflare apply', cloudflare_source)
         self.assertNotIn('"$ROOT/platform" cloudflare acceptance', cloudflare_source)
 
+    def test_e2e_refreshes_daytona_before_producing_canary_evidence(self):
+        source = VERIFY.read_text()
+        e2e = source.split("run_e2e() {", 1)[1].split("\nrun_release_acceptance()", 1)[0]
+        daytona_apply = e2e.index('"$ROOT/platform" daytona apply')
+        daytona_verify = e2e.index('"$ROOT/platform" daytona verify')
+        canary_apply = e2e.index('"$ROOT/platform" kestra-canary apply')
+        canary_verify = e2e.index('"$ROOT/platform" kestra-canary verify')
+        self.assertLess(daytona_apply, daytona_verify)
+        self.assertLess(daytona_verify, canary_apply)
+        self.assertLess(canary_apply, canary_verify)
+        self.assertEqual(e2e.count('"$ROOT/platform" daytona apply'), 1)
+        self.assertEqual(e2e.count('"$ROOT/platform" daytona verify'), 1)
+
     def test_quick_syntax_check_covers_installer_and_every_stage_script(self):
         source = VERIFY.read_text()
         self.assertIn("shell_files=(platform install.sh test.sh)", source)

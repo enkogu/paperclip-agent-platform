@@ -1858,8 +1858,15 @@ def run_kestra_canary(cfg: dict[str, Any], action: str) -> None:
     ssh(cfg, verified_command)
 
 
+def refresh_daytona_e2e_runtime(cfg: dict[str, Any]) -> None:
+    """Reconcile and prove the runtime evidence consumed by the live canary."""
+    run_paperclip_experimental(cfg, "daytona", "apply")
+    run_paperclip_experimental(cfg, "daytona", "verify")
+
+
 def run_kestra_canary_acceptance(cfg: dict[str, Any]) -> None:
-    """Produce E2E evidence, then independently verify that exact evidence."""
+    """Refresh Daytona, then produce and independently verify E2E evidence."""
+    refresh_daytona_e2e_runtime(cfg)
     run_kestra_canary(cfg, "apply")
     run_kestra_canary(cfg, "verify")
 
