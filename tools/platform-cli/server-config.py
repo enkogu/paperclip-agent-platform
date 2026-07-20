@@ -380,59 +380,6 @@ REVIEWED_CANONICAL_VALUE_MIGRATIONS = {
         "ghcr.io/firecrawl/nuq-postgres@sha256:4ca6718b2cef40404b046db5cd37ae45db3e44d1a5750c80522f3587a5b193d5",
         "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6",
     ),
-    "MTE_DAYTONA_INSTALLER_SHA256": (
-        "8e4363185851605e1fa9863797f3d2d7dbb323f1b1e50421010aced1b619a98d",
-        "d3f3523ce521dc7a71f4d915b01053a6f7e9ff013dfbedf902ae44c8d9defd70",
-        "5eee75d25641c5d04efe164007796eab864b25786ec6b19515ab9f6eed8195ab",
-        "60e97e75a7706129784341b0a3e7e71ac663fde6bc9df7c3ff20026851629c07",
-        "c4fffbeaa0774f3a2be7dfe5a08f784ca42b1d1ab68c50eb0f0204b25556fbe6",
-        "59a13624fc11128877fc8ab359e11d61371d640b1ace788e103c4eee5518fbb7",
-        "c75620fffb6c51d45dcc767775b25b16a3c7fcd0c72a5c5ca124085d69df5664",
-        "9da1555d1d328d80ba2d5d0cacb4327633d530a297e58cc5805797e208838f96",
-        "c0752d53534b0360fac4077c22cb30810938b1580260e7547bc7adde35572aa5",
-        "895517b416896ecc650e393a25e75e6c2fdf3ff7763064e3bb330f9a308a9662",
-        "58cee979c329539c68098afe2be5558d5edf04edefe55fbc8ca17b09b09ceb5b",
-        "658bab51334183f0b241ed700983ef114474cf80992d352dc70c67949d219fa7",
-        "ead5620ddb7955f19cbcb56f410ebb818cda0b9418f96b607316f6ab1e9bd061",
-        "04aa4be2ea866bb35e8aea2a0b2d121562b46947e6461225438fad8c9b39ef97",
-        "b4d167bcbe4d64345afeb05931e13349bdf2707802a6c58ff22499b41ce67f3b",
-        "0c5d24a9c20f490d75d275e80207d162fa01779fce5ca89fc3491e55056c0d23",
-        "63652b380ffeb98beb25a0a48eca7a5d1ef376a7af11ca24d016483967e7b276",
-        "6ba2b3e9525ef716d0f076f3ad873f2664c42ad68c9170a5fd2b2a44d96924a8",
-        "13a58ac70aa452c8b02e8038dea563e378249b8d995f55c5b56fb766aaae98a8",
-        "a5d099f96f8c8102dd79eede5ffc90d5e81467e230185711f2861c8c5971d0e9",
-        "c9f4c32e8cfd2d445616cff079d5072741e45218f9f855dc0fc5bf57972a573b",
-        "02423af31b6d497e763c2bdec27eb5d4bc7d2bef7d33bfcc62916a878a150705",
-        "e218352c6d9436dcc25599f627c8645cdef2a285e050f28359fedbacb366fccf",
-        "fc715f42c098b9a495d098c774c4365996879cdfd405ffbe04831c0cc116ca71",
-        "b3d9415ffef8263aa9a02277d002e05508d6585704e6528e96c677a0f866f7c2",
-        "ee89bba4ce4a943e5be4ba93ad7d435fce2f468a2c0590ae76bb35e1697a8262",
-        "e424ea285185dc430a9cac6a1a93ec87505320e73e109866c03121b982678a5a",
-        "7ac9c50f661d668de4f4e6d34abb526293f5066526aed1b0d4fc2aa6265bac73",
-        "a5f2975c3bab3ed69bf69a0800e6d9796d825d0ddb31bbc4be39b427d4ff4236",
-        "93ef9ac36aaef79875c77b7a729b5508eaef7867dd77a9e12d4cac8840a3aa9e",
-        "3f6405faad4cb765b4268b5f985d6b51e9d3833e93c545cc817300f5d4c5c26a",
-        "8b8c17f24885b7dc55b2e8c952a6f1ce177ab5e023a4fdccff5b37cc8111bd0e",
-        "cb6f2bdae64b2d2f990c152f9bdfd7e1d586448f3b44516b7818f2caae7ff857",
-        "b60493ed92b8a561dddad00902ec4582467174a7f65a22c416a6f0cffc83d42b",
-        "3d60ee52b40c5e786426156eb9ad0f4abe229661764bea20a3f89e1efc3b1e44",
-        "668470b13cd9b37d58253866cd2bec97f5a04b970aff7e5129fd2da9a2ecb04a",
-        "5891917c9b4a0611cf489d499a5515ff26d977a2bdc04746d5c099dc1f1d941b",
-        "a566b3de0b7848fa26245c242ee2a8814288cc4b2adeb006ecb98e138836c552",
-        "cd32b106a79781bbe322b0ec5f159bd0244f2fe50e9599cc623369f8d0995064",
-        "28a993bbf447369a4835fe202095665798b60a3124bcd2fb0a1508979f892a94",
-        "74a21913c2d91a935959a35b5a1dba9b3346d7882f212d9faad630e2186084f5",
-        "d69ded85bed5b6b1af7a5841eb91246081002f63fea67bda5f82680b90d7fc49",
-        "fd378c9e140db8fc8a8d12210fd38d586e3e9c9875ab4a9452e93292b65c9e15",
-        "3ab7096a0deb908931f743cbe078a2d5623990d7dc881d0f7a90a3aff86f7e51",
-        "aab1e9417213083be73d2d0328e862319a09ef77571643bf4be07446edaf7322",
-        "6ff0ca9938d7fc9a63e976656884de172fa9c6baf20654b3ddb86212dfa3d611",
-        "2a89ffbd67866ad542ba801f7a31c1228780315cc133cf85eb59d8b860d5ad0a",
-        "3c26ec6b08874d25afef724fba930ebeb983924eaa9a031353a6cd6349d3256c",
-    ),
-    # The runtime verifies its own release-script digest before it starts.
-    # Upgrade only reviewed historical script digests; unknown overrides fail
-    # closed at the runtime boundary.
     "MTE_DAYTONA_CODING_SNAPSHOT": (
         "mte-coding-harness-v1",
         "mte-coding-harness-v2",
@@ -469,6 +416,13 @@ REVIEWED_CANONICAL_VALUE_MIGRATIONS = {
 # deployment has already started.
 GOVERNED_CANONICAL_VALUE_MIGRATIONS = {
     "PAPERCLIP_DAYTONA_SDK_VERSION": ("0.171.0", "0.175.0"),
+    # A release script is executable deployment code.  Unlike ordinary
+    # compatibility values, accept only the immediately prior reviewed digest
+    # so a custom canonical override cannot be silently replaced.
+    "MTE_DAYTONA_INSTALLER_SHA256": (
+        "088ca38cbebf40d4b3c6471ff0b2693fa411bb3532a828de5f54c2d85f8f724b",
+        "3c26ec6b08874d25afef724fba930ebeb983924eaa9a031353a6cd6349d3256c",
+    ),
 }
 
 
@@ -489,8 +443,8 @@ def reconcile_governed_canonical_value_migrations(
             continue
         raise ConfigError(
             f"refusing automatic {key} migration from an unreviewed value; "
-            f"after verifying the immutable Paperclip image, set {key}={current_value} "
-            "in the canonical environment and rerun the one-command install"
+            f"set {key}={current_value} through a reviewed platform release "
+            "and rerun the one-command install"
         )
     return migrated
 

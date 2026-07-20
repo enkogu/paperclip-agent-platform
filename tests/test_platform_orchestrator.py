@@ -3842,16 +3842,17 @@ class PlatformOrchestratorTests(unittest.TestCase):
             current_digest,
         )
         self.assertEqual(
-            server_config.REVIEWED_CANONICAL_VALUE_MIGRATIONS[
+            server_config.GOVERNED_CANONICAL_VALUE_MIGRATIONS[
                 "MTE_DAYTONA_INSTALLER_SHA256"
-            ][-1],
-            current_digest,
+            ],
+            (
+                "088ca38cbebf40d4b3c6471ff0b2693fa411bb3532a828de5f54c2d85f8f724b",
+                current_digest,
+            ),
         )
-        self.assertIn(
-            "2a89ffbd67866ad542ba801f7a31c1228780315cc133cf85eb59d8b860d5ad0a",
-            server_config.REVIEWED_CANONICAL_VALUE_MIGRATIONS[
-                "MTE_DAYTONA_INSTALLER_SHA256"
-            ][:-1],
+        self.assertNotIn(
+            "MTE_DAYTONA_INSTALLER_SHA256",
+            server_config.REVIEWED_CANONICAL_VALUE_MIGRATIONS,
         )
         self.assertIn('"MTE_DAYTONA_NETWORK",', source)
         self.assertIn('"MTE_DAYTONA_PAPERCLIP_NETWORK",', source)
@@ -3868,6 +3869,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             "Self-hosted Daytona resolves an omitted SDK target through the organization's",
             source,
         )
+
         self.assertIn("os.replace(temporary, path)", source)
         self.assertIn("os.O_RDWR | nofollow | cloexec", source)
         self.assertIn("fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)", source)
@@ -3909,6 +3911,76 @@ class PlatformOrchestratorTests(unittest.TestCase):
             server_config.REQUIRED_OPERATOR_BOOTSTRAP_KEYS,
         )
         self.assertNotIn("MTE_DAYTONA_CODING_IMAGE", canonical)
+
+    def test_daytona_installer_digest_migration_is_exact_and_fail_closed(self):
+        key = "MTE_DAYTONA_INSTALLER_SHA256"
+        legacy, current = server_config.GOVERNED_CANONICAL_VALUE_MIGRATIONS[key]
+
+        legacy_values = {key: legacy}
+        self.assertEqual(
+            server_config.reconcile_governed_canonical_value_migrations(
+                legacy_values
+            ),
+            {key},
+        )
+        self.assertEqual(legacy_values[key], current)
+        self.assertEqual(
+            server_config.reconcile_governed_canonical_value_migrations(
+                legacy_values
+            ),
+            set(),
+        )
+
+        custom_values = {key: "f" * 64}
+        with self.assertRaisesRegex(server_config.ConfigError, "unreviewed value"):
+            server_config.reconcile_governed_canonical_value_migrations(
+                custom_values
+            )
+        self.assertEqual(custom_values, {key: "f" * 64})
+
+    def test_init_source_persists_only_the_reviewed_daytona_installer_upgrade(self):
+        key = "MTE_DAYTONA_INSTALLER_SHA256"
+        legacy, current = server_config.GOVERNED_CANONICAL_VALUE_MIGRATIONS[key]
+        with tempfile.TemporaryDirectory() as temp:
+            canonical = Path(temp) / "platform.env"
+            canonical.write_text(
+                "DATA_CONTENT_PROFILE=none\n"
+                f"{key}={legacy}\n"
+            )
+            canonical.chmod(0o600)
+            original_stat = Path.stat
+
+            def root_owned_stat(path, *args, **kwargs):
+                value = original_stat(path, *args, **kwargs)
+                fields = list(value)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with (
+                mock.patch.object(server_config, "SOURCE", canonical),
+                mock.patch.object(server_config, "config_object", return_value={}),
+                mock.patch.object(
+                    server_config, "active_config_object", return_value={}
+                ),
+                mock.patch.object(
+                    server_config,
+                    "declared_keys",
+                    return_value=({key}, {}, {}),
+                ),
+                mock.patch.object(
+                    server_config,
+                    "ONE_TIME_MIGRATION_SEEDS",
+                    {"DATA_CONTENT_PROFILE": "none", key: current},
+                ),
+                mock.patch.object(
+                    server_config, "resource_preflight_values", return_value={}
+                ),
+                mock.patch.object(Path, "stat", root_owned_stat),
+            ):
+                result = server_config.init_source({})
+
+            self.assertEqual(server_config.parse_env(canonical)[key], current)
+        self.assertIn(key, result["migratedKeys"])
 
     def test_redis_passwords_are_generated_and_all_app_paths_use_derived_urls(self):
         passwords = {
