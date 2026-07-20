@@ -98,6 +98,19 @@ class CiSupplyChainTests(unittest.TestCase):
         )
         self.assertNotIn("--certificate-identity-regexp", workflow)
         self.assertIn("anchore/sbom-action@", workflow)
+        platform_manifest = workflow.split(
+            "name: Derive the single runnable manifest from the signed image index", 1
+        )[1].split("- name: Generate a digest-bound SPDX SBOM", 1)[0]
+        self.assertIn(
+            'docker buildx imagetools inspect --raw "$IMAGE_NAME@$IMAGE_DIGEST"',
+            platform_manifest,
+        )
+        self.assertIn('.platform.os == "linux"', platform_manifest)
+        self.assertIn('.platform.architecture == "amd64"', platform_manifest)
+        self.assertIn(
+            "signed image index must contain exactly one linux/amd64 manifest",
+            platform_manifest,
+        )
         sbom_generation = workflow.split(
             "- name: Generate a digest-bound SPDX SBOM", 1
         )[1].split("- id: sbom-identity", 1)[0]
@@ -106,6 +119,12 @@ class CiSupplyChainTests(unittest.TestCase):
             "SYFT_SOURCE_VERSION: ${{ steps.build.outputs.digest }}",
             sbom_generation,
         )
+        self.assertIn(
+            "image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.digest }}",
+            sbom_generation,
+        )
+        self.assertIn("syft_platform_image_identity", workflow)
+        self.assertIn("PLATFORM_IMAGE_DIGEST", workflow)
         self.assertIn("tools/platform-cli/verify-sbom.py", workflow)
         self.assertIn("--expected-root-purl", workflow)
         self.assertIn("--expected-digest", workflow)
@@ -456,6 +475,30 @@ class CiSupplyChainTests(unittest.TestCase):
         self.assertEqual(tofu["root_name"], "opentofu")
         self.assertEqual(tofu["root_version"], "1.12.1")
         self.assertTrue(tofu["purl"].startswith("pkg:oci/opentofu@sha256:"))
+
+    def test_syft_platform_image_identity_binds_the_index_to_its_manifest(self) -> None:
+        targets = load_module(SBOM_TARGETS)
+        index_digest = "sha256:" + "a" * 64
+        manifest_digest = "sha256:" + "b" * 64
+
+        identity = targets.syft_platform_image_identity(
+            "ghcr.io/example/harness@" + index_digest,
+            manifest_digest=manifest_digest,
+            architecture="amd64",
+        )
+
+        self.assertEqual(identity["root_name"], "harness")
+        self.assertEqual(identity["root_version"], index_digest)
+        self.assertEqual(identity["digest"], manifest_digest)
+        self.assertEqual(
+            identity["purl"], f"pkg:oci/harness@{manifest_digest}?arch=amd64"
+        )
+        with self.assertRaisesRegex(ValueError, "platform manifest"):
+            targets.syft_platform_image_identity(
+                "ghcr.io/example/harness@" + index_digest,
+                manifest_digest="not-a-digest",
+                architecture="amd64",
+            )
 
     def test_release_sbom_verifier_rejects_an_incomplete_document(self) -> None:
         module = load_module(SBOM_VERIFIER)

@@ -156,6 +156,34 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$IMAGE_NAME@$IMAGE_DIGEST"
 
+      - id: platform-image
+        name: Derive the single runnable manifest from the signed image index
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          index="$(docker buildx imagetools inspect --raw "$IMAGE_NAME@$IMAGE_DIGEST")"
+          manifest="$(jq -er '
+            if .mediaType != "application/vnd.oci.image.index.v1+json" then
+              error("signed image digest is not an OCI index")
+            else
+              [
+                .manifests[]
+                | select(
+                    .mediaType == "application/vnd.oci.image.manifest.v1+json"
+                    and .platform.os == "linux"
+                    and .platform.architecture == "amd64"
+                    and (.platform.variant // "") == ""
+                  )
+                | .digest
+              ]
+              | if (length == 1 and (.[0] | test("^sha256:[0-9a-f]{64}$"))) then .[0]
+                else error("signed image index must contain exactly one linux/amd64 manifest")
+                end
+            end
+          ' <<<"$index")"
+          printf 'digest=%s\n' "$manifest" >> "$GITHUB_OUTPUT"
+
       - name: Generate a digest-bound SPDX SBOM
         uses: anchore/sbom-action@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
         env:
@@ -164,7 +192,7 @@ jobs:
           SYFT_SOURCE_NAME: paperclip-daytona-harness
           SYFT_SOURCE_VERSION: ${{ steps.build.outputs.digest }}
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.digest }}
           format: spdx-json
           syft-version: v1.38.0
           output-file: daytona-harness-${{ github.sha }}.spdx.json
@@ -175,6 +203,7 @@ jobs:
         name: Derive the exact expected SPDX root identity
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM_IMAGE_DIGEST: ${{ steps.platform-image.outputs.digest }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -188,8 +217,10 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           assert spec.loader is not None
           spec.loader.exec_module(module)
-          identity = module.image_identity(
-              f'{os.environ["IMAGE_NAME"]}@{os.environ["IMAGE_DIGEST"]}'
+          identity = module.syft_platform_image_identity(
+              f'{os.environ["IMAGE_NAME"]}@{os.environ["IMAGE_DIGEST"]}',
+              manifest_digest=os.environ["PLATFORM_IMAGE_DIGEST"],
+              architecture="amd64",
           )
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               for key, value in identity.items():
