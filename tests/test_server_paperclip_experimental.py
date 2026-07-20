@@ -1039,6 +1039,11 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 "paperclip_context",
                 return_value=("http://paperclip.test", company_id),
             ),
+            mock.patch.object(
+                module,
+                "dotenv",
+                return_value={"PAPERCLIP_SERVICE_TOKEN": "unit-service-token"},
+            ),
             mock.patch.object(module, "json_request", side_effect=json_response),
         ):
             evidence = module.reconcile_secrets(mutate=False)

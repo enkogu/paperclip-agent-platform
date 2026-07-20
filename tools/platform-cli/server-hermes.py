@@ -2353,7 +2353,11 @@ def service_property(name: str) -> str:
 
 
 def sudoers_valid() -> bool:
-    if not SUDOERS_PATH.is_file() or stat.S_IMODE(SUDOERS_PATH.stat().st_mode) != 0o440:
+    try:
+        info = SUDOERS_PATH.stat()
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o440:
         return False
     result = command(
         ["visudo", "-cf", str(SUDOERS_PATH)], check=False, capture=True, timeout=30
@@ -2361,16 +2365,27 @@ def sudoers_valid() -> bool:
     return result.returncode == 0
 
 
+def sudoers_path_present() -> bool | None:
+    """Return policy presence, or ``None`` when it cannot be inspected."""
+    try:
+        return SUDOERS_PATH.exists()
+    except OSError:
+        return None
+
+
 def operator_mode_ready(configured_mode: str) -> bool:
     try:
         unit = UNIT_PATH.read_text(encoding="utf-8")
     except OSError:
         return False
+    policy_present = sudoers_path_present()
+    if policy_present is None:
+        return False
     if configured_mode == "unprivileged_service":
-        return not SUDOERS_PATH.exists() and "NoNewPrivileges=true" in unit
+        return not policy_present and "NoNewPrivileges=true" in unit
     if configured_mode == "unrestricted_host_repair":
         return (
-            SUDOERS_PATH.exists()
+            policy_present
             and sudoers_valid()
             and "NoNewPrivileges=true" not in unit
         )
@@ -2423,8 +2438,13 @@ def status_payload(env_file: Path, *, verify_external: bool = False) -> dict[str
     enabled = systemctl("is-enabled", SERVICE, check=False).stdout.strip()
     version = installed_version()
     configured_mode = credential_values.get("HERMES_OPERATOR_MODE", "").strip()
-    admin_policy_installed = SUDOERS_PATH.exists()
-    admin_policy_valid = sudoers_valid() if admin_policy_installed else True
+    admin_policy_presence = sudoers_path_present()
+    admin_policy_installed = admin_policy_presence is True
+    admin_policy_valid = (
+        sudoers_valid()
+        if admin_policy_installed
+        else admin_policy_presence is False
+    )
     skill_state = platform_skill_status()
     try:
         supply_state = venv_supply_chain_evidence()

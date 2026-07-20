@@ -50,4 +50,6 @@ jobs:
         run: docker compose version
 
       - name: Run offline release gate
+        env:
+          MTE_SECRET_ROOT: ${{ runner.temp }}/mte-secrets
         run: MTE_RELEASE_SECRET_SCAN=ci-action make release-check

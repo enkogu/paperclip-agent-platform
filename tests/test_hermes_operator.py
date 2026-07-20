@@ -1260,6 +1260,9 @@ class HermesInstallerTests(unittest.TestCase):
             mock.patch.object(
                 self.installer, "installed_version", return_value=self.installer.VERSION
             ),
+            mock.patch.object(
+                self.installer, "sudoers_path_present", return_value=None
+            ),
             mock.patch.object(self.installer, "sudoers_valid", return_value=True),
             mock.patch.object(
                 self.installer, "operator_mode_ready", return_value=True
@@ -1308,6 +1311,14 @@ class HermesInstallerTests(unittest.TestCase):
         self.assertEqual(
             status["externalReadiness"]["context7Discovery"], "not-requested"
         )
+        self.assertFalse(status["checks"]["platformAdminPolicy"])
+        self.assertFalse(status["platformAdminPolicyInstalled"])
+
+    def test_sudoers_presence_fails_closed_when_privileged_path_is_inaccessible(self):
+        inaccessible = mock.Mock()
+        inaccessible.exists.side_effect = PermissionError("unit permission denied")
+        with mock.patch.object(self.installer, "SUDOERS_PATH", inaccessible):
+            self.assertIsNone(self.installer.sudoers_path_present())
 
     def test_platform_skill_install_replaces_full_tree_and_removes_legacy_copy(self):
         with tempfile.TemporaryDirectory() as directory:

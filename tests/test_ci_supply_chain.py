@@ -215,6 +215,10 @@ class CiSupplyChainTests(unittest.TestCase):
             workflow.index(cleanup),
             workflow.index("- name: Run offline release gate"),
         )
+        self.assertIn(
+            "MTE_SECRET_ROOT: ${{ runner.temp }}/mte-secrets",
+            workflow,
+        )
 
     def test_release_check_requires_a_clean_release_tree_before_tools_run(self) -> None:
         release_check = RELEASE_CHECK.read_text()
