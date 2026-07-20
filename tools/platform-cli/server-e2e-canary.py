@@ -5762,6 +5762,8 @@ def validated_daytona_runtime_evidence(
         "generatedAt",
         "producerSha256",
         "canonicalSourceSha256",
+        "controlPlane",
+        "sandboxVersion",
         "provider",
         "target",
         "snapshot",
@@ -5783,20 +5785,103 @@ def validated_daytona_runtime_evidence(
         "generatedAt",
         "producerSha256",
         "canonicalSourceSha256",
+        "controlPlane",
+        "sandboxVersion",
         "snapshotContractHash",
+        "generation",
         "sandboxImage",
         "source",
         "snapshots",
+        "deferredCleanup",
+        "pointerSwitch",
         "resources",
         "harnessVersions",
         "credentialsBakedIntoImage",
     }
+    expected_control_plane = {
+        "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+        "sourceCommit": values.get("MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"),
+    }
+    expected_resources = {
+        "coding": {
+            "cpu": int(values.get("MTE_DAYTONA_CODING_CPU") or 0),
+            "memory": int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB") or 0),
+            "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
+        },
+        "general": {
+            "cpu": int(values.get("MTE_DAYTONA_GENERAL_CPU") or 0),
+            "memory": int(values.get("MTE_DAYTONA_GENERAL_MEMORY_GIB") or 0),
+            "disk": int(values.get("MTE_DAYTONA_DISK_GIB") or 0),
+        },
+    }
+    expected_snapshots = (
+        (
+            "coding",
+            values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+            int(values.get("MTE_DAYTONA_CODING_CPU") or 0),
+            int(values.get("MTE_DAYTONA_CODING_MEMORY_GIB") or 0),
+        ),
+        (
+            "general",
+            values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+            int(values.get("MTE_DAYTONA_GENERAL_CPU") or 0),
+            int(values.get("MTE_DAYTONA_GENERAL_MEMORY_GIB") or 0),
+        ),
+    )
+    valid_snapshots = len(snapshots) == 2 and all(
+        isinstance(row, dict)
+        and set(row)
+        == {
+            "role",
+            "id",
+            "name",
+            "state",
+            "ref",
+            "buildDockerfile",
+            "cpu",
+            "memoryGiB",
+            "diskGiB",
+        }
+        and row.get("role") == role
+        and bool(row.get("id"))
+        and row.get("name") == name
+        and row.get("state") == "active"
+        and row.get("ref") == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+        and row.get("buildDockerfile")
+        == f"FROM {values.get('MTE_DAYTONA_SANDBOX_IMAGE')}\n"
+        and row.get("cpu") == cpu
+        and row.get("memoryGiB") == memory
+        and row.get("diskGiB") == int(values.get("MTE_DAYTONA_DISK_GIB") or 0)
+        for row, (role, name, cpu, memory) in zip(
+            snapshots, expected_snapshots, strict=True
+        )
+    )
+    valid_deferred_cleanup = isinstance(images.get("deferredCleanup"), list) and all(
+        isinstance(row, dict)
+        and set(row) == {"id", "name", "state"}
+        and bool(row.get("id"))
+        and row.get("name")
+        not in {
+            values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+            values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+        }
+        and any(
+            str(row.get("name") or "").startswith(f"{prefix}-")
+            for prefix in (
+                values.get("MTE_DAYTONA_CODING_SNAPSHOT_PREFIX"),
+                values.get("MTE_DAYTONA_GENERAL_SNAPSHOT_PREFIX"),
+            )
+        )
+        for row in images.get("deferredCleanup", [])
+    )
     if (
         set(images) != expected_image_keys
-        or len(snapshots) != 2
+        or not valid_snapshots
         or not isinstance(snapshot, dict)
-        or snapshot.get("state") != "active"
-        or snapshot.get("ref") != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+        or len({row.get("id") for row in snapshots}) != 2
+        or len({row.get("name") for row in snapshots}) != 2
+        or images.get("controlPlane") != expected_control_plane
+        or images.get("sandboxVersion") != values.get("MTE_DAYTONA_SANDBOX_VERSION")
         or images.get("sandboxImage") != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
         or not re.fullmatch(
             r"[^\s@]+@sha256:[0-9a-f]{64}", str(images.get("sandboxImage") or "")
@@ -5812,6 +5897,7 @@ def validated_daytona_runtime_evidence(
             "claudeCode": values.get("MTE_CLAUDE_CODE_VERSION"),
             "pi": values.get("MTE_PI_VERSION"),
         }
+        or images.get("resources") != expected_resources
         or images.get("snapshotContractHash")
         != hashlib.sha256(
             json.dumps(
@@ -5827,9 +5913,23 @@ def validated_daytona_runtime_evidence(
                 separators=(",", ":"),
             ).encode()
         ).hexdigest()
+        or images.get("generation")
+        != str(images.get("snapshotContractHash") or "")[:12]
+        or images.get("pointerSwitch")
+        != {
+            "coding": values.get("MTE_DAYTONA_CODING_SNAPSHOT"),
+            "general": values.get("MTE_DAYTONA_GENERAL_SNAPSHOT"),
+            "completed": True,
+        }
+        or not valid_deferred_cleanup
         or images.get("credentialsBakedIntoImage") is not False
         or set(lifecycle) != expected_lifecycle_keys
+        or lifecycle.get("controlPlane") != expected_control_plane
+        or lifecycle.get("sandboxVersion") != values.get("MTE_DAYTONA_SANDBOX_VERSION")
+        or lifecycle.get("provider") != "daytona"
+        or lifecycle.get("target") != values.get("DAYTONA_TARGET")
         or lifecycle.get("snapshot") != coding_snapshot
+        or not lifecycle.get("sandboxId")
         or lifecycle.get("workspace") != "/home/daytona/paperclip-workspace"
         or not valid_lifecycle_harnesses
         or [

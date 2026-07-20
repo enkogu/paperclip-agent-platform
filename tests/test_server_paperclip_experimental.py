@@ -1265,6 +1265,13 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 "canonicalSourceSha256": hashlib.sha256(
                     canonical.read_bytes()
                 ).hexdigest(),
+                "controlPlane": {
+                    "version": values["MTE_DAYTONA_CONTROL_PLANE_VERSION"],
+                    "sourceCommit": values[
+                        "MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"
+                    ],
+                },
+                "sandboxVersion": values["MTE_DAYTONA_SANDBOX_VERSION"],
                 "provider": "daytona",
                 "target": values["DAYTONA_TARGET"],
                 "snapshot": values["MTE_DAYTONA_CODING_SNAPSHOT"],
@@ -1340,6 +1347,19 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 module.validate_daytona_runtime_evidence(
                     lifecycle, "DaytonaSandboxLifecycleEvidence", values
                 )
+            lifecycle["credentialFileProbe"]["foundPaths"] = []
+            missing_schema = dict(lifecycle)
+            missing_schema.pop("controlPlane")
+            extra_schema = {**lifecycle, "legacy": True}
+            stale_provenance = {
+                **lifecycle,
+                "sandboxVersion": "0.0.0-stale",
+            }
+            for drifted in (missing_schema, extra_schema, stale_provenance):
+                with self.assertRaises(module.ControlError):
+                    module.validate_daytona_runtime_evidence(
+                        drifted, "DaytonaSandboxLifecycleEvidence", values
+                    )
 
     def test_tool_delivery_evidence_rejects_wrong_endpoint_or_context7_auth_drift(self):
         catalog = module.DEFAULT_PROFILE_CATALOG

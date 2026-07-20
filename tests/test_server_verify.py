@@ -2948,6 +2948,17 @@ class FailClosedVerifierTests(unittest.TestCase):
         self.assertFalse(result["C074"]["ok"])
         lifecycle["sandboxVersion"] = values["MTE_DAYTONA_SANDBOX_VERSION"]
 
+        lifecycle_control_plane = lifecycle.pop("controlPlane")
+        write_documents()
+        result = self.module._daytona_connection_proofs({"C074"})
+        self.assertFalse(result["C074"]["ok"])
+        lifecycle["controlPlane"] = lifecycle_control_plane
+        lifecycle["legacy"] = True
+        write_documents()
+        result = self.module._daytona_connection_proofs({"C074"})
+        self.assertFalse(result["C074"]["ok"])
+        lifecycle.pop("legacy")
+
         control_plane["controlPlane"]["version"] = "0.186.0"
         write_documents()
         result = self.module._daytona_connection_proofs({"C072"})

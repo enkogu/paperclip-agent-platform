@@ -998,6 +998,8 @@ def validate_daytona_runtime_evidence(
             "generatedAt",
             "producerSha256",
             "canonicalSourceSha256",
+            "controlPlane",
+            "sandboxVersion",
             "provider",
             "target",
             "snapshot",
@@ -1048,6 +1050,13 @@ def validate_daytona_runtime_evidence(
                     break
         if (
             set(payload) != expected_keys
+            or payload.get("controlPlane")
+            != {
+                "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+                "sourceCommit": values.get("MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"),
+            }
+            or payload.get("sandboxVersion")
+            != values.get("MTE_DAYTONA_SANDBOX_VERSION")
             or payload.get("provider") != "daytona"
             or payload.get("target") != values["DAYTONA_TARGET"]
             or payload.get("snapshot") != values["MTE_DAYTONA_CODING_SNAPSHOT"]
