@@ -8381,6 +8381,7 @@ def _daytona_image_contract_valid(images: object, values: dict[str, str]) -> boo
                     "name",
                     "state",
                     "ref",
+                    "buildDockerfile",
                     "cpu",
                     "memoryGiB",
                     "diskGiB",
@@ -8390,6 +8391,8 @@ def _daytona_image_contract_valid(images: object, values: dict[str, str]) -> boo
                 and row.get("state") == "active"
                 and bool(row.get("id"))
                 and row.get("ref") == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+                and row.get("buildDockerfile")
+                == f"FROM {values.get('MTE_DAYTONA_SANDBOX_IMAGE')}\n"
                 and row.get("cpu") == expected_resources["cpu"]
                 and row.get("memoryGiB") == expected_resources["memory"]
                 and row.get("diskGiB") == expected_resources["disk"]
@@ -8959,12 +8962,15 @@ def _daytona_connection_proofs(requested: set[str]) -> dict[str, dict]:
                         "name",
                         "state",
                         "ref",
+                        "buildDockerfile",
                         "cpu",
                         "memoryGiB",
                         "diskGiB",
                     }
                     and row.get("ref")
                     == values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+                    and row.get("buildDockerfile")
+                    == f"FROM {values.get('MTE_DAYTONA_SANDBOX_IMAGE')}\n"
                     and row.get("role") == expected["role"]
                     and row.get("name") == expected["name"]
                     and row.get("cpu") == expected["cpu"]

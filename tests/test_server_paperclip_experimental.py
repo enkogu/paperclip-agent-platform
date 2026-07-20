@@ -1173,6 +1173,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                         "id": "snapshot-coding",
                         "name": values["MTE_DAYTONA_CODING_SNAPSHOT"],
                         "state": "active",
+                        "buildDockerfile": f"FROM {values['MTE_DAYTONA_SANDBOX_IMAGE']}\n",
                         "cpu": 1,
                         "memoryGiB": 2,
                         "diskGiB": 20,
@@ -1183,6 +1184,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                         "id": "snapshot-general",
                         "name": values["MTE_DAYTONA_GENERAL_SNAPSHOT"],
                         "state": "active",
+                        "buildDockerfile": f"FROM {values['MTE_DAYTONA_SANDBOX_IMAGE']}\n",
                         "cpu": 1,
                         "memoryGiB": 1,
                         "diskGiB": 20,
@@ -1224,6 +1226,27 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                         images, "DaytonaHarnessSnapshots", values
                     )
                 images["snapshotContractHash"] = expected_contract_hash
+                expected_dockerfile = images["snapshots"][0]["buildDockerfile"]
+                images["snapshots"][0]["buildDockerfile"] = "FROM untrusted\n"
+                with self.assertRaises(module.ControlError):
+                    module.validate_daytona_runtime_evidence(
+                        images, "DaytonaHarnessSnapshots", values
+                    )
+                images["snapshots"][0]["buildDockerfile"] = expected_dockerfile
+                missing_schema = dict(images["snapshots"][0])
+                missing_schema.pop("buildDockerfile")
+                images["snapshots"][0] = missing_schema
+                with self.assertRaises(module.ControlError):
+                    module.validate_daytona_runtime_evidence(
+                        images, "DaytonaHarnessSnapshots", values
+                    )
+                extra_schema = {**missing_schema, "buildDockerfile": expected_dockerfile, "legacy": True}
+                images["snapshots"][0] = extra_schema
+                with self.assertRaises(module.ControlError):
+                    module.validate_daytona_runtime_evidence(
+                        images, "DaytonaHarnessSnapshots", values
+                    )
+                images["snapshots"][0] = {**missing_schema, "buildDockerfile": expected_dockerfile}
                 images["snapshots"][0]["ref"] = (
                     "ghcr.io/example/daytona-harness@sha256:" + "0" * 64
                 )

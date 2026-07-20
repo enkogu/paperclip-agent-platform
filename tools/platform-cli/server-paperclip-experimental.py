@@ -900,6 +900,7 @@ def validate_daytona_runtime_evidence(
                     "name",
                     "state",
                     "ref",
+                    "buildDockerfile",
                     "cpu",
                     "memoryGiB",
                     "diskGiB",
@@ -910,6 +911,8 @@ def validate_daytona_runtime_evidence(
                 or row.get("state") != "active"
                 or not isinstance(row.get("ref"), str)
                 or row.get("ref") != values.get("MTE_DAYTONA_SANDBOX_IMAGE")
+                or row.get("buildDockerfile")
+                != f"FROM {values.get('MTE_DAYTONA_SANDBOX_IMAGE')}\n"
                 or row.get("cpu") != cpu
                 or row.get("memoryGiB") != memory
                 or row.get("diskGiB") != int(values["MTE_DAYTONA_DISK_GIB"])

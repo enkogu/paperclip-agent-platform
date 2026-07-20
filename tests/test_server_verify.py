@@ -2575,6 +2575,7 @@ class FailClosedVerifierTests(unittest.TestCase):
                     "id": "snapshot-coding",
                     "name": values["MTE_DAYTONA_CODING_SNAPSHOT"],
                     "state": "active",
+                    "buildDockerfile": f"FROM {values['MTE_DAYTONA_SANDBOX_IMAGE']}\n",
                     "cpu": 1,
                     "memoryGiB": 2,
                     "diskGiB": 20,
@@ -2585,6 +2586,7 @@ class FailClosedVerifierTests(unittest.TestCase):
                     "id": "snapshot-general",
                     "name": values["MTE_DAYTONA_GENERAL_SNAPSHOT"],
                     "state": "active",
+                    "buildDockerfile": f"FROM {values['MTE_DAYTONA_SANDBOX_IMAGE']}\n",
                     "cpu": 1,
                     "memoryGiB": 1,
                     "diskGiB": 20,
@@ -2893,6 +2895,13 @@ class FailClosedVerifierTests(unittest.TestCase):
                 values["MTE_DAYTONA_SANDBOX_IMAGE"],
             ),
             (
+                "snapshot-build-dockerfile",
+                images["snapshots"][0],
+                "buildDockerfile",
+                "FROM untrusted\n",
+                f"FROM {values['MTE_DAYTONA_SANDBOX_IMAGE']}\n",
+            ),
+            (
                 "pointer-switch",
                 images["pointerSwitch"],
                 "coding",
@@ -2921,6 +2930,17 @@ class FailClosedVerifierTests(unittest.TestCase):
         self.assertFalse(result["C072"]["ok"])
         self.assertFalse(result["C074"]["ok"])
         images["deferredCleanup"].clear()
+
+        build_dockerfile = images["snapshots"][0].pop("buildDockerfile")
+        write_documents()
+        result = self.module._daytona_connection_proofs({"C074"})
+        self.assertFalse(result["C074"]["ok"])
+        images["snapshots"][0]["buildDockerfile"] = build_dockerfile
+        images["snapshots"][0]["legacy"] = True
+        write_documents()
+        result = self.module._daytona_connection_proofs({"C074"})
+        self.assertFalse(result["C074"]["ok"])
+        images["snapshots"][0].pop("legacy")
 
         lifecycle["sandboxVersion"] = "0.189.0"
         write_documents()
