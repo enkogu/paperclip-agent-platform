@@ -107,6 +107,7 @@ class CiSupplyChainTests(unittest.TestCase):
         )
         self.assertIn('.platform.os == "linux"', platform_manifest)
         self.assertIn('.platform.architecture == "amd64"', platform_manifest)
+        self.assertIn(".config.digest", platform_manifest)
         self.assertIn(
             "signed image index must contain exactly one linux/amd64 manifest",
             platform_manifest,
@@ -120,11 +121,12 @@ class CiSupplyChainTests(unittest.TestCase):
             sbom_generation,
         )
         self.assertIn(
-            "image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.digest }}",
+            "image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.manifest_digest }}",
             sbom_generation,
         )
         self.assertIn("syft_platform_image_identity", workflow)
-        self.assertIn("PLATFORM_IMAGE_DIGEST", workflow)
+        self.assertIn("PLATFORM_CONFIG_DIGEST", workflow)
+        self.assertIn("PLATFORM_MANIFEST_DIGEST", workflow)
         self.assertIn(
             '--expected-digest "${{ steps.sbom-identity.outputs.digest }}"',
             workflow,
@@ -146,6 +148,9 @@ class CiSupplyChainTests(unittest.TestCase):
         self.assertIn("actual !== version", workflow)
         self.assertIn("daytona-harness-image.json", workflow)
         self.assertIn('"image": f\'{os.environ["IMAGE_NAME"]}@{digest}\'', workflow)
+        self.assertIn('"runnablePlatform": {', workflow)
+        self.assertIn('"manifestDigest": platform_manifest,', workflow)
+        self.assertIn('"configDigest": platform_config,', workflow)
         self.assertIn("IMAGE_NAME: ${{ needs.prepare.outputs.image_name }}", workflow)
         self.assertIn('gh release create "$RELEASE_TAG"', workflow)
         self.assertIn("--draft", workflow)
@@ -487,24 +492,24 @@ class CiSupplyChainTests(unittest.TestCase):
     def test_syft_platform_image_identity_binds_the_index_to_its_manifest(self) -> None:
         targets = load_module(SBOM_TARGETS)
         index_digest = "sha256:" + "a" * 64
-        manifest_digest = "sha256:" + "b" * 64
+        config_digest = "sha256:" + "b" * 64
 
         identity = targets.syft_platform_image_identity(
             "ghcr.io/example/harness@" + index_digest,
-            manifest_digest=manifest_digest,
+            config_digest=config_digest,
             architecture="amd64",
         )
 
         self.assertEqual(identity["root_name"], "harness")
         self.assertEqual(identity["root_version"], index_digest)
-        self.assertEqual(identity["digest"], manifest_digest)
+        self.assertEqual(identity["digest"], config_digest)
         self.assertEqual(
-            identity["purl"], f"pkg:oci/harness@{manifest_digest}?arch=amd64"
+            identity["purl"], f"pkg:oci/harness@sha256%3A{'b' * 64}?arch=amd64"
         )
-        with self.assertRaisesRegex(ValueError, "platform manifest"):
+        with self.assertRaisesRegex(ValueError, "platform config"):
             targets.syft_platform_image_identity(
                 "ghcr.io/example/harness@" + index_digest,
-                manifest_digest="not-a-digest",
+                config_digest="not-a-digest",
                 architecture="amd64",
             )
 

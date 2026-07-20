@@ -182,7 +182,16 @@ jobs:
                 end
             end
           ' <<<"$index")"
-          printf 'digest=%s\n' "$manifest" >> "$GITHUB_OUTPUT"
+          platform_manifest="$(docker buildx imagetools inspect --raw "$IMAGE_NAME@$manifest")"
+          config="$(jq -er '
+            if .mediaType != "application/vnd.oci.image.manifest.v1+json" then
+              error("selected linux/amd64 descriptor is not an OCI image manifest")
+            elif (.config.digest | test("^sha256:[0-9a-f]{64}$")) then .config.digest
+            else error("selected linux/amd64 manifest has no sha256 config digest")
+            end
+          ' <<<"$platform_manifest")"
+          printf 'manifest_digest=%s\n' "$manifest" >> "$GITHUB_OUTPUT"
+          printf 'config_digest=%s\n' "$config" >> "$GITHUB_OUTPUT"
 
       - name: Generate a digest-bound SPDX SBOM
         uses: anchore/sbom-action@fbfd9c6c189226748411491745178e0c2017392d # v0.20.10
@@ -192,7 +201,7 @@ jobs:
           SYFT_SOURCE_NAME: paperclip-daytona-harness
           SYFT_SOURCE_VERSION: ${{ steps.build.outputs.digest }}
         with:
-          image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.digest }}
+          image: ${{ env.IMAGE_NAME }}@${{ steps.platform-image.outputs.manifest_digest }}
           format: spdx-json
           syft-version: v1.38.0
           output-file: daytona-harness-${{ github.sha }}.spdx.json
@@ -203,7 +212,7 @@ jobs:
         name: Derive the exact expected SPDX root identity
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          PLATFORM_IMAGE_DIGEST: ${{ steps.platform-image.outputs.digest }}
+          PLATFORM_CONFIG_DIGEST: ${{ steps.platform-image.outputs.config_digest }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -219,7 +228,7 @@ jobs:
           spec.loader.exec_module(module)
           identity = module.syft_platform_image_identity(
               f'{os.environ["IMAGE_NAME"]}@{os.environ["IMAGE_DIGEST"]}',
-              manifest_digest=os.environ["PLATFORM_IMAGE_DIGEST"],
+              config_digest=os.environ["PLATFORM_CONFIG_DIGEST"],
               architecture="amd64",
           )
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
@@ -288,6 +297,8 @@ jobs:
       - name: Emit the deploy input and provenance receipt
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM_MANIFEST_DIGEST: ${{ steps.platform-image.outputs.manifest_digest }}
+          PLATFORM_CONFIG_DIGEST: ${{ steps.platform-image.outputs.config_digest }}
           SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
           CERTIFICATE_IDENTITY: ${{ github.server_url }}/${{ github.workflow_ref }}
         run: |
@@ -301,8 +312,22 @@ jobs:
           digest = os.environ["IMAGE_DIGEST"]
           if not digest.startswith("sha256:") or len(digest) != 71:
               raise SystemExit("build did not return a sha256 image digest")
+          platform_manifest = os.environ["PLATFORM_MANIFEST_DIGEST"]
+          platform_config = os.environ["PLATFORM_CONFIG_DIGEST"]
+          for label, value in {
+              "platform manifest": platform_manifest,
+              "platform config": platform_config,
+          }.items():
+              if not value.startswith("sha256:") or len(value) != 71:
+                  raise SystemExit(f"{label} did not resolve to a sha256 digest")
           receipt = {
               "image": f'{os.environ["IMAGE_NAME"]}@{digest}',
+              "runnablePlatform": {
+                  "architecture": "amd64",
+                  "configDigest": platform_config,
+                  "manifestDigest": platform_manifest,
+                  "os": "linux",
+              },
               "sourceUrl": os.environ["SOURCE_URL"],
               "revision": os.environ["SOURCE_REVISION"],
               "signature": {

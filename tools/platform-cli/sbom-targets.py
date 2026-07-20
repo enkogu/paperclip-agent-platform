@@ -75,21 +75,19 @@ def image_identity(ref: str) -> dict[str, str]:
 
 
 def syft_platform_image_identity(
-    ref: str, *, manifest_digest: str, architecture: str
+    ref: str, *, config_digest: str, architecture: str
 ) -> dict[str, str]:
     """Return Syft v1.38's exact SPDX identity for one runnable image manifest.
 
     Buildx publishes the signed image index, while Syft scans its selected
     platform manifest. Syft preserves the index as the source version but
-    emits the selected manifest digest and architecture in the root package
-    PURL/checksum. Callers must derive ``manifest_digest`` from that index
-    before trusting this identity.
+    emits the selected manifest's OCI config digest and architecture in the
+    root package PURL/checksum. Callers must derive ``config_digest`` from
+    the index-selected manifest before trusting this identity.
     """
 
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest):
-        raise ValueError(
-            f"platform manifest is not a sha256 digest: {manifest_digest!r}"
-        )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", config_digest):
+        raise ValueError(f"platform config is not a sha256 digest: {config_digest!r}")
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", architecture):
         raise ValueError(f"invalid platform architecture: {architecture!r}")
     index_identity = image_identity(ref)
@@ -97,9 +95,9 @@ def syft_platform_image_identity(
     return {
         "root_name": name,
         "root_version": index_identity["root_version"],
-        "digest": manifest_digest,
+        "digest": config_digest,
         "purl": (
-            f"pkg:oci/{quote(name, safe='')}@{manifest_digest}"
+            f"pkg:oci/{quote(name, safe='')}@{quote(config_digest, safe='')}"
             f"?arch={quote(architecture, safe='')}"
         ),
     }
