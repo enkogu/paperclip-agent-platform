@@ -2618,6 +2618,53 @@ def projection_row(path: Path, source_sha: str) -> dict[str, str]:
     }
 
 
+def cloudflare_runtime_credential_projections(
+    values: dict[str, str],
+    route_prefixes: dict[str, str],
+    source_sha: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve independently deployable Cloudflare runtime credentials.
+
+    A legacy installation can already have a valid tunnel token before the
+    Cloudflare stage has created per-route Access service tokens.  Keep that
+    state renderable while rejecting a torn credential tuple for any route.
+    The aggregate Access projection is emitted only after every configured
+    service route has a complete tuple.
+    """
+    tunnel_token = values.get("CLOUDFLARE_TUNNEL_TOKEN", "").strip() or None
+    route_fields = {
+        "id": "_ID",
+        "client_id": "_CLIENT_ID",
+        "client_secret": "_CLIENT_SECRET",
+        "expires_at": "_EXPIRES_AT",
+    }
+    complete_routes: dict[str, dict[str, str]] = {}
+    for app_id, prefix in route_prefixes.items():
+        route = {
+            field: values.get(prefix + suffix, "").strip()
+            for field, suffix in route_fields.items()
+        }
+        present = [bool(value) for value in route.values()]
+        if any(present) and not all(present):
+            raise ConfigError(
+                f"canonical Cloudflare runtime credentials are incomplete for route: {app_id}"
+            )
+        if all(present):
+            complete_routes[app_id] = route
+
+    access_payload = None
+    if route_prefixes and len(complete_routes) == len(route_prefixes):
+        access_payload = {
+            "routes": complete_routes,
+            "_generated": {
+                "doNotEdit": True,
+                "sourceSha256": source_sha,
+                "generatorVersion": GENERATOR_VERSION,
+            },
+        }
+    return tunnel_token, access_payload
+
+
 def service_projection_content(
     component_id: str,
     keys: set[str],
@@ -3171,39 +3218,17 @@ def _render_locked() -> dict[str, Any]:
         app_id: "CLOUDFLARE_ACCESS_ROUTE_" + app_id.upper().replace("-", "_")
         for app_id in service_app_ids
     }
-    runtime_credential_keys = ["CLOUDFLARE_TUNNEL_TOKEN"] + [
-        prefix + suffix
-        for prefix in route_prefixes.values()
-        for suffix in ("_ID", "_CLIENT_ID", "_CLIENT_SECRET", "_EXPIRES_AT")
-    ]
-    runtime_present = [
-        bool(values.get(key, "").strip()) for key in runtime_credential_keys
-    ]
-    if any(runtime_present) and not all(runtime_present):
-        raise ConfigError("canonical Cloudflare runtime credentials are incomplete")
-    if all(runtime_present):
+    tunnel_token, access_payload = cloudflare_runtime_credential_projections(
+        values, route_prefixes, source_sha
+    )
+    if tunnel_token is not None:
         atomic_text(
             CLOUDFLARE_TUNNEL_TOKEN,
-            values["CLOUDFLARE_TUNNEL_TOKEN"].strip() + "\n",
+            tunnel_token + "\n",
             0o600,
         )
         projections.append(projection_row(CLOUDFLARE_TUNNEL_TOKEN, source_sha))
-        access_payload = {
-            "routes": {
-                app_id: {
-                    "id": values[prefix + "_ID"].strip(),
-                    "client_id": values[prefix + "_CLIENT_ID"].strip(),
-                    "client_secret": values[prefix + "_CLIENT_SECRET"].strip(),
-                    "expires_at": values[prefix + "_EXPIRES_AT"].strip(),
-                }
-                for app_id, prefix in route_prefixes.items()
-            },
-            "_generated": {
-                "doNotEdit": True,
-                "sourceSha256": source_sha,
-                "generatorVersion": GENERATOR_VERSION,
-            },
-        }
+    if access_payload is not None:
         atomic_text(
             CLOUDFLARE_ACCESS_TOKEN,
             json.dumps(access_payload, indent=2, sort_keys=True) + "\n",

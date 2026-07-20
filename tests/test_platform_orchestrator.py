@@ -44,6 +44,60 @@ class PlatformOrchestratorTests(unittest.TestCase):
     def tearDown(self):
         platform.OPERATOR_ENV_OVERRIDE = None
 
+    def test_cloudflare_legacy_tunnel_projects_before_access_tokens_exist(self):
+        tunnel = "legacy-tunnel-value"
+        projected_tunnel, access = (
+            server_config.cloudflare_runtime_credential_projections(
+                {"CLOUDFLARE_TUNNEL_TOKEN": tunnel},
+                {"firecrawl": "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL"},
+                "a" * 64,
+            )
+        )
+
+        self.assertEqual(projected_tunnel, tunnel)
+        self.assertIsNone(access)
+
+    def test_cloudflare_complete_route_tuples_build_access_projection(self):
+        values = {"CLOUDFLARE_TUNNEL_TOKEN": "tunnel-value"}
+        prefixes = {
+            "firecrawl": "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL",
+            "toolhive": "CLOUDFLARE_ACCESS_ROUTE_TOOLHIVE",
+        }
+        for index, prefix in enumerate(prefixes.values(), 1):
+            values.update(
+                {
+                    prefix + "_ID": f"route-{index}",
+                    prefix + "_CLIENT_ID": f"client-{index}",
+                    prefix + "_CLIENT_SECRET": f"secret-{index}",
+                    prefix + "_EXPIRES_AT": "2099-01-01T00:00:00+00:00",
+                }
+            )
+
+        projected_tunnel, access = (
+            server_config.cloudflare_runtime_credential_projections(
+                values, prefixes, "b" * 64
+            )
+        )
+
+        self.assertEqual(projected_tunnel, "tunnel-value")
+        self.assertEqual(set(access["routes"]), set(prefixes))
+        self.assertEqual(access["_generated"]["sourceSha256"], "b" * 64)
+
+    def test_cloudflare_partial_route_tuple_fails_closed(self):
+        values = {
+            "CLOUDFLARE_TUNNEL_TOKEN": "legacy-tunnel-value",
+            "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL_ID": "route-id",
+        }
+
+        with self.assertRaisesRegex(
+            server_config.ConfigError, "incomplete for route: firecrawl"
+        ):
+            server_config.cloudflare_runtime_credential_projections(
+                values,
+                {"firecrawl": "CLOUDFLARE_ACCESS_ROUTE_FIRECRAWL"},
+                "c" * 64,
+            )
+
     def test_server_config_cli_render_reuses_its_outer_lock(self):
         output = io.StringIO()
         with (
