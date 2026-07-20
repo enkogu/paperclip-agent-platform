@@ -102,6 +102,10 @@ class CiSupplyChainTests(unittest.TestCase):
         self.assertIn("--expected-root-purl", workflow)
         self.assertIn("--expected-digest", workflow)
         self.assertIn("Verify the exact harness and tool ABI", workflow)
+        self.assertIn(
+            'docker run --rm --network none --entrypoint node "$IMAGE_NAME@$IMAGE_DIGEST"',
+            workflow,
+        )
         self.assertIn("versionPatterns", workflow)
         self.assertNotIn("output.includes(version)", workflow)
         self.assertIn("actual !== version", workflow)

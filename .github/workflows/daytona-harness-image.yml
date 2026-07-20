@@ -92,7 +92,7 @@ jobs:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          docker run --rm --network none "$IMAGE_NAME@$IMAGE_DIGEST" node <<'NODE'
+          docker run --rm --network none --entrypoint node "$IMAGE_NAME@$IMAGE_DIGEST" <<'NODE'
           const cp = require("node:child_process");
           const fs = require("node:fs");
           const expected = {
