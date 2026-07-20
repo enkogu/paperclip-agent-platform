@@ -203,6 +203,19 @@ class CiSupplyChainTests(unittest.TestCase):
         )
         self.assertIn("MTE_RELEASE_SECRET_SCAN=ci-action make release-check", workflow)
 
+    def test_ci_removes_only_the_gitleaks_workspace_report_before_release_gate(self) -> None:
+        workflow = (WORKFLOW_ROOT / "ci.yml").read_text()
+        cleanup = "- name: Remove the Gitleaks workspace report\n        run: rm -f -- results.sarif"
+        self.assertIn(cleanup, workflow)
+        self.assertGreater(
+            workflow.index(cleanup),
+            workflow.index("- name: Scan tracked source for secrets"),
+        )
+        self.assertLess(
+            workflow.index(cleanup),
+            workflow.index("- name: Run offline release gate"),
+        )
+
     def test_release_check_requires_a_clean_release_tree_before_tools_run(self) -> None:
         release_check = RELEASE_CHECK.read_text()
 

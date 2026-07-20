@@ -43,6 +43,9 @@ jobs:
           GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
           GITLEAKS_ENABLE_SUMMARY: "false"
 
+      - name: Remove the Gitleaks workspace report
+        run: rm -f -- results.sarif
+
       - name: Verify Docker Compose
         run: docker compose version
 
