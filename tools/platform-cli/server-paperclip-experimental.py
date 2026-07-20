@@ -1940,14 +1940,24 @@ let current = path.dirname(require.resolve('@paperclipai/plugin-daytona'));
 while (current !== path.dirname(current) && !fs.existsSync(path.join(current, 'package.json'))) {
   current = path.dirname(current);
 }
+const appRoot = fs.realpathSync('/app');
+current = fs.realpathSync(current);
+if (current !== appRoot && !current.startsWith(appRoot + path.sep)) {
+  throw new Error(`Daytona plugin package escapes /app: ${current}`);
+}
 const manifestPath = path.join(current, 'package.json');
 const manifestBytes = fs.readFileSync(manifestPath);
 const manifest = JSON.parse(manifestBytes.toString('utf8'));
 if (manifest.name !== '@paperclipai/plugin-daytona') process.exit(4);
 const files = [];
+const dependencyDirectory = path.join(current, 'node_modules');
 function walk(directory) {
   for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
     const absolute = path.join(directory, entry.name);
+    // pnpm wires dependencies through symlinks below the package's own
+    // node_modules. They are not part of the immutable plugin payload; never
+    // traverse them. Symlinks anywhere else remain a fail-closed condition.
+    if (absolute === dependencyDirectory && entry.isDirectory()) continue;
     if (entry.isDirectory()) walk(absolute);
     else if (entry.isFile()) files.push(path.relative(current, absolute));
     else throw new Error(`unsupported Daytona plugin file type: ${absolute}`);
@@ -1966,6 +1976,7 @@ process.stdout.write(JSON.stringify({
   packagePath: current,
   manifestSha256: crypto.createHash('sha256').update(manifestBytes).digest('hex'),
   contentSha256: digest.digest('hex'),
+  contentScope: 'package-files-excluding-node_modules',
   fileCount: files.length,
 }));
 """
@@ -1989,6 +2000,7 @@ process.stdout.write(JSON.stringify({
         or not str(value.get("packagePath", "")).startswith("/app/")
         or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("manifestSha256", "")))
         or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("contentSha256", "")))
+        or value.get("contentScope") != "package-files-excluding-node_modules"
         or int(value.get("fileCount", 0)) < 1
     ):
         raise ControlError(

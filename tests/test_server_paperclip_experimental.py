@@ -757,7 +757,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
 
         ready_plugin = {
             "packageName": "@paperclipai/plugin-daytona",
-            "packagePath": "/app/server/node_modules/@paperclipai/plugin-daytona",
+            "packagePath": "/app/plugins/daytona",
             "pluginKey": "paperclip.daytona-sandbox-provider",
             "version": "0.1.0",
             "status": "ready",
@@ -776,7 +776,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 "0.1.0",
                 {
                     "version": "0.1.0",
-                    "packagePath": "/app/server/node_modules/@paperclipai/plugin-daytona",
+                    "packagePath": "/app/plugins/daytona",
                 },
             )
 
@@ -786,7 +786,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 "POST",
                 "/api/plugins/install",
                 {
-                    "packageName": "/app/server/node_modules/@paperclipai/plugin-daytona",
+                    "packageName": "/app/plugins/daytona",
                     "isLocalPath": True,
                 },
             ),
@@ -800,6 +800,10 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
         self.assertIn("require.resolve('@paperclipai/plugin-daytona')", source)
         self.assertNotIn("MTE_DAYTONA_PLUGIN_NPM_", source)
         self.assertNotIn("/tools/node_modules", source)
+        self.assertIn("fs.realpathSync('/app')", source)
+        self.assertIn("absolute === dependencyDirectory && entry.isDirectory()", source)
+        self.assertIn("unsupported Daytona plugin file type", source)
+        self.assertIn("package-files-excluding-node_modules", source)
 
     def test_plugin_purges_then_reinstalls_when_image_package_path_drifted(self):
         plugin = {
@@ -824,7 +828,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 "0.1.0",
                 {
                     "version": "0.1.0",
-                    "packagePath": "/app/server/node_modules/@paperclipai/plugin-daytona",
+                    "packagePath": "/app/plugins/daytona",
                 },
             )
 
@@ -840,7 +844,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                     "POST",
                     "/api/plugins/install",
                     {
-                        "packageName": "/app/server/node_modules/@paperclipai/plugin-daytona",
+                        "packageName": "/app/plugins/daytona",
                         "isLocalPath": True,
                     },
                 ),
@@ -850,7 +854,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
     def test_plugin_enables_existing_errored_exact_package_without_reinstall(self):
         errored = {
             "packageName": "@paperclipai/plugin-daytona",
-            "packagePath": "/app/server/node_modules/@paperclipai/plugin-daytona",
+            "packagePath": "/app/plugins/daytona",
             "pluginKey": "paperclip.daytona-sandbox-provider",
             "version": "0.1.0",
             "status": "error",
@@ -872,7 +876,7 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
                 "0.1.0",
                 {
                     "version": "0.1.0",
-                    "packagePath": "/app/server/node_modules/@paperclipai/plugin-daytona",
+                    "packagePath": "/app/plugins/daytona",
                 },
             )
 
@@ -1515,9 +1519,10 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
         payload = {
             "name": "@paperclipai/plugin-daytona",
             "version": "0.1.0",
-            "packagePath": "/app/server/node_modules/@paperclipai/plugin-daytona",
+            "packagePath": "/app/plugins/daytona",
             "manifestSha256": "1" * 64,
             "contentSha256": "2" * 64,
+            "contentScope": "package-files-excluding-node_modules",
             "fileCount": 17,
         }
         completed = subprocess.CompletedProcess(
@@ -1527,6 +1532,14 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
             proof = module.installed_plugin_package_proof(payload["name"])
             self.assertEqual(proof, payload)
         payload["manifestSha256"] = "truncated"
+        completed.stdout = json.dumps(payload)
+        with (
+            mock.patch.object(module.subprocess, "run", return_value=completed),
+            self.assertRaises(module.ControlError),
+        ):
+            module.installed_plugin_package_proof(payload["name"])
+        payload["manifestSha256"] = "1" * 64
+        payload.pop("contentScope")
         completed.stdout = json.dumps(payload)
         with (
             mock.patch.object(module.subprocess, "run", return_value=completed),
