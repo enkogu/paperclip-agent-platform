@@ -109,6 +109,53 @@ def test_custom_sdk_seed_fails_closed_without_mutating_canonical_source() -> Non
         assert canonical.read_text() == original
 
 
+def test_legacy_hermes_sigstore_contract_migrates_once_and_replays_cleanly() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        canonical = Path(temporary) / "platform.env"
+        canonical.write_text(
+            "DATA_CONTENT_PROFILE=none\n"
+            "HERMES_SIGSTORE_PACKAGE_VERSION=3.0.0\n"
+            "HERMES_SIGSTORE_VERIFIER_IMAGE=node:22-bookworm@sha256:"
+            "5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37\n"
+        )
+        canonical.chmod(0o600)
+
+        migrated = init_existing(canonical)
+        replayed = init_existing(canonical)
+        values = server_config.parse_env(canonical)
+
+        assert values["HERMES_SIGSTORE_PACKAGE_VERSION"] == "3.1.0"
+        assert values["HERMES_SIGSTORE_VERIFIER_IMAGE"] == (
+            "node:24.3.0-bookworm@sha256:"
+            "256a2e7037e745228f7630d578e6c1d327ab4c0a8e401c63d0d4d9dfb3c13465"
+        )
+        assert {
+            "HERMES_SIGSTORE_PACKAGE_VERSION",
+            "HERMES_SIGSTORE_VERIFIER_IMAGE",
+        } <= set(migrated["migratedKeys"])
+        assert "HERMES_SIGSTORE_PACKAGE_VERSION" not in replayed["migratedKeys"]
+        assert "HERMES_SIGSTORE_VERIFIER_IMAGE" not in replayed["migratedKeys"]
+
+
+def test_unreviewed_hermes_sigstore_contract_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        canonical = Path(temporary) / "platform.env"
+        original = (
+            "DATA_CONTENT_PROFILE=none\n"
+            "HERMES_SIGSTORE_PACKAGE_VERSION=3.1.1\n"
+        )
+        canonical.write_text(original)
+        canonical.chmod(0o600)
+
+        with pytest.raises(
+            server_config.ConfigError,
+            match="refusing automatic HERMES_SIGSTORE_PACKAGE_VERSION migration",
+        ):
+            init_existing(canonical)
+
+        assert canonical.read_text() == original
+
+
 def test_legacy_hermes_apt_closure_migrates_once_and_replay_is_idempotent() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         canonical = Path(temporary) / "platform.env"

@@ -79,7 +79,7 @@ class DependencyContractTests(unittest.TestCase):
     def test_embedded_sigstore_identity_and_license_mapping_are_exact(self) -> None:
         artifacts = module.license_artifacts(ROOT, self.lock)
         self.assertIn(
-            "HERMES_SIGSTORE_VERIFIER_IMAGE/sigstore@3.0.0",
+            "HERMES_SIGSTORE_VERIFIER_IMAGE/sigstore@3.1.0",
             artifacts["embeddedImagePackages"],
         )
         self.assertEqual(
@@ -87,7 +87,7 @@ class DependencyContractTests(unittest.TestCase):
             "Apache-2.0",
         )
         self.assertEqual(
-            self.licenses["components"]["sigstore-js"]["sourceRef"], "v3.0.0"
+            self.licenses["components"]["sigstore-js"]["sourceRef"], "v3.1.0"
         )
 
     def test_embedded_image_package_version_drift_is_rejected(self) -> None:
@@ -375,7 +375,7 @@ class DependencyContractTests(unittest.TestCase):
         lock = copy.deepcopy(self.lock)
         lock["pythonDistributions"]["hermes-agent"][
             "sigstoreVerifierPackageVersion"
-        ] = "3.0.1"
+        ] = "3.1.1"
         findings: list[dict[str, str]] = []
         module.validate_python_distributions(ROOT, lock, findings)
         self.assertIn(

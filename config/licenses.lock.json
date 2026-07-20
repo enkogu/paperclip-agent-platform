@@ -252,8 +252,8 @@
     "sigstore-js": {
       "decision": "approved-oss",
       "licenseExpression": "Apache-2.0",
-      "sourceRef": "v3.0.0",
-      "sourceUrl": "https://github.com/sigstore/sigstore-js/tree/v3.0.0"
+      "sourceRef": "v3.1.0",
+      "sourceUrl": "https://github.com/sigstore/sigstore-js/tree/v3.1.0"
     },
     "aws-sdk-js-v3": {
       "decision": "approved-oss",
@@ -377,7 +377,7 @@
     {"scope": "composeSeedImages", "pattern": "^MTE_SEARXNG_VALKEY_IMAGE$", "component": "valkey"},
     {"scope": "composeSeedImages", "pattern": "^MTE_TOOLHIVE_(TOOLHIVE|TOOL_RUNTIME)_IMAGE$", "component": "oci-mixed-open-source"},
 
-    {"scope": "embeddedImagePackages", "pattern": "^HERMES_SIGSTORE_VERIFIER_IMAGE/sigstore@3\\.0\\.0$", "component": "sigstore-js"},
+    {"scope": "embeddedImagePackages", "pattern": "^HERMES_SIGSTORE_VERIFIER_IMAGE/sigstore@3\\.1\\.0$", "component": "sigstore-js"},
     {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@paperclipai/plugin-daytona@0\\.1\\.0$", "component": "paperclip-daytona-plugin"},
     {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@daytonaio/sdk@0\\.175\\.0$", "component": "daytona-sdk"},
     {"scope": "embeddedImagePackages", "pattern": "^MTE_PAPERCLIP_IMAGE/@aws-sdk/client-s3@3\\.1075\\.0$", "component": "aws-sdk-js-v3"},

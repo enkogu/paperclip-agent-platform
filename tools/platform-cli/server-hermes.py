@@ -57,14 +57,14 @@ HERMES_SIGSTORE_BUNDLE_SHA256 = (
     "20cea7962a0773b21c75652845742ae5d414632864cd08684993f286f486c0ad"
 )
 HERMES_SIGNER_REPOSITORY = "NousResearch/hermes-agent"
-HERMES_SIGNER_WORKFLOW = "release.yml"
-HERMES_SIGNER_IDENTITY = "https://github.com/NousResearch/hermes-agent/.github/workflows/release.yml@refs/tags/v2026.7.7.2"
+HERMES_SIGNER_WORKFLOW = "upload_to_pypi.yml"
+HERMES_SIGNER_IDENTITY = "https://github.com/NousResearch/hermes-agent/.github/workflows/upload_to_pypi.yml@refs/tags/v2026.7.7.2"
 HERMES_SIGNER_TAG_REF = "refs/tags/v2026.7.7.2"
 HERMES_SIGNER_ISSUER = "https://token.actions.githubusercontent.com"
 PYPI_PUBLISH_ATTESTATION_TYPE = "https://docs.pypi.org/attestations/publish/v1"
 SIGSTORE_BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
 SUPPLY_CHAIN_MANIFEST_SHA256 = (
-    "df6813bc80d4ee3a3716ea15dde9551de658a60a8e7499ea4e447eb7a52469c1"
+    "3eb63f732658b2ec897314e16d0e9e90049cc776555a746b48ad5db8629aa54c"
 )
 OPERATOR_MODES = frozenset({"unprivileged_service", "unrestricted_host_repair"})
 
@@ -464,6 +464,8 @@ def run_sigstore_verifier(
             "/tmp:rw,noexec,nosuid,size=16m",
             "--tmpfs",
             "/root/.sigstore:rw,noexec,nosuid,size=16m",
+            "--tmpfs",
+            "/root/.local:rw,noexec,nosuid,size=16m",
             verifier_image,
             "node",
             "-e",

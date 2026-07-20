@@ -560,9 +560,9 @@ class HermesInstallerTests(unittest.TestCase):
                     {"wheelSize": len(wheel_bytes)},
                     workspace,
                     {
-                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                         + "0" * 64,
-                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                     },
                 )
 
@@ -637,7 +637,7 @@ class HermesInstallerTests(unittest.TestCase):
                                 "publisher": {
                                     "kind": "GitHub",
                                     "repository": self.installer.HERMES_SIGNER_REPOSITORY,
-                                    "workflow": "release.yml",
+                        "workflow": "upload_to_pypi.yml",
                                 },
                                 "attestations": [
                                     {
@@ -682,9 +682,9 @@ class HermesInstallerTests(unittest.TestCase):
                     sigstore,
                     workspace,
                     {
-                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                         + "0" * 64,
-                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                     },
                 )
                 self.installer.verify_pypi_provenance(
@@ -696,9 +696,9 @@ class HermesInstallerTests(unittest.TestCase):
                 sigstore,
                 workspace,
                 {
-                    "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                    "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                     + "0" * 64,
-                    "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                    "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                 },
             )
 
@@ -721,17 +721,19 @@ class HermesInstallerTests(unittest.TestCase):
                     bundle,
                     workspace,
                     {
-                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                         + "0" * 64,
-                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                     },
                 )
 
         argv = command.call_args.args[0]
-        self.assertIn("node:22-bookworm@sha256:" + "0" * 64, argv)
+        self.assertIn("node:24.3.0-bookworm@sha256:" + "0" * 64, argv)
         self.assertIn(self.installer.HERMES_SIGNER_IDENTITY, argv)
         self.assertIn(self.installer.HERMES_SIGNER_ISSUER, argv)
-        self.assertIn("3.0.0", argv)
+        self.assertIn("3.1.0", argv)
+        self.assertEqual(self.installer.HERMES_SIGNER_WORKFLOW, "upload_to_pypi.yml")
+        self.assertIn("/root/.local:rw,noexec,nosuid,size=16m", argv)
         self.assertIn("ctLogThreshold: 1", self.installer.SIGSTORE_VERIFY_PROGRAM)
         self.assertIn("tlogThreshold: 1", self.installer.SIGSTORE_VERIFY_PROGRAM)
 
@@ -765,9 +767,9 @@ class HermesInstallerTests(unittest.TestCase):
                             bundle,
                             workspace,
                             {
-                                "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                                "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                                 + "0" * 64,
-                                "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                                "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                             },
                         )
 
@@ -829,9 +831,9 @@ class HermesInstallerTests(unittest.TestCase):
             ):
                 self.installer.install_venv(
                     {
-                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                         + "0" * 64,
-                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                     }
                 )
 
@@ -871,9 +873,9 @@ class HermesInstallerTests(unittest.TestCase):
             ):
                 self.installer.install_venv(
                     {
-                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:"
+                        "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:"
                         + "0" * 64,
-                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
+                        "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
                     }
                 )
 

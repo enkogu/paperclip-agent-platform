@@ -33,10 +33,10 @@ Install downloads that exact wheel into a mode `0600` temporary directory and
 verifies its size and SHA-256 before pip sees it. The PyPI publish attestation
 and the upstream Sigstore bundle are downloaded beside it. Cryptographic
 verification uses the official Sigstore JS verifier shipped in the existing
-digest-pinned `node:22-bookworm` platform image; it requires Sigstore package
-`3.0.0` and rejects any other embedded version. The verifier applies the
+digest-pinned `node:24.3.0-bookworm` platform image; it requires Sigstore package
+`3.1.0` and rejects any other embedded version. The verifier applies the
 Fulcio chain and CT-log checks, Rekor signed-entry/inclusion checks, and the
-exact `release.yml@refs/tags/v2026.7.7.2` GitHub Actions identity and issuer.
+exact `upload_to_pypi.yml@refs/tags/v2026.7.7.2` GitHub Actions identity and issuer.
 This image reuse is the smallest locked standard-verifier dependency; no
 project-specific certificate or transparency-log crypto is implemented. The
 image may need to be pulled by immutable digest, and Sigstore TUF may refresh

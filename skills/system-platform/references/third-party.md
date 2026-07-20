@@ -76,7 +76,7 @@ supplied MiniMax upstream credential root-only.
   command and performs no source build, npm install, `node_modules` patch,
   tool-volume mutation, loopback proxy, or command wrapper.
 - Hermes provenance verification calls the exact Apache-2.0 `sigstore`
-  JavaScript package `3.0.0` already shipped by the digest-pinned Node verifier
+  JavaScript package `3.1.0` already shipped by the digest-pinned Node verifier
   image. The verifier package identity is an explicit direct-artifact license
   mapping; it is not a mutable `npm install` step.
 - Firecrawl uses its three official AGPL-3.0 GHCR images for the API,

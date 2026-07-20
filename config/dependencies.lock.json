@@ -256,7 +256,7 @@
       ]
     },
     "HERMES_SIGSTORE_VERIFIER_IMAGE": {
-      "ref": "node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
+      "ref": "node:24.3.0-bookworm@sha256:256a2e7037e745228f7630d578e6c1d327ab4c0a8e401c63d0d4d9dfb3c13465",
       "declarations": [
         {
           "path": "tools/platform-cli/server-config.py",
@@ -273,7 +273,7 @@
     "hermes-sigstore-js": {
       "imageKey": "HERMES_SIGSTORE_VERIFIER_IMAGE",
       "packageName": "sigstore",
-      "version": "3.0.0",
+      "version": "3.1.0",
       "versionKey": "HERMES_SIGSTORE_PACKAGE_VERSION",
       "modulePath": "/usr/local/lib/node_modules/npm/node_modules",
       "consumer": "tools/platform-cli/server-hermes.py"
@@ -511,20 +511,20 @@
       ],
       "wheelDownload": "hermes-agent-wheel",
       "pypiProvenanceUrl": "https://pypi.org/integrity/hermes-agent/0.18.2/hermes_agent-0.18.2-py3-none-any.whl/provenance",
-      "signerIdentity": "https://github.com/NousResearch/hermes-agent/.github/workflows/release.yml@refs/tags/v2026.7.7.2",
+      "signerIdentity": "https://github.com/NousResearch/hermes-agent/.github/workflows/upload_to_pypi.yml@refs/tags/v2026.7.7.2",
       "signerIssuer": "https://token.actions.githubusercontent.com",
       "signerRepository": "NousResearch/hermes-agent",
       "signerTagRef": "refs/tags/v2026.7.7.2",
-      "sigstoreVerifierPackageVersion": "3.0.0",
+      "sigstoreVerifierPackageVersion": "3.1.0",
       "sigstoreBundleDownload": "hermes-agent-sigstore-bundle",
       "manifest": "deployment/services/hermes/supply-chain.lock.json",
-      "manifestSha256": "df6813bc80d4ee3a3716ea15dde9551de658a60a8e7499ea4e447eb7a52469c1",
+      "manifestSha256": "3eb63f732658b2ec897314e16d0e9e90049cc776555a746b48ad5db8629aa54c",
       "requirements": "deployment/services/hermes/requirements-messaging.lock",
       "requirementsSha256": "cdd060f00da533c59d989a3e7489a02adabe3afabdfdb789c05a70f51ed16959",
       "canonicalPackagesKey": "HERMES_APT_PACKAGES",
       "consumer": "tools/platform-cli/server-hermes.py",
       "projectionConsumer": "tools/platform-cli/platform.py",
-      "sigstoreVerifierImage": "node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37"
+      "sigstoreVerifierImage": "node:24.3.0-bookworm@sha256:256a2e7037e745228f7630d578e6c1d327ab4c0a8e401c63d0d4d9dfb3c13465"
     }
   },
   "signedRepositories": {

@@ -416,6 +416,11 @@ REVIEWED_CANONICAL_VALUE_MIGRATIONS = {
 # deployment has already started.
 GOVERNED_CANONICAL_VALUE_MIGRATIONS = {
     "PAPERCLIP_DAYTONA_SDK_VERSION": ("0.171.0", "0.175.0"),
+    "HERMES_SIGSTORE_PACKAGE_VERSION": ("3.0.0", "3.1.0"),
+    "HERMES_SIGSTORE_VERIFIER_IMAGE": (
+        "node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
+        "node:24.3.0-bookworm@sha256:256a2e7037e745228f7630d578e6c1d327ab4c0a8e401c63d0d4d9dfb3c13465",
+    ),
     # A release script is executable deployment code.  Unlike ordinary
     # compatibility values, accept only the immediately prior reviewed digest
     # so a custom canonical override cannot be silently replaced.
@@ -830,8 +835,8 @@ ONE_TIME_MIGRATION_SEEDS = {
     "HERMES_SIGSTORE_BUNDLE_SHA256": (
         "20cea7962a0773b21c75652845742ae5d414632864cd08684993f286f486c0ad"
     ),
-    "HERMES_SIGSTORE_PACKAGE_VERSION": "3.0.0",
-    "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37",
+    "HERMES_SIGSTORE_PACKAGE_VERSION": "3.1.0",
+    "HERMES_SIGSTORE_VERIFIER_IMAGE": "node:24.3.0-bookworm@sha256:256a2e7037e745228f7630d578e6c1d327ab4c0a8e401c63d0d4d9dfb3c13465",
     "HERMES_TELEGRAM_EXCLUSIVE_BOT_MENTIONS": "true",
     "HERMES_TELEGRAM_GUEST_MODE": "false",
     "HERMES_TELEGRAM_NOTIFICATIONS": "important",
