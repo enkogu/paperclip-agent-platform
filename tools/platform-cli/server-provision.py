@@ -2796,7 +2796,7 @@ def paperclip_adapter_binding_ready(
 def paperclip_e2e_workspace_contract(ctx: Context) -> dict[str, Any]:
     """Return the supported Paperclip project workspace for the E2E target."""
 
-    e2e = ctx.config.get("spec", {}).get("e2e", {})
+    e2e = ctx.config.get("spec", {}).get("e2eCanary", {})
     refs = {
         "owner": str(e2e.get("githubOwnerRef") or ""),
         "repository": str(e2e.get("githubRepositoryRef") or ""),

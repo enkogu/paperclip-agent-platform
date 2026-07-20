@@ -496,7 +496,7 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
         return self.module.Context(
             config={
                 "spec": {
-                    "e2e": {
+                    "e2eCanary": {
                         "githubOwnerRef": "E2E_GITHUB_OWNER",
                         "githubRepositoryRef": "E2E_GITHUB_REPOSITORY",
                         "baseBranchRef": "E2E_GITHUB_BASE_BRANCH",
@@ -591,6 +591,28 @@ class PaperclipDeclarativeBindingTests(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_e2e_project_workspace_contract_uses_canonical_e2e_canary_section(self):
+        canonical = yaml.safe_load((ROOT / "config/platform.yaml").read_text())
+        e2e = canonical["spec"]["e2eCanary"]
+        ctx = self.module.Context(
+            config=canonical,
+            platform_env={
+                e2e["githubOwnerRef"]: "enkogu",
+                e2e["githubRepositoryRef"]: "aesthetic-diagrams",
+                e2e["baseBranchRef"]: "main",
+            },
+            mutate=False,
+            strict=True,
+        )
+
+        contract = self.module.paperclip_e2e_workspace_contract(ctx)
+
+        self.assertEqual(
+            contract["repoUrl"],
+            "https://github.com/enkogu/aesthetic-diagrams.git",
+        )
+        self.assertEqual(contract["defaultRef"], "main")
 
     def test_e2e_project_workspace_reconcile_is_read_before_write_idempotent(self):
         ctx = self.context()
