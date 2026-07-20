@@ -801,11 +801,11 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
         self.assertNotIn("MTE_DAYTONA_PLUGIN_NPM_", source)
         self.assertNotIn("/tools/node_modules", source)
         self.assertIn("fs.realpathSync('/app')", source)
-        self.assertIn("if (absolute === dependencyDirectory) continue;", source)
+        self.assertIn("relative.split(path.sep).includes('node_modules')", source)
         self.assertIn("unsupported Daytona plugin file type", source)
         self.assertIn("package-files-excluding-node_modules", source)
         self.assertLess(
-            source.index("if (absolute === dependencyDirectory) continue;"),
+            source.index("relative.split(path.sep).includes('node_modules')"),
             source.index("unsupported Daytona plugin file type"),
         )
 

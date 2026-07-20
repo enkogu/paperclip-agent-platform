@@ -1950,14 +1950,14 @@ const manifestBytes = fs.readFileSync(manifestPath);
 const manifest = JSON.parse(manifestBytes.toString('utf8'));
 if (manifest.name !== '@paperclipai/plugin-daytona') process.exit(4);
 const files = [];
-const dependencyDirectory = path.join(current, 'node_modules');
 function walk(directory) {
   for (const entry of fs.readdirSync(directory, {withFileTypes: true})) {
     const absolute = path.join(directory, entry.name);
-    // pnpm may make the package's own node_modules a symlink. Its dependency
-    // forest is not part of the immutable plugin payload; never traverse it.
-    // Symlinks anywhere else remain a fail-closed condition.
-    if (absolute === dependencyDirectory) continue;
+    // pnpm may create nested node_modules symlinks. Dependency forests are not
+    // part of the immutable plugin payload, so never traverse a node_modules
+    // subtree. Symlinks anywhere else remain a fail-closed condition.
+    const relative = path.relative(current, absolute);
+    if (relative.split(path.sep).includes('node_modules')) continue;
     if (entry.isDirectory()) walk(absolute);
     else if (entry.isFile()) files.push(path.relative(current, absolute));
     else throw new Error(`unsupported Daytona plugin file type: ${absolute}`);
