@@ -81,16 +81,19 @@ def syft_platform_image_identity(
 
     Buildx publishes the signed image index, while Syft scans its selected
     platform manifest. Syft preserves the index as the source version but
-    emits the selected manifest digest and architecture in the root package
-    PURL/checksum. Callers must derive ``manifest_digest`` from the
-    index-selected manifest before trusting this identity.
+    emits the selected manifest digest in the root package PURL/checksum.
+    The registry source does not populate the PURL ``arch`` qualifier, so the
+    exact expected qualifier is the empty value it emits. The workflow still
+    verifies the selected linux/amd64 member independently before calling
+    Syft. Callers must derive ``manifest_digest`` from that selected manifest
+    before trusting this identity.
     """
 
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest_digest):
         raise ValueError(
             f"platform manifest is not a sha256 digest: {manifest_digest!r}"
         )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", architecture):
+    if architecture != "":
         raise ValueError(f"invalid platform architecture: {architecture!r}")
     index_identity = image_identity(ref)
     name = index_identity["root_name"]

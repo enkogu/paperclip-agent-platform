@@ -232,7 +232,7 @@ jobs:
           identity = module.syft_platform_image_identity(
               f'{os.environ["IMAGE_NAME"]}@{os.environ["IMAGE_DIGEST"]}',
               manifest_digest=os.environ["PLATFORM_MANIFEST_DIGEST"],
-              architecture="amd64",
+              architecture="",
           )
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               for key, value in identity.items():

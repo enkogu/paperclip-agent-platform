@@ -501,19 +501,25 @@ class CiSupplyChainTests(unittest.TestCase):
         identity = targets.syft_platform_image_identity(
             "ghcr.io/example/harness@" + index_digest,
             manifest_digest=manifest_digest,
-            architecture="amd64",
+            architecture="",
         )
 
         self.assertEqual(identity["root_name"], "harness")
         self.assertEqual(identity["root_version"], index_digest)
         self.assertEqual(identity["digest"], manifest_digest)
         self.assertEqual(
-            identity["purl"], f"pkg:oci/harness@sha256%3A{'b' * 64}?arch=amd64"
+            identity["purl"], f"pkg:oci/harness@sha256%3A{'b' * 64}?arch="
         )
         with self.assertRaisesRegex(ValueError, "platform manifest"):
             targets.syft_platform_image_identity(
                 "ghcr.io/example/harness@" + index_digest,
                 manifest_digest="not-a-digest",
+                architecture="",
+            )
+        with self.assertRaisesRegex(ValueError, "platform architecture"):
+            targets.syft_platform_image_identity(
+                "ghcr.io/example/harness@" + index_digest,
+                manifest_digest=manifest_digest,
                 architecture="amd64",
             )
 
