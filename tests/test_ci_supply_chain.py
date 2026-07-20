@@ -98,6 +98,14 @@ class CiSupplyChainTests(unittest.TestCase):
         )
         self.assertNotIn("--certificate-identity-regexp", workflow)
         self.assertIn("anchore/sbom-action@", workflow)
+        sbom_generation = workflow.split(
+            "- name: Generate a digest-bound SPDX SBOM", 1
+        )[1].split("- id: sbom-identity", 1)[0]
+        self.assertIn("SYFT_SOURCE_NAME: paperclip-daytona-harness", sbom_generation)
+        self.assertIn(
+            "SYFT_SOURCE_VERSION: ${{ steps.build.outputs.digest }}",
+            sbom_generation,
+        )
         self.assertIn("tools/platform-cli/verify-sbom.py", workflow)
         self.assertIn("--expected-root-purl", workflow)
         self.assertIn("--expected-digest", workflow)
