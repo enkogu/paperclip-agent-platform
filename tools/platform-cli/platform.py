@@ -1160,6 +1160,8 @@ def _materialize_sync_bundle(cfg: dict[str, Any], bundle: Path, rendered: Path) 
     file_projections = {
         "manifests/kestra/application.yaml": KESTRA_SERVICE_ROOT / "application.yaml",
         "deployment/compose.yaml": ROOT / "deployment/compose.yaml",
+        "deployment/scripts/compose-remote.sh": ROOT
+        / "deployment/scripts/compose-remote.sh",
         "config/services/kestra/application.yaml": KESTRA_SERVICE_ROOT
         / "application.yaml",
         "config/services/searxng/settings.yml": SEARXNG_SERVICE_ROOT / "settings.yml",

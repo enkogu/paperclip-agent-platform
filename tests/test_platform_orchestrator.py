@@ -2027,6 +2027,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         self.assertTrue(all("--delete" in command for command in commands))
         expected_paths = {
             "deployment/compose.yaml",
+            "deployment/scripts/compose-remote.sh",
             "templates/profiles/profiles.yaml",
             "runtime/paperclip/profiles/skills/verification-before-completion/SKILL.md",
             "templates/platform.json",

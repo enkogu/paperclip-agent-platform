@@ -10,6 +10,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_SCRIPT = ROOT / "deployment/scripts/compose.sh"
+COMPOSE_REMOTE_SCRIPT = ROOT / "deployment/scripts/compose-remote.sh"
 RENDERER_PATH = ROOT / "tools/platform-cli/render-cloudflare.py"
 
 
@@ -24,24 +25,21 @@ def load_renderer():
 
 
 def remote_compose_script() -> str:
-    source = COMPOSE_SCRIPT.read_text()
-    marker = "<<'REMOTE'\n"
-    return source.split(marker, 1)[1].rsplit("\nREMOTE", 1)[0]
+    return COMPOSE_REMOTE_SCRIPT.read_text()
 
 
-def test_compose_ssh_transport_uses_a_cleaned_regular_file_for_stdin():
+def test_compose_ssh_transport_reads_the_checked_in_helper_directly():
     source = COMPOSE_SCRIPT.read_text()
     transport = source.rsplit('\nssh "${ssh_options[@]}"', 1)[1]
 
-    assert 'remote_script=$(umask 077; mktemp ' in source
-    assert 'cat >"$remote_script" <<\'REMOTE\'' in source
+    assert "<<" not in source
+    assert 'remote_script="$ROOT/deployment/scripts/compose-remote.sh"' in source
     assert '<"$remote_script"' in transport
-    assert source.index('cat >"$remote_script"') < source.rindex(
-        '\nssh "${ssh_options[@]}"'
+    remote_source = COMPOSE_REMOTE_SCRIPT.read_text()
+    assert "<<" not in remote_source
+    assert remote_source.startswith(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
     )
-    assert 'rm -f -- "$remote_script"' in source
-    assert "trap cleanup_remote_script EXIT" in source
-    assert '"${services[@]}" <<\'REMOTE\'' not in source
 
 
 def test_cloudflare_canonical_environment_wins_over_ambient_and_is_not_backfilled():
