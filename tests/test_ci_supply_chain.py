@@ -125,6 +125,14 @@ class CiSupplyChainTests(unittest.TestCase):
         )
         self.assertIn("syft_platform_image_identity", workflow)
         self.assertIn("PLATFORM_IMAGE_DIGEST", workflow)
+        self.assertIn(
+            '--expected-digest "${{ steps.sbom-identity.outputs.digest }}"',
+            workflow,
+        )
+        self.assertIn(
+            "Report the generated SPDX root identity on verification failure", workflow
+        )
+        self.assertIn("if: failure()", workflow)
         self.assertIn("tools/platform-cli/verify-sbom.py", workflow)
         self.assertIn("--expected-root-purl", workflow)
         self.assertIn("--expected-digest", workflow)

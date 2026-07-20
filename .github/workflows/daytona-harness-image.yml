@@ -237,8 +237,53 @@ jobs:
             --expected-root-name "${{ steps.sbom-identity.outputs.root_name }}" \
             --expected-root-version "${{ steps.sbom-identity.outputs.root_version }}" \
             --expected-root-purl "${{ steps.sbom-identity.outputs.purl }}" \
-            --expected-digest "$IMAGE_DIGEST" \
+            --expected-digest "${{ steps.sbom-identity.outputs.digest }}" \
             daytona-harness-"$SOURCE_REVISION".spdx.json
+
+      - name: Report the generated SPDX root identity on verification failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          document = json.loads(
+              Path(f'daytona-harness-{os.environ["SOURCE_REVISION"]}.spdx.json').read_text()
+          )
+          packages = {
+              package.get("SPDXID"): package
+              for package in document.get("packages", [])
+              if isinstance(package, dict)
+          }
+          roots = [
+              packages[relationship.get("relatedSpdxElement")]
+              for relationship in document.get("relationships", [])
+              if isinstance(relationship, dict)
+              and relationship.get("spdxElementId") == "SPDXRef-DOCUMENT"
+              and relationship.get("relationshipType") == "DESCRIBES"
+              and relationship.get("relatedSpdxElement") in packages
+          ]
+          if len(roots) != 1:
+              raise SystemExit("generated SPDX document has no unique root to report")
+          root = roots[0]
+          print(
+              json.dumps(
+                  {
+                      "checksums": root.get("checksums", []),
+                      "name": root.get("name"),
+                      "purls": [
+                          ref.get("referenceLocator")
+                          for ref in root.get("externalRefs", [])
+                          if isinstance(ref, dict) and ref.get("referenceType") == "purl"
+                      ],
+                      "version": root.get("versionInfo"),
+                  },
+                  sort_keys=True,
+              )
+          )
+          PY
 
       - name: Emit the deploy input and provenance receipt
         env:
