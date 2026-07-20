@@ -174,6 +174,48 @@ def test_host_has_one_canonical_pinned_bootstrap_path() -> None:
     assert "incompatible shared network: mte-control" in host_step
 
 
+def test_host_control_network_ignores_ambient_values(tmp_path: Path) -> None:
+    source = HOST_STEP.read_text()
+    function_body = source.split("canonical_value() {", 1)[1].split(
+        "\n}\n\nfail()", 1
+    )[0]
+    assignments = [
+        line
+        for line in source.splitlines()
+        if line
+        in {
+            "MTE_CONTROL_NETWORK_SUBNET=$(canonical_value MTE_CONTROL_NETWORK_SUBNET)",
+            "MTE_CONTROL_NETWORK_GATEWAY=$(canonical_value MTE_CONTROL_NETWORK_GATEWAY)",
+        }
+    ]
+    assert len(assignments) == 2
+
+    canonical = tmp_path / "platform.env"
+    canonical.write_text(
+        "MTE_CONTROL_NETWORK_SUBNET=172.30.0.0/16\n"
+        "MTE_CONTROL_NETWORK_GATEWAY=172.30.0.1\n"
+    )
+    script = (
+        "set -euo pipefail\n"
+        f"CONFIG={str(canonical)!r}\n"
+        f"canonical_value() {{{function_body}\n}}\n"
+        + "\n".join(assignments)
+        + "\nprintf '%s\\n' \"$MTE_CONTROL_NETWORK_SUBNET\" \"$MTE_CONTROL_NETWORK_GATEWAY\"\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            **os.environ,
+            "MTE_CONTROL_NETWORK_SUBNET": "10.0.0.0/8",
+            "MTE_CONTROL_NETWORK_GATEWAY": "10.0.0.1",
+        },
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.splitlines() == ["172.30.0.0/16", "172.30.0.1"]
+
+
 def test_paperclip_runtime_uses_the_immutable_image_native_entrypoint():
     source = PAPERCLIP.read_text()
     assert "MTE_PAPERCLIP_IMAGE" in source

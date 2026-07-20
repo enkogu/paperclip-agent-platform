@@ -674,6 +674,46 @@ class PlatformOrchestratorTests(unittest.TestCase):
             text=True,
         )
 
+    def test_host_bootstrap_seed_merge_is_clean_and_replay_idempotent(self):
+        cfg = {
+            "spec": {
+                "host": {
+                    "ssh": "root@example.test",
+                    "secretsRoot": "/root/.config/mte-secrets",
+                }
+            }
+        }
+        command = platform.host_bootstrap_env_command(cfg)
+        start = command.index("awk -F= '\n    NR == FNR {") + len("awk -F= '")
+        end = command.index('\' "$incoming" "$existing" >"$merged"', start)
+        merge_program = command[start:end]
+        seeds = platform.host_bootstrap_seeds()
+        payload = "".join(f"{key}={seeds[key]}\n" for key in sorted(seeds))
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            incoming = root / "incoming.env"
+            empty = root / "empty.env"
+            first = root / "first.env"
+            incoming.write_text(payload)
+            empty.write_text("")
+            first_output = subprocess.run(
+                ["awk", "-F=", merge_program, incoming, empty],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            first.write_text(first_output)
+            replay = subprocess.run(
+                ["awk", "-F=", merge_program, incoming, first],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+
+        self.assertEqual(first_output, payload)
+        self.assertEqual(replay, payload)
+
     def test_host_bootstrap_materializes_frozen_contract_before_script(self):
         cfg = {
             "spec": {
