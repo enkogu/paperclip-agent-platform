@@ -2524,23 +2524,34 @@ def cloudflare_access_policy_bootstrap_command(iac_root: str, api_env: str) -> s
     OpenTofu state that is still attached to remote Access applications.  A
     full apply would otherwise attempt that deletion before the REST
     application reconciler can bind the current named policies.  Target only
-    the replacement policy/token graph, reconcile applications, then perform
-    a fresh full plan and apply.  Re-running this is a no-op after the first
-    successful migration.
+    the current named policy instances: targeting the whole ``service``
+    resource would also select a legacy ``service[0]`` state entry.  Each
+    policy target brings its matching token dependency.  Reconcile applications
+    next, then perform a fresh full plan and apply.  Re-running this is a
+    no-op after the first successful migration.
     """
-    targets = (
-        "-target=cloudflare_zero_trust_access_policy.human",
-        "-target=cloudflare_zero_trust_access_service_token.service",
-        "-target=cloudflare_zero_trust_access_policy.service",
-    )
-    return tofu_command(
+    tfvars = shlex.quote(iac_root + "/terraform.tfvars.json")
+    apply = tofu_command(
         iac_root,
         api_env,
         "apply",
         "-input=false",
         "-no-color",
         "-auto-approve",
-        *targets,
+    )
+    human_target = shlex.quote(
+        "-target=cloudflare_zero_trust_access_policy.human[0]"
+    )
+    return (
+        "set -eu; set -f; "
+        f"if jq -e '.apps | any(.[]; .access_class == \"human\")' {tfvars} "
+        f">/dev/null; then {apply} {human_target}; fi; "
+        f"jq -r '.apps | to_entries[] | select(.value.access_class == \"service\") "
+        f"| .key' {tfvars} | while IFS= read -r service_id; do "
+        'case "$service_id" in ""|-*|*-|*--*|*[!a-z0-9-]*) '
+        'echo "unsafe Cloudflare service app id" >&2; exit 1 ;; esac; '
+        f'{apply} "-target=cloudflare_zero_trust_access_policy.service[\\"$service_id\\"]"; '
+        "done"
     )
 
 

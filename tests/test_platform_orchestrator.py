@@ -2533,23 +2533,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
             platform.run_cloudflare(cfg, "apply")
 
         self.assertEqual(len(commands), 4)
-        bootstrap_call = next(
-            call
-            for call in tofu_calls
-            if "-target=cloudflare_zero_trust_access_policy.human" in call
-        )
-        self.assertEqual(
-            set(
-                value
-                for value in bootstrap_call
-                if value.startswith("-target=cloudflare_zero_trust_access_")
-            ),
-            {
-                "-target=cloudflare_zero_trust_access_policy.human",
-                "-target=cloudflare_zero_trust_access_service_token.service",
-                "-target=cloudflare_zero_trust_access_policy.service",
-            },
-        )
+        bootstrap_call = next(call for call in tofu_calls if "apply" in call)
         self.assertIn("server-cloudflare-access.py", commands[1])
         bootstrap_index = tofu_calls.index(bootstrap_call)
         first_access_output_index = next(
@@ -2563,7 +2547,7 @@ class PlatformOrchestratorTests(unittest.TestCase):
         full_apply_index = next(
             index
             for index, call in enumerate(tofu_calls)
-            if "apply" in call and not any(value.startswith("-target=") for value in call)
+            if "apply" in call and index > first_full_plan_index
         )
         self.assertLess(bootstrap_index, first_access_output_index)
         self.assertLess(first_access_output_index, first_full_plan_index)
@@ -2578,7 +2562,19 @@ class PlatformOrchestratorTests(unittest.TestCase):
         with mock.patch.object(platform, "tofu_command", return_value="tofu") as tofu:
             command = platform.cloudflare_access_policy_bootstrap_command("/iac", "/api.env")
 
-        self.assertEqual(command, "tofu")
+        self.assertIn("jq -e", command)
+        self.assertIn("cloudflare_zero_trust_access_policy.human[0]", command)
+        self.assertIn(
+            'cloudflare_zero_trust_access_policy.service[\\"$service_id\\"]',
+            command,
+        )
+        self.assertNotIn("cloudflare_zero_trust_access_policy.service[0]", command)
+        self.assertNotIn(
+            "-target=cloudflare_zero_trust_access_policy.service ", command
+        )
+        self.assertNotIn(
+            "-target=cloudflare_zero_trust_access_service_token.service", command
+        )
         self.assertEqual(
             tofu.call_args.args,
             (
@@ -2588,9 +2584,6 @@ class PlatformOrchestratorTests(unittest.TestCase):
                 "-input=false",
                 "-no-color",
                 "-auto-approve",
-                "-target=cloudflare_zero_trust_access_policy.human",
-                "-target=cloudflare_zero_trust_access_service_token.service",
-                "-target=cloudflare_zero_trust_access_policy.service",
             ),
         )
 
@@ -2633,19 +2626,8 @@ class PlatformOrchestratorTests(unittest.TestCase):
         ):
             platform.run_cloudflare(cfg, "apply")
 
-        self.assertTrue(
-            any(
-                "-target=cloudflare_zero_trust_access_policy.human" in call
-                for call in tofu_calls
-            )
-        )
+        self.assertEqual(sum("apply" in call for call in tofu_calls), 1)
         self.assertFalse(any("plan" in call for call in tofu_calls))
-        self.assertFalse(
-            any(
-                "apply" in call and not any(value.startswith("-target=") for value in call)
-                for call in tofu_calls
-            )
-        )
 
     def test_cloudflare_access_failure_never_publishes_dns(self):
         cfg = {"spec": {}}
