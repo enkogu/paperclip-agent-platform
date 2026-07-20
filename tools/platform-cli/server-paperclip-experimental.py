@@ -821,10 +821,19 @@ def validate_daytona_runtime_evidence(
                 "generatedAt",
                 "producerSha256",
                 "canonicalSourceSha256",
+                "controlPlane",
+                "sandboxVersion",
                 "composeServices",
                 "runtimeEvidence",
                 "secretValuesPrinted",
             }
+            or payload.get("controlPlane")
+            != {
+                "version": values.get("MTE_DAYTONA_CONTROL_PLANE_VERSION"),
+                "sourceCommit": values.get("MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"),
+            }
+            or payload.get("sandboxVersion")
+            != values.get("MTE_DAYTONA_SANDBOX_VERSION")
             or payload.get("composeServices") != expected_services
             or payload.get("runtimeEvidence")
             != {

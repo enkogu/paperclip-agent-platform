@@ -1365,6 +1365,11 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
             "generatedAt": "2026-07-18T00:00:00Z",
             "producerSha256": "1" * 64,
             "canonicalSourceSha256": "2" * 64,
+            "controlPlane": {
+                "version": values["MTE_DAYTONA_CONTROL_PLANE_VERSION"],
+                "sourceCommit": values["MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"],
+            },
+            "sandboxVersion": values["MTE_DAYTONA_SANDBOX_VERSION"],
             "composeServices": [
                 "agent-gateway",
                 "api",
@@ -1391,6 +1396,55 @@ class PaperclipExperimentalEvidenceTests(unittest.TestCase):
             module.validate_daytona_runtime_evidence(
                 payload, "PaperclipDaytonaControlPlaneEvidence", values
             )
+
+    def test_control_plane_evidence_rejects_missing_extra_and_stale_schemas(self):
+        values = canonical_values()
+        current = {
+            "apiVersion": module.API_VERSION,
+            "kind": "PaperclipDaytonaControlPlaneEvidence",
+            "status": "ready",
+            "generatedAt": "2026-07-18T00:00:00Z",
+            "producerSha256": "1" * 64,
+            "canonicalSourceSha256": "2" * 64,
+            "controlPlane": {
+                "version": values["MTE_DAYTONA_CONTROL_PLANE_VERSION"],
+                "sourceCommit": values["MTE_DAYTONA_CONTROL_PLANE_SOURCE_COMMIT"],
+            },
+            "sandboxVersion": values["MTE_DAYTONA_SANDBOX_VERSION"],
+            "composeServices": [
+                "agent-gateway",
+                "api",
+                "db",
+                "dex",
+                "minio",
+                "proxy",
+                "redis",
+                "registry",
+                "runner",
+                "ssh-gateway",
+            ],
+            "runtimeEvidence": {
+                "images": str(module.EVIDENCE_ROOT / "daytona-images.json"),
+                "lifecycle": str(module.EVIDENCE_ROOT / "daytona-lifecycle.json"),
+            },
+            "secretValuesPrinted": False,
+        }
+        module.validate_daytona_runtime_evidence(
+            current, "PaperclipDaytonaControlPlaneEvidence", values
+        )
+        missing = dict(current)
+        missing.pop("sandboxVersion")
+        extra = {**current, "legacySchema": True}
+        stale = {
+            key: value
+            for key, value in current.items()
+            if key not in {"controlPlane", "sandboxVersion"}
+        }
+        for payload in (missing, extra, stale):
+            with self.assertRaises(module.ControlError):
+                module.validate_daytona_runtime_evidence(
+                    payload, "PaperclipDaytonaControlPlaneEvidence", values
+                )
 
     def test_company_secret_scope_requires_distinct_local_encrypted_records(self):
         company_id = "company-unit"
