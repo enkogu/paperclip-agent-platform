@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -628,6 +630,76 @@ def test_paperclip_runtime_passes_direct_daytona_upstream_without_proxy():
         '-e PAPERCLIP_DAYTONA_UPSTREAM_URL="$PAPERCLIP_DAYTONA_UPSTREAM_URL"' in source
     )
     assert "mte-daytona-loopback-proxy" not in source
+
+
+def _verify_private_route_membership(tmp_path: Path, members: list[str]) -> subprocess.CompletedProcess[str]:
+    source = PAPERCLIP.read_text()
+    python_source = source.split(
+        "    \"$PAPERCLIP_PORT\" \"$PAPERCLIP_DAYTONA_NETWORK\" \\\n"
+        "    \"$PAPERCLIP_DAYTONA_API_SERVICE\" \"$PAPERCLIP_DAYTONA_PROXY_SERVICE\" \"$mode\" \\\n"
+        "    \"$PAPERCLIP_LOG_MAX_SIZE\" \"$PAPERCLIP_LOG_MAX_FILES\" <<'PY'\n",
+        1,
+    )[1].split("\nPY\n\n  docker run", 1)[0]
+    fixture = tmp_path / ("membership-" + "-".join(members))
+    fixture.mkdir()
+    verifier = fixture / "verify-private-route.py"
+    verifier.write_text(python_source)
+    docker = fixture / "docker"
+    docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "command = sys.argv[1:]\n"
+        "if command == ['inspect', 'mte-paperclip']:\n"
+        "  print(json.dumps([{'HostConfig': {'NetworkMode': 'mte-control', 'PortBindings': {'3100/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '3100'}]}, 'ExtraHosts': None, 'LogConfig': {'Type': 'json-file', 'Config': {'max-size': '10m', 'max-file': '3'}}}, 'NetworkSettings': {'Networks': {'mte-control': {'Aliases': ['mte-paperclip']}, 'mte-daytona-api': {}}}}]))\n"
+        "elif command == ['network', 'inspect', 'mte-daytona-api']:\n"
+        "  members = json.loads(os.environ['MTE_TEST_NETWORK_MEMBERS'])\n"
+        "  print(json.dumps([{'Containers': {str(index): {'Name': name} for index, name in enumerate(members)}}]))\n"
+        "else:\n"
+        "  raise SystemExit(91)\n"
+    )
+    docker.chmod(0o700)
+    return subprocess.run(
+        [
+            sys.executable,
+            verifier,
+            "mte-control",
+            "mte-paperclip",
+            "3100",
+            "mte-daytona-api",
+            "mte-daytona-api",
+            "mte-daytona-proxy",
+            "strict",
+            "10m",
+            "3",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{fixture}:{os.environ['PATH']}",
+            "MTE_TEST_NETWORK_MEMBERS": json.dumps(members),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_paperclip_private_route_strict_network_membership_is_exact_three_member_set(
+    tmp_path: Path,
+) -> None:
+    expected = ["mte-paperclip", "mte-daytona-api", "mte-daytona-proxy"]
+    result = _verify_private_route_membership(tmp_path, expected)
+    assert result.returncode == 0, result.stderr
+
+    for invalid_members in (
+        ["mte-paperclip", "mte-daytona-api"],
+        [*expected, "mte-unapproved-container"],
+        ["mte-paperclip", "mte-daytona-api", "mte-daytona-runner"],
+    ):
+        result = _verify_private_route_membership(tmp_path, invalid_members)
+        assert result.returncode != 0
+        assert "API-only network membership drift" in result.stderr
 
 
 def test_kestra_is_reconciled_after_paperclip_service_key_provisioning():

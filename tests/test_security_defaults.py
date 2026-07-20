@@ -8,6 +8,8 @@ import stat
 import sys
 import tempfile
 import unittest
+
+import yaml
 from unittest import mock
 
 
@@ -355,12 +357,14 @@ class PaperclipAuthenticationContractTests(unittest.TestCase):
         daytona_compose = (
             ROOT / "deployment/services/daytona/compose.yaml"
         ).read_text()
+        daytona = yaml.safe_load(daytona_compose)
         canary = (ROOT / "workflows/kestra/platform-canary.yaml").read_text()
         e2e = (ROOT / "workflows/kestra/paperclip-github-e2e.yaml").read_text()
 
         for marker in (
             "PAPERCLIP_CONTROL_NETWORK='mte-control'",
             "PAPERCLIP_DAYTONA_API_SERVICE='mte-daytona-api'",
+            "PAPERCLIP_DAYTONA_PROXY_SERVICE='mte-daytona-proxy'",
             "PAPERCLIP_DAYTONA_NETWORK=$(canonical_value MTE_DAYTONA_PAPERCLIP_NETWORK)",
             '--network-alias "$PAPERCLIP_CONTAINER_HOST"',
             'docker network connect "$PAPERCLIP_DAYTONA_NETWORK" mte-paperclip',
@@ -371,6 +375,7 @@ class PaperclipAuthenticationContractTests(unittest.TestCase):
             '"extraProxyContainer": False',
             'if host.get("ExtraHosts"):',
             'if set(networks) != {control_network, daytona_network}:',
+            '{"mte-paperclip", daytona_api_service, daytona_proxy_service}',
             '"daytonaDockerDnsRouteConfigured": True',
             '"daytonaNonApiServicesUnreachable": int(denied_target_count) == 7',
             '"daytonaApiNetworkMembershipExact": True',
@@ -404,7 +409,7 @@ class PaperclipAuthenticationContractTests(unittest.TestCase):
                 else runtime_step
             )
             self.assertIn(marker, source)
-        self.assertNotIn("PAPERCLIP_DAYTONA_PROXY", runtime_step)
+        self.assertNotIn("PAPERCLIP_DAYTONA_PROXY_URL", runtime_step)
         self.assertNotIn("proxy_checked", runtime_step)
         self.assertIn('-e PAPERCLIP_BIND=lan', runtime_step)
         self.assertIn('-e PAPERCLIP_ALLOWED_HOSTNAMES="$PAPERCLIP_CONTAINER_HOST"', runtime_step)
@@ -433,6 +438,11 @@ class PaperclipAuthenticationContractTests(unittest.TestCase):
         self.assertIn("{{ envs.PAPERCLIP_BASE_URL }}/api/health", canary)
         self.assertNotIn("host.docker.internal:3100", canary)
         self.assertEqual(daytona_compose.count("networks: [daytona, paperclip-api]"), 2)
+        self.assertEqual(daytona["services"]["api"]["container_name"], "mte-daytona-api")
+        self.assertEqual(daytona["services"]["proxy"]["container_name"], "mte-daytona-proxy")
+        self.assertEqual(
+            daytona["services"]["proxy"]["networks"], ["daytona", "paperclip-api"]
+        )
         self.assertIn(
             "name: ${MTE_DAYTONA_PAPERCLIP_NETWORK:?required}",
             daytona_compose,

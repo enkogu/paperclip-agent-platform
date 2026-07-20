@@ -52,6 +52,7 @@ PAPERCLIP_DAYTONA_PLUGIN_VERSION=$(canonical_value DAYTONA_PLUGIN_VERSION)
 PAPERCLIP_DAYTONA_SDK_VERSION=$(canonical_value PAPERCLIP_DAYTONA_SDK_VERSION)
 PAPERCLIP_AWS_S3_CLIENT_VERSION=$(canonical_value PAPERCLIP_AWS_S3_CLIENT_VERSION)
 PAPERCLIP_DAYTONA_API_SERVICE='mte-daytona-api'
+PAPERCLIP_DAYTONA_PROXY_SERVICE='mte-daytona-proxy'
 PAPERCLIP_DAYTONA_NETWORK=$(canonical_value MTE_DAYTONA_PAPERCLIP_NETWORK)
 PAPERCLIP_DAYTONA_INTERNAL_NETWORK=$(canonical_value MTE_DAYTONA_NETWORK)
 PAPERCLIP_LEGACY_PORT=$(canonical_value PAPERCLIP_LEGACY_PORT)
@@ -348,7 +349,7 @@ verify_private_route() {
   validate_private_route_contract
   python3 - "$PAPERCLIP_CONTROL_NETWORK" "$PAPERCLIP_CONTAINER_HOST" \
     "$PAPERCLIP_PORT" "$PAPERCLIP_DAYTONA_NETWORK" \
-    "$PAPERCLIP_DAYTONA_API_SERVICE" "$mode" \
+    "$PAPERCLIP_DAYTONA_API_SERVICE" "$PAPERCLIP_DAYTONA_PROXY_SERVICE" "$mode" \
     "$PAPERCLIP_LOG_MAX_SIZE" "$PAPERCLIP_LOG_MAX_FILES" <<'PY'
 import json
 import subprocess
@@ -360,6 +361,7 @@ import sys
     port,
     daytona_network,
     daytona_api_service,
+    daytona_proxy_service,
     mode,
     log_max_size,
     log_max_files,
@@ -387,9 +389,13 @@ if hostname not in aliases:
     raise SystemExit("paperclip-runtime: Paperclip private service alias is missing")
 network = json.loads(subprocess.check_output(["docker", "network", "inspect", daytona_network]))[0]
 members = {entry["Name"] for entry in (network.get("Containers") or {}).values()}
-expected = {"mte-paperclip", daytona_api_service} if mode == "strict" else {"mte-paperclip"}
+expected = (
+    {"mte-paperclip", daytona_api_service, daytona_proxy_service}
+    if mode == "strict"
+    else {"mte-paperclip"}
+)
 if mode != "strict":
-    for service in (daytona_api_service,):
+    for service in (daytona_api_service, daytona_proxy_service):
         if service in members:
             expected.add(service)
 if members != expected:
